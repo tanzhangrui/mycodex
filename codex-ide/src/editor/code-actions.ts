@@ -33,11 +33,29 @@ function getSelection(): SelectionInfo | undefined {
   };
 }
 
+/** 收集选中范围内的诊断（Problems 面板是修复任务最直接的线索） */
+function getDiagnosticsInSelection(): string {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return '';
+  const diags = vscode.languages
+    .getDiagnostics(editor.document.uri)
+    .filter((d) => d.severity <= vscode.DiagnosticSeverity.Warning)
+    .filter((d) => editor.selection.isEmpty || d.range.intersection(editor.selection))
+    .slice(0, 10);
+  if (diags.length === 0) return '';
+  const lines = diags.map(
+    (d) =>
+      `第 ${d.range.start.line + 1} 行 [${d.severity === vscode.DiagnosticSeverity.Error ? '错误' : '警告'}] ${d.message}${d.source ? `（${d.source}）` : ''}`,
+  );
+  return `\n\n编辑器的实时诊断（请优先修复）：\n${lines.join('\n')}`;
+}
+
 export function registerCodeActions(chat: ChatViewProvider): vscode.Disposable[] {
-  const make = (instruction: string) => async () => {
+  const make = (instruction: string, withDiagnostics = false) => async () => {
     const sel = getSelection();
     if (!sel) return;
-    await chat.askWithCode(instruction, sel.code, sel.language, sel.fileName, sel.range);
+    const diag = withDiagnostics ? getDiagnosticsInSelection() : '';
+    await chat.askWithCode(instruction + diag, sel.code, sel.language, sel.fileName, sel.range);
   };
 
   return [
@@ -47,7 +65,7 @@ export function registerCodeActions(chat: ChatViewProvider): vscode.Disposable[]
     ),
     vscode.commands.registerCommand(
       'codex-ide.fixSelection',
-      make('请找出这段代码中的 bug 或隐患，说明原因，然后使用 edit_file 工具直接修复它。'),
+      make('请找出这段代码中的 bug 或隐患，说明原因，然后使用 edit_file 工具直接修复它。', true),
     ),
     vscode.commands.registerCommand(
       'codex-ide.refactorSelection',

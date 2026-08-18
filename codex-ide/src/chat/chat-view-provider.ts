@@ -13,6 +13,12 @@ import type { DiffManager } from '../editor/diff-manager.js';
 import type { StatusBar } from '../status/status-bar.js';
 import type { SecretManager } from '../agent/secrets.js';
 import { MODEL_PRESETS, AUTO_PRESET_ID } from '../agent/presets.js';
+import { isSensitivePath } from '../../../src/core/privacy-guard.js';
+
+/** @引用单文件最大注入字符数（成本意识：精确引用而非全文投喂） */
+const MAX_REF_CHARS = 4000;
+/** 单条消息最多引用文件数 */
+const MAX_REFS = 3;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'codex-ide.chat';
@@ -53,9 +59,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.postMessage({ type: 'history', messages: this.agent.getHistory() });
             this.agent.emitDirty();
             break;
-          case 'send':
-            await this.agent.send(msg.text, this.buildEditorContext());
+          case 'send': {
+            const refs = await this.resolveAtMentions(msg.text);
+            const editorCtx = this.buildEditorContext();
+            const context = [refs, editorCtx].filter(Boolean).join('\n\n') || undefined;
+            await this.agent.send(msg.text, context);
             break;
+          }
           case 'cancel':
             this.agent.cancel();
             break;
@@ -146,6 +156,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * 解析消息中的 @文件路径 引用（Cursor 式精确上下文圈定）
+   * 安全：隐私守卫全程生效；单文件 4K 截断；最多 3 个文件
+   */
+  private async resolveAtMentions(text: string): Promise<string | undefined> {
+    const matches = [...text.matchAll(/@([\w./\\-]+\.\w{1,10})/g)].map((m) => m[1]);
+    if (matches.length === 0) return undefined;
+
+    const parts: string[] = [];
+    for (const relPath of matches.slice(0, MAX_REFS)) {
+      if (isSensitivePath(relPath)) {
+        parts.push(`[引用被拦截] @${relPath} 受隐私保护策略隔离`);
+        continue;
+      }
+      // 优先从内存文件系统读取（与 Agent 视图一致）
+      let content = this.agent.memoryFs?.read(relPath) ?? null;
+      if (content === null) {
+        // 回退到磁盘（新文件可能不在快照中）
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        if (!folder) continue;
+        try {
+          const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder.uri, relPath));
+          content = Buffer.from(bytes).toString('utf-8');
+        } catch {
+          parts.push(`[引用失败] @${relPath} 不存在或不可读`);
+          continue;
+        }
+      }
+      const truncated = content.length > MAX_REF_CHARS;
+      const body = truncated ? content.slice(0, MAX_REF_CHARS) : content;
+      const lang = relPath.includes('.') ? relPath.split('.').pop() : '';
+      parts.push(`[引用的文件 ${relPath}${truncated ? `（已截断至 ${MAX_REF_CHARS} 字符）` : ''}]\n\`\`\`${lang}\n${body}\n\`\`\``);
+    }
+    return parts.length > 0 ? parts.join('\n\n') : undefined;
+  }
+
   /** 提取当前编辑器上下文（成本意识：只带选中内容，不盲目全文投喂） */
   private buildEditorContext(): string | undefined {
     const editor = vscode.window.activeTextEditor;
@@ -204,7 +250,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </section>
 
   <footer id="composer">
-    <textarea id="input" placeholder="描述你的任务…（Enter 发送，Shift+Enter 换行）" rows="3"></textarea>
+    <textarea id="input" placeholder="描述任务… 用 @路径 引用文件（Enter 发送，Shift+Enter 换行）" rows="3"></textarea>
     <div id="composer-bar">
       <span id="usage"></span>
       <button id="send-btn" class="primary">发送</button>

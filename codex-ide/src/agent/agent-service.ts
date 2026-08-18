@@ -57,6 +57,8 @@ export class AgentService {
   private messages: Message[] = [];
   private fs: InMemoryFileSystem | null = null;
   private abortController: AbortController | null = null;
+  /** 内联编辑（streamOnce）的独立取消控制器 */
+  private inlineAbort: AbortController | null = null;
   private running = false;
   private sessionCostCny = 0;
   private sessionUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -281,10 +283,16 @@ export class AgentService {
     }
     const provider = this.buildProvider(withKey.preset, withKey.apiKey);
     const messages: Message[] = [{ role: 'user', content: userText, timestamp: new Date().toISOString() }];
+    // 独立的取消控制器（修复：此前取 agent 循环的 controller，inline 场景下恒为 null）
+    this.inlineAbort = new AbortController();
     let text = '';
-    for await (const delta of provider.stream(messages, systemPrompt, this.abortController?.signal)) {
-      text += delta;
-      yield delta;
+    try {
+      for await (const delta of provider.stream(messages, systemPrompt, this.inlineAbort.signal)) {
+        text += delta;
+        yield delta;
+      }
+    } finally {
+      this.inlineAbort = null;
     }
     // 单发也计成本（粗估：按字符近似 token）
     const approxTokens = Math.ceil((userText.length + text.length) / 2);
@@ -292,9 +300,11 @@ export class AgentService {
     this.sessionCostCny += cost;
   }
 
-  /** 取消当前任务 */
+  /** 取消当前任务（含排队任务与内联编辑） */
   cancel(): void {
     this.abortController?.abort();
+    this.inlineAbort?.abort();
+    this.pendingTask = null;
     this.running = false;
   }
 
