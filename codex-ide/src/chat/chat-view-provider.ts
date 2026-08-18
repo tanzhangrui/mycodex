@@ -92,6 +92,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case 'newSession':
             await this.agent.newSession();
             break;
+          case 'rollback': {
+            const cps = this.agent.getCheckpoints();
+            if (cps.length === 0) {
+              vscode.window.showInformationMessage('暂无可回滚的轮次（每轮任务开始前会自动存档）');
+              break;
+            }
+            const pick = await vscode.window.showQuickPick(
+              cps
+                .slice()
+                .reverse()
+                .map((c) => ({ label: `回到第 ${c.turn} 轮之前`, description: c.label, turn: c.turn })),
+              { title: '回滚文件状态到某轮任务之前（消息记录不受影响）' },
+            );
+            if (pick && this.agent.rollbackTo(pick.turn)) {
+              vscode.window.showInformationMessage(
+                '已回滚。若此前的修改已写入磁盘，点击「全部应用」可将回滚后的状态写回。',
+              );
+            }
+            break;
+          }
           case 'setModel': {
             const cfg = vscode.workspace.getConfiguration('codex-ide');
             await cfg.update('activePreset', msg.presetId, vscode.ConfigurationTarget.Global);
@@ -232,6 +252,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <header id="topbar">
     <span class="brand">Codex IDE</span>
     <select id="model-select" title="选择模型"></select>
+    <button id="rollback-btn" title="回滚到某轮任务之前">⟲</button>
     <button id="key-btn" title="设置 API Key">🔑</button>
     <button id="new-session-btn" title="新会话">＋</button>
   </header>

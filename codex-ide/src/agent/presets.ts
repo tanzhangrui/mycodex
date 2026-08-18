@@ -180,3 +180,12 @@ export function estimateComplexity(userText: string): 'low' | 'high' {
   if (userText.length > 500) return 'high';
   return 'low';
 }
+
+/**
+ * 失败自适应升档（最小反馈回路）：
+ * 仅当失败发生于 free 档时升级到 cheap 档重试；其余情况不升级（避免账单失控）
+ */
+export function pickEscalationPreset(failed: ModelPreset): ModelPreset | null {
+  if (failed.tier !== 'free') return null;
+  return MODEL_PRESETS.find((p) => p.id === 'deepseek-chat') ?? null;
+}

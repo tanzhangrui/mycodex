@@ -7,7 +7,7 @@
 
 import * as vscode from 'vscode';
 import { runAgentLoop, type AgentLoopResult, type TokenUsage } from '../../../src/core/agent-loop.js';
-import { InMemoryFileSystem } from '../../../src/core/in-memory-fs.js';
+import { InMemoryFileSystem, type FsCheckpoint } from '../../../src/core/in-memory-fs.js';
 import { createSandbox, type Sandbox } from '../../../src/sandbox/sandbox.js';
 import { createProvider, type AIProvider } from '../../../src/utils/ai-client.js';
 import { registerBuiltinTools } from '../../../src/tools/builtin.js';
@@ -19,6 +19,7 @@ import {
   getPreset,
   estimateCost,
   estimateComplexity,
+  pickEscalationPreset,
   type ModelPreset,
 } from './presets.js';
 import { SecretManager } from './secrets.js';
@@ -69,6 +70,10 @@ export class AgentService {
 
   /** 运行中到达的排队任务（单槽，后到覆盖先到，防无限堆积） */
   private pendingTask: { text: string; context?: string } | null = null;
+
+  /** 逐轮检查点（回滚时间线） */
+  private checkpoints: Array<{ turn: number; label: string; checkpoint: FsCheckpoint }> = [];
+  private checkpointSeq = 0;
 
   constructor(
     private readonly secrets: SecretManager,
@@ -188,8 +193,10 @@ export class AgentService {
       await this.fs.snapshot(workingDir);
     }
 
-    const provider = this.buildProvider(preset, apiKey);
     const sandbox = this.buildSandbox(workingDir);
+
+    // 检查点：任务前存档（回滚时间线）
+    this.pushCheckpoint(userText);
 
     // 组装消息（注入 IDE 上下文）
     const content = editorContext ? `${editorContext}\n\n${userText}` : userText;
@@ -197,23 +204,19 @@ export class AgentService {
 
     this.running = true;
     this.abortController = new AbortController();
-    this.emitter.fire({ type: 'streamStart', presetLabel: preset.label });
+    const signal = this.abortController.signal;
 
-    let fullText = '';
-    try {
-      const result = await runAgentLoop(
+    const runOnce = (p: ModelPreset, key: string): Promise<AgentLoopResult> => {
+      const provider = this.buildProvider(p, key);
+      this.emitter.fire({ type: 'streamStart', presetLabel: p.label });
+      return runAgentLoop(
         provider,
         this.messages,
-        this.fs,
+        this.fs!,
         workingDir,
         {
-          onTextDelta: (text) => {
-            fullText += text;
-            this.emitter.fire({ type: 'delta', text });
-          },
-          onToolUse: (name, input) => {
-            this.emitter.fire({ type: 'tool', name, input, phase: 'call' });
-          },
+          onTextDelta: (text) => this.emitter.fire({ type: 'delta', text }),
+          onToolUse: (name, input) => this.emitter.fire({ type: 'tool', name, input, phase: 'call' }),
           onToolResult: (name, success, output) => {
             this.emitter.fire({ type: 'tool', name, input: {}, phase: 'result', success, output });
             this.emitDirty();
@@ -221,12 +224,30 @@ export class AgentService {
           onError: (message) => this.emitter.fire({ type: 'error', message }),
           onDone: () => {},
         },
-        this.abortController.signal,
+        signal,
         sandbox,
       );
+    };
+
+    try {
+      let usedPreset = preset;
+      let result = await runOnce(preset, apiKey);
+
+      // 失败自适应升档（最小反馈回路）：auto 模式 + free 档失败 → cheap 档重试一次
+      const activeId = vscode.workspace.getConfiguration('codex-ide').get<string>('activePreset', AUTO_PRESET_ID);
+      const escalation = result.hasError && activeId === AUTO_PRESET_ID ? pickEscalationPreset(preset) : null;
+      if (escalation && !signal.aborted) {
+        const esc = await this.withKey(escalation, true);
+        if (esc && 'preset' in esc) {
+          this.log?.(`[agent] ${preset.label} 失败，升级 ${esc.preset.label} 重试`);
+          this.emitter.fire({ type: 'delta', text: `\n\n> ⚡ ${preset.label} 调用失败，已自动升级到 **${esc.preset.label}** 重试\n\n` });
+          usedPreset = esc.preset;
+          result = await runOnce(esc.preset, esc.apiKey);
+        }
+      }
 
       // 成本与用量
-      const cost = estimateCost(preset, result.tokenUsage.promptTokens, result.tokenUsage.completionTokens);
+      const cost = estimateCost(usedPreset, result.tokenUsage.promptTokens, result.tokenUsage.completionTokens);
       this.sessionCostCny += cost;
       this.sessionUsage.promptTokens += result.tokenUsage.promptTokens;
       this.sessionUsage.completionTokens += result.tokenUsage.completionTokens;
@@ -236,15 +257,15 @@ export class AgentService {
       this.messages.push({ role: 'assistant', content: result.text, timestamp: new Date().toISOString() });
       this.trimHistory();
 
-      this.emitter.fire({ type: 'streamEnd', result, presetLabel: preset.label, costCny: cost });
+      this.emitter.fire({ type: 'streamEnd', result, presetLabel: usedPreset.label, costCny: cost });
       this.emitter.fire({
         type: 'usage',
         usage: { ...this.sessionUsage },
         sessionCostCny: this.sessionCostCny,
-        presetLabel: preset.label,
+        presetLabel: usedPreset.label,
       });
       this.emitDirty();
-      this.log?.(`[agent] 任务完成: ${preset.label}, 本次 ¥${cost.toFixed(4)}, ${result.toolCalls.length} 次工具调用`);
+      this.log?.(`[agent] 任务完成: ${usedPreset.label}, 本次 ¥${cost.toFixed(4)}, ${result.toolCalls.length} 次工具调用`);
       this.persistSession();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -319,6 +340,8 @@ export class AgentService {
     }
     this.emitDirty();
     this.persistSession();
+    this.checkpoints = [];
+    this.checkpointSeq = 0;
     this.log?.('[agent] 新会话已开始');
   }
 
@@ -342,6 +365,40 @@ export class AgentService {
     return this.messages
       .filter((m) => !m.content.startsWith('[tool_result'))
       .map((m) => ({ role: m.role, content: m.content }));
+  }
+
+  // ---- 检查点（回滚时间线） ----
+
+  private pushCheckpoint(userText: string): void {
+    if (!this.fs) return;
+    this.checkpoints.push({
+      turn: ++this.checkpointSeq,
+      label: userText.slice(0, 40),
+      checkpoint: this.fs.createCheckpoint(),
+    });
+    // 只保留最近 20 轮，控制内存
+    if (this.checkpoints.length > 20) this.checkpoints.shift();
+  }
+
+  /** 可回滚的轮次列表（供 QuickPick 展示） */
+  getCheckpoints(): Array<{ turn: number; label: string }> {
+    return this.checkpoints.map((c) => ({ turn: c.turn, label: c.label }));
+  }
+
+  /**
+   * 回滚到第 N 轮任务之前的状态。
+   * 恢复后与磁盘重新对齐：若期间有变更已写盘，重新标记 dirty，
+   * 用户通过「全部应用」即可把回滚状态写回磁盘（时间旅行闭环）。
+   */
+  rollbackTo(turn: number): boolean {
+    const idx = this.checkpoints.findIndex((c) => c.turn === turn);
+    if (idx < 0 || !this.fs) return false;
+    this.fs.restoreCheckpoint(this.checkpoints[idx].checkpoint);
+    this.fs.rebaseAgainstDisk();
+    this.checkpoints = this.checkpoints.slice(0, idx + 1);
+    this.emitDirty();
+    this.log?.(`[agent] 已回滚到第 ${turn} 轮之前`);
+    return true;
   }
 
   private persistSession(): void {

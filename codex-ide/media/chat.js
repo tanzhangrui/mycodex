@@ -331,6 +331,7 @@
     vscode.postMessage({ type: 'newSession' });
   });
 
+  $('rollback-btn').addEventListener('click', () => vscode.postMessage({ type: 'rollback' }));
   $('apply-all').addEventListener('click', () => vscode.postMessage({ type: 'applyAll' }));
   $('reject-all').addEventListener('click', () => vscode.postMessage({ type: 'rejectAll' }));
 

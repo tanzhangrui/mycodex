@@ -51,6 +51,14 @@ export interface ApplyResult {
   failed: Array<{ path: string; error: string }>;
 }
 
+/** 检查点：完整状态快照（字符串不可变，浅拷贝 Map/Set 即可） */
+export interface FsCheckpoint {
+  files: Map<string, string>;
+  originalFiles: Map<string, string>;
+  dirtyFiles: Set<string>;
+  deletedFiles: Set<string>;
+}
+
 // ---- 内存文件系统 ----
 
 export class InMemoryFileSystem {
@@ -398,6 +406,50 @@ export class InMemoryFileSystem {
    */
   isDirty(): boolean {
     return this.dirtyFiles.size > 0 || this.deletedFiles.size > 0;
+  }
+
+  /**
+   * V3.1: 创建检查点（每轮 Agent 任务前调用，支持逐轮回滚）
+   */
+  createCheckpoint(): FsCheckpoint {
+    return {
+      files: new Map(this.files),
+      originalFiles: new Map(this.originalFiles),
+      dirtyFiles: new Set(this.dirtyFiles),
+      deletedFiles: new Set(this.deletedFiles),
+    };
+  }
+
+  /**
+   * V3.1: 恢复到检查点状态
+   */
+  restoreCheckpoint(checkpoint: FsCheckpoint): void {
+    this.files = new Map(checkpoint.files);
+    this.originalFiles = new Map(checkpoint.originalFiles);
+    this.dirtyFiles = new Set(checkpoint.dirtyFiles);
+    this.deletedFiles = new Set(checkpoint.deletedFiles);
+  }
+
+  /**
+   * V3.1: 与磁盘重新对齐 — 回滚后若检查点之前已有变更被写入磁盘，
+   * 将「内存内容与磁盘不一致」的文件重新标记为 dirty，
+   * 使「全部应用」可以把回滚后的状态真正写回磁盘（时间旅行闭环）。
+   */
+  rebaseAgainstDisk(): void {
+    for (const [path, content] of this.files) {
+      let disk: string | null = null;
+      try {
+        disk = readFileSync(path, 'utf-8');
+      } catch {
+        // 磁盘上不存在（待新建）
+      }
+      if (disk !== content) {
+        this.dirtyFiles.add(path);
+        if (disk !== null) {
+          this.originalFiles.set(path, disk);
+        }
+      }
+    }
   }
 
   /**
