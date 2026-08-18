@@ -13,14 +13,21 @@ import { registerCodeActions } from './editor/code-actions.js';
 import { StatusBar } from './status/status-bar.js';
 
 export function activate(context: vscode.ExtensionContext): void {
+  const channel = vscode.window.createOutputChannel('Codex IDE');
+  const log = (msg: string): void => channel.appendLine(`${new Date().toLocaleTimeString()} ${msg}`);
+
   const secrets = new SecretManager(context.secrets);
-  const agent = new AgentService(secrets);
+  const agent = new AgentService(secrets, context.globalState, log);
+  agent.restoreSession();
   const diff = new DiffManager(agent);
   const statusBar = new StatusBar(agent);
   const inlineChat = new InlineChat(agent);
   const chat = new ChatViewProvider(context.extensionUri, agent, diff, statusBar, secrets);
 
+  log('[codex-ide] 扩展已激活');
+
   context.subscriptions.push(
+    channel,
     agent,
     diff,
     statusBar,

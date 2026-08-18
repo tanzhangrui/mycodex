@@ -56,6 +56,30 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .cursor { animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* 欢迎页 */
+#welcome {
+  text-align: center; padding: 32px 12px 12px;
+}
+.welcome-brand { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+.welcome-sub { font-size: 11px; opacity: 0.65; margin-bottom: 18px; }
+.welcome-actions { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.quick-action {
+  padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.25));
+  text-align: left;
+}
+.quick-action:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.welcome-hint { font-size: 10px; opacity: 0.55; line-height: 1.7; }
+
+/* 信息提示（排队等） */
+.msg.info .bubble {
+  background: transparent;
+  border: 1px dashed var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.4));
+  font-size: 11px; opacity: 0.85;
+}
+
 /* Markdown 元素 */
 .bubble h1, .bubble h2, .bubble h3 { margin: 8px 0 4px; font-size: 1.05em; }
 .bubble h4, .bubble h5, .bubble h6 { margin: 6px 0 3px; font-size: 1em; }

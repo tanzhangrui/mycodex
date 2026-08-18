@@ -31,8 +31,21 @@ export type AgentEvent =
   | { type: 'streamEnd'; result: AgentLoopResult; presetLabel: string; costCny: number }
   | { type: 'tool'; name: string; input: Record<string, unknown>; phase: 'call' | 'result'; success?: boolean; output?: string }
   | { type: 'error'; message: string }
+  | { type: 'queued'; text: string }
   | { type: 'dirtyChanged'; files: DirtyFile[] }
   | { type: 'usage'; usage: TokenUsage; sessionCostCny: number; presetLabel: string };
+
+/** 持久化的会话快照（globalState） */
+interface SessionSnapshot {
+  messages: Message[];
+  sessionCostCny: number;
+  sessionUsage: TokenUsage;
+  savedAt: string;
+}
+
+const SESSION_KEY = 'codex-ide.session.v1';
+/** 持久化单条消息的最大长度（控制存储体积） */
+const MAX_STORED_MESSAGE = 8000;
 
 export interface DirtyFile {
   path: string; // 绝对路径
@@ -52,7 +65,14 @@ export class AgentService {
   private readonly emitter = new vscode.EventEmitter<AgentEvent>();
   readonly onEvent = this.emitter.event;
 
-  constructor(private readonly secrets: SecretManager) {}
+  /** 运行中到达的排队任务（单槽，后到覆盖先到，防无限堆积） */
+  private pendingTask: { text: string; context?: string } | null = null;
+
+  constructor(
+    private readonly secrets: SecretManager,
+    private readonly store?: vscode.Memento,
+    private readonly log?: (msg: string) => void,
+  ) {}
 
   /** 工作区根目录 */
   get workingDir(): string | undefined {
@@ -125,10 +145,12 @@ export class AgentService {
     return { preset, apiKey };
   }
 
-  /** 发送用户消息并运行 Agent 循环 */
+  /** 发送用户消息并运行 Agent 循环（运行中自动排队一条） */
   async send(userText: string, editorContext?: string): Promise<void> {
     if (this.running) {
-      this.emitter.fire({ type: 'error', message: '上一个任务仍在运行，请先等待或点击停止' });
+      this.pendingTask = { text: userText, context: editorContext };
+      this.emitter.fire({ type: 'queued', text: userText });
+      this.log?.('[agent] 任务已排队，等待当前任务完成');
       return;
     }
     const workingDir = this.workingDir;
@@ -220,12 +242,22 @@ export class AgentService {
         presetLabel: preset.label,
       });
       this.emitDirty();
+      this.log?.(`[agent] 任务完成: ${preset.label}, 本次 ¥${cost.toFixed(4)}, ${result.toolCalls.length} 次工具调用`);
+      this.persistSession();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      this.log?.(`[agent] 任务异常: ${message}`);
       this.emitter.fire({ type: 'error', message });
     } finally {
       this.running = false;
       this.abortController = null;
+      // 排空队列：自动接续排队任务
+      const pending = this.pendingTask;
+      this.pendingTask = null;
+      if (pending) {
+        this.log?.('[agent] 执行排队任务');
+        void this.send(pending.text, pending.context);
+      }
     }
   }
 
@@ -276,6 +308,44 @@ export class AgentService {
       await this.fs.snapshot(this.workingDir);
     }
     this.emitDirty();
+    this.persistSession();
+    this.log?.('[agent] 新会话已开始');
+  }
+
+  /** 从 globalState 恢复上次会话（重启不丢对话） */
+  restoreSession(): void {
+    if (!this.store) return;
+    try {
+      const snap = this.store.get<SessionSnapshot>(SESSION_KEY);
+      if (!snap || !Array.isArray(snap.messages)) return;
+      this.messages = snap.messages;
+      this.sessionCostCny = snap.sessionCostCny ?? 0;
+      this.sessionUsage = snap.sessionUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      this.log?.(`[agent] 已恢复会话（${snap.messages.length} 条消息，保存于 ${snap.savedAt}）`);
+    } catch {
+      // 损坏则忽略
+    }
+  }
+
+  /** 供 UI 回放的历史（只含 role/content，不含内部协议噪声） */
+  getHistory(): Array<{ role: string; content: string }> {
+    return this.messages
+      .filter((m) => !m.content.startsWith('[tool_result'))
+      .map((m) => ({ role: m.role, content: m.content }));
+  }
+
+  private persistSession(): void {
+    if (!this.store) return;
+    const snap: SessionSnapshot = {
+      messages: this.messages.slice(-40).map((m) => ({
+        ...m,
+        content: m.content.length > MAX_STORED_MESSAGE ? m.content.slice(0, MAX_STORED_MESSAGE) : m.content,
+      })),
+      sessionCostCny: this.sessionCostCny,
+      sessionUsage: this.sessionUsage,
+      savedAt: new Date().toISOString(),
+    };
+    void this.store.update(SESSION_KEY, snap);
   }
 
   /** 通知 UI 未保存变更列表 */

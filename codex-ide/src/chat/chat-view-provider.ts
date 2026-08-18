@@ -50,6 +50,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         switch (msg.type) {
           case 'ready':
             this.pushState();
+            this.postMessage({ type: 'history', messages: this.agent.getHistory() });
             this.agent.emitDirty();
             break;
           case 'send':

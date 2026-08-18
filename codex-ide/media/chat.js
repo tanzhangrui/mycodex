@@ -21,6 +21,52 @@
   let running = false;
   let presets = [];
   let keyStatus = {};
+  let hasMessages = false;
+
+  // ---- 欢迎页（空状态引导） ----
+
+  const QUICK_ACTIONS = [
+    { icon: '📖', label: '解释当前文件', prompt: '请解释我当前打开的文件：整体结构、关键逻辑与设计意图。' },
+    { icon: '🧪', label: '编写单元测试', prompt: '请为我当前选中的代码（若无选中则为当前文件）编写高质量的单元测试，使用项目已有的测试框架。' },
+    { icon: '🔍', label: '代码审查', prompt: '请审查我当前打开的文件：指出潜在 bug、可读性问题与改进建议，按严重程度排序。' },
+  ];
+
+  function renderWelcome() {
+    if (hasMessages) return;
+    const div = document.createElement('div');
+    div.id = 'welcome';
+    div.innerHTML = `
+      <div class="welcome-brand">⚡ Codex IDE</div>
+      <div class="welcome-sub">免费/低价模型 · 旗舰级体验 · 隐私物理隔离</div>
+      <div class="welcome-actions"></div>
+      <div class="welcome-hint">选中代码后可用 <b>Ctrl+I</b> 内联编辑 · 输入 <b>@文件路径</b> 可引用文件 · 右键有解释/修复/重构</div>`;
+    const actions = div.querySelector('.welcome-actions');
+    for (const a of QUICK_ACTIONS) {
+      const btn = document.createElement('button');
+      btn.className = 'quick-action';
+      btn.innerHTML = `${a.icon} ${a.label}`;
+      btn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'send', text: a.prompt });
+        addUserMessage(a.prompt);
+      });
+      actions.appendChild(btn);
+    }
+    messagesEl.appendChild(div);
+  }
+
+  function hideWelcome() {
+    hasMessages = true;
+    const w = document.getElementById('welcome');
+    if (w) w.remove();
+  }
+
+  function addInfoMessage(text) {
+    const div = document.createElement('div');
+    div.className = 'msg info';
+    div.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+    messagesEl.appendChild(div);
+    scrollToBottom();
+  }
 
   // ---- 消息渲染 ----
 
@@ -62,6 +108,7 @@
   }
 
   function addUserMessage(text) {
+    hideWelcome();
     const div = document.createElement('div');
     div.className = 'msg user';
     div.innerHTML = `<div class="bubble">${renderMarkdown(text)}</div>`;
@@ -78,6 +125,7 @@
   }
 
   function beginAssistant(modelLabel) {
+    hideWelcome();
     const div = document.createElement('div');
     div.className = 'msg assistant';
     div.innerHTML = `<div class="meta">${escapeHtml(modelLabel)}</div><div class="bubble"><span class="cursor">▍</span></div><div class="tools"></div>`;
@@ -186,6 +234,21 @@
         keyStatus = msg.keyStatus || {};
         refreshModelSelect(msg.activePreset);
         break;
+      case 'history':
+        // 会话回放（重启恢复）
+        for (const m of msg.messages || []) {
+          if (m.role === 'user') addUserMessage(m.content);
+          else if (m.role === 'assistant') {
+            beginAssistant('');
+            currentText = m.content;
+            endAssistant(0);
+          }
+        }
+        if (!hasMessages) renderWelcome();
+        break;
+      case 'queued':
+        addInfoMessage(`⏳ 已排队：「${msg.text.slice(0, 50)}${msg.text.length > 50 ? '…' : ''}」将在当前任务完成后自动执行`);
+        break;
       case 'userEcho':
         addUserMessage(msg.text);
         break;
@@ -263,6 +326,8 @@
 
   $('new-session-btn').addEventListener('click', () => {
     messagesEl.innerHTML = '';
+    hasMessages = false;
+    renderWelcome();
     vscode.postMessage({ type: 'newSession' });
   });
 
