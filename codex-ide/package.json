@@ -1,0 +1,105 @@
+{
+  "name": "codex-ide",
+  "displayName": "Codex IDE — 零成本 AI 编程助手",
+  "description": "用免费/极致低价模型跑出旗舰 IDE 体验：GLM 免费档 + DeepSeek 低价档 + 本地模型，深度嵌入 VSCode。隐私优先，.env 物理隔离。",
+  "version": "0.1.0",
+  "publisher": "codex-local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI", "Chat", "Programming Languages"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codex-ide",
+          "title": "Codex IDE",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codex-ide": [
+        {
+          "type": "webview",
+          "id": "codex-ide.chat",
+          "name": "AI 助手",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "codex-ide.openChat", "title": "Codex: 打开 AI 助手", "icon": "$(hubot)" },
+      { "command": "codex-ide.inlineEdit", "title": "Codex: 内联编辑选中代码", "icon": "$(sparkle)" },
+      { "command": "codex-ide.explainSelection", "title": "Codex: 解释选中代码", "icon": "$(book)" },
+      { "command": "codex-ide.fixSelection", "title": "Codex: 修复选中代码", "icon": "$(wrench)" },
+      { "command": "codex-ide.refactorSelection", "title": "Codex: 重构选中代码", "icon": "$(symbol-method)" },
+      { "command": "codex-ide.applyChanges", "title": "Codex: 应用全部变更", "icon": "$(check)" },
+      { "command": "codex-ide.rejectChanges", "title": "Codex: 拒绝全部变更", "icon": "$(discard)" },
+      { "command": "codex-ide.switchModel", "title": "Codex: 切换模型", "icon": "$(zap)" },
+      { "command": "codex-ide.newSession", "title": "Codex: 新会话", "icon": "$(add)" }
+    ],
+    "keybindings": [
+      {
+        "command": "codex-ide.inlineEdit",
+        "key": "ctrl+i",
+        "mac": "cmd+i",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "codex-ide.openChat",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "codex-ide.inlineEdit", "group": "codex-ide@1", "when": "editorHasSelection" },
+        { "command": "codex-ide.explainSelection", "group": "codex-ide@2", "when": "editorHasSelection" },
+        { "command": "codex-ide.fixSelection", "group": "codex-ide@3", "when": "editorHasSelection" },
+        { "command": "codex-ide.refactorSelection", "group": "codex-ide@4", "when": "editorHasSelection" }
+      ]
+    },
+    "configuration": {
+      "title": "Codex IDE",
+      "properties": {
+        "codex-ide.activePreset": {
+          "type": "string",
+          "default": "auto",
+          "description": "当前模型预设（auto = 自动路由：简单任务用免费模型，复杂任务用低价强模型）",
+          "enum": ["auto", "glm-flash", "deepseek-chat", "deepseek-reasoner", "glm-plus", "qwen-plus", "kimi-k2", "siliconflow-free", "ollama-local", "claude-sonnet"]
+        },
+        "codex-ide.autoRoute": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动路由模式下，复杂任务是否自动升级到低价强模型（DeepSeek）"
+        },
+        "codex-ide.costBudgetCny": {
+          "type": "number",
+          "default": 0,
+          "description": "会话成本预算（元），0 = 不限。达到后自动熔断，防止账单失控"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "node build.mjs --production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.5.0"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true
+  }
+}

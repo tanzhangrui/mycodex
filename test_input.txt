@@ -1,0 +1,5 @@
+创建 test_demo.js 文件
+/diff
+/status
+/apply
+/exit

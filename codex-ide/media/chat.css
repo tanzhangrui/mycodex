@@ -1,0 +1,157 @@
+/* Codex IDE 聊天面板 — 使用 VSCode 主题变量，原生融合 */
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background);
+}
+body { display: flex; flex-direction: column; height: 100vh; }
+.hidden { display: none !important; }
+
+/* 顶栏 */
+#topbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, transparent);
+}
+.brand { font-weight: 600; margin-right: auto; }
+#model-select {
+  max-width: 180px;
+  background: var(--vscode-dropdown-background);
+  color: var(--vscode-dropdown-foreground);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: 4px; padding: 2px 4px; font-size: 11px;
+}
+#topbar button {
+  background: transparent; border: none; cursor: pointer;
+  color: var(--vscode-foreground); font-size: 13px; padding: 2px 6px; border-radius: 4px;
+}
+#topbar button:hover { background: var(--vscode-toolbar-hoverBackground); }
+
+/* 消息区 */
+#messages { flex: 1; overflow-y: auto; padding: 10px 10px 4px; }
+.msg { margin-bottom: 12px; }
+.msg .meta {
+  font-size: 10px; opacity: 0.6; margin-bottom: 3px;
+}
+.msg .bubble {
+  padding: 8px 10px; border-radius: 8px; line-height: 1.55;
+  word-wrap: break-word; overflow-wrap: anywhere;
+}
+.msg.user .bubble {
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+}
+.msg.assistant .bubble {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.2));
+}
+.msg.error .bubble {
+  background: var(--vscode-inputValidation-errorBackground);
+  border: 1px solid var(--vscode-inputValidation-errorBorder);
+  color: var(--vscode-errorForeground);
+}
+.cursor { animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Markdown 元素 */
+.bubble h1, .bubble h2, .bubble h3 { margin: 8px 0 4px; font-size: 1.05em; }
+.bubble h4, .bubble h5, .bubble h6 { margin: 6px 0 3px; font-size: 1em; }
+.bubble ul { margin: 4px 0; padding-left: 18px; }
+.bubble a { color: var(--vscode-textLink-foreground); }
+code.inline {
+  background: var(--vscode-textCodeBlock-background);
+  padding: 1px 4px; border-radius: 3px; font-size: 0.92em;
+}
+.code-block {
+  margin: 6px 0; border-radius: 6px; overflow: hidden;
+  background: var(--vscode-textCodeBlock-background);
+  border: 1px solid rgba(128,128,128,0.25);
+}
+.code-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 2px 8px; font-size: 10px; opacity: 0.75;
+  border-bottom: 1px solid rgba(128,128,128,0.2);
+}
+.copy-btn {
+  background: transparent; border: none; cursor: pointer;
+  color: inherit; font-size: 10px; padding: 1px 4px;
+}
+.code-block code {
+  display: block; padding: 8px 10px; overflow-x: auto;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.9em; line-height: 1.45; white-space: pre;
+}
+
+/* 工具调用 */
+.tools { margin-top: 4px; }
+.tool {
+  font-size: 11px; padding: 4px 8px; margin: 3px 0;
+  border-radius: 5px; opacity: 0.9;
+  background: var(--vscode-badge-background, rgba(128,128,128,0.15));
+}
+.tool.ok { border-left: 2px solid var(--vscode-testing-iconPassed, #4caf50); }
+.tool.fail { border-left: 2px solid var(--vscode-testing-iconFailed, #f44336); }
+.tool.call { border-left: 2px solid var(--vscode-progressBar-background, #2196f3); }
+.tool-brief { opacity: 0.7; margin-left: 4px; }
+.tool details summary { cursor: pointer; }
+.tool pre {
+  margin: 4px 0 0; padding: 6px; max-height: 200px; overflow: auto;
+  font-size: 10px; white-space: pre-wrap;
+  background: var(--vscode-textCodeBlock-background); border-radius: 4px;
+}
+
+/* 待应用变更栏 */
+#dirty-bar {
+  border-top: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.3));
+  padding: 6px 8px; max-height: 30vh; overflow-y: auto;
+}
+#dirty-header {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; margin-bottom: 4px;
+}
+#dirty-list { list-style: none; margin: 0; padding: 0; }
+#dirty-list li {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 11px; padding: 2px 0;
+}
+#dirty-list .deleted { text-decoration: line-through; opacity: 0.7; }
+#dirty-list button {
+  font-size: 10px; padding: 1px 8px; border-radius: 3px; cursor: pointer;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: none;
+}
+
+/* 输入区 */
+#composer {
+  border-top: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.3));
+  padding: 8px;
+}
+#input {
+  width: 100%; resize: none;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 6px; padding: 8px; font-family: inherit; font-size: inherit;
+  outline: none;
+}
+#input:focus { border-color: var(--vscode-focusBorder); }
+#composer-bar {
+  display: flex; align-items: center; margin-top: 6px; gap: 6px;
+}
+#usage { font-size: 10px; opacity: 0.6; margin-right: auto; }
+button.primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none; border-radius: 4px; padding: 4px 14px; cursor: pointer;
+}
+button.primary:hover { background: var(--vscode-button-hoverBackground); }
+button.danger {
+  background: transparent;
+  color: var(--vscode-errorForeground);
+  border: 1px solid var(--vscode-errorForeground);
+  border-radius: 4px; padding: 3px 12px; cursor: pointer;
+}
