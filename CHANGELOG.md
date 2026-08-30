@@ -5,6 +5,51 @@
 
 ---
 
+## V5.0 — 2026-08-30 — 多仓库工作区（核心层）
+
+> 纲领文档：`V4.4-V5.0-ITERATION-PROMPT.md`。核心命题：单 workingDir 假设贯穿引擎/agent-loop/IDE——monorepo 多仓场景（前端仓 + 服务仓 + 共享库仓）下检索只见一仓。
+> 诚实边界：本轮交付**核心层原语 + 引擎消费**；agent-loop/CLI 的多根入口接线与跨根 import（tsconfig paths/别名）不在本轮。
+
+### A. WorkspaceResolver（`src/core/workspace.ts`）
+- 多根注册 + 根名去重（basename 冲突 → `repo-2`，双仓同 basename 是常态）；首根为主根（CODEX.md 规则、默认工作目录语义）
+- 双向路径映射：绝对路径 ⇄ 工作区相对路径（`rootName/rel`）
+- 边界安全：`contains`/`toWorkspaceRel` 越界显式返回 null/false（路径逃逸是安全问题不是 bug）；`toAbsolute` 段级 `..` 逃逸拒绝；前缀伪装目录（`backend-inside` ≠ `backend`）不误判
+- `resolveInput`：任意输入（绝对或相对主根）→ 根内绝对路径，越界 null
+
+### B. ContextEngine 多根（`src/context/context-engine.ts`）
+- `index(workingDir: string | string[])`：多根时键空间统一为 `rootName/rel` 前缀——**四路召回（符号/关键词/语义/依赖图）与 import 图 BFS 零改动即跨根**（全部消费统一键）
+- `scanDirectory` 参数化（baseDir + prefix）；`refresh` 增量刷新重扫全部根
+- `keyToAbs`：统一键 → 绝对路径按根名路由；单根模式与旧行为完全一致（无前缀键）
+- 相对 import 天然限定同根（不同根是不同目录树），统一键空间内解析无需特判
+- 持久化隔离：`persistKey`（单根 = workingDir 兼容旧缓存；多根 = 全根路径拼接）——多根缓存绝不误读单根缓存
+- `getSharedContextEngine` 支持多根（根列表 join 为缓存键，顺序不同视为不同工作区）；单根 string 与单元素数组键归一化等价
+- 隐私红线不放松：敏感文件跨根依然拦截（有测试）
+
+### 验收（V4.4 + V5.0 合并）
+- 新增 34 项测试：市场协议 15（解析三级容错/形状校验/去重/上限/加载/查找/安装四态）+ 多仓库 19（根名去重/双向映射/越界拒绝/统一键空间/跨根检索与读内容/import 图/refresh 增量/单根兼容/持久化隔离/共享单例）
+- typecheck 零错误 / **216 测试全绿**（182 + 34）
+
+---
+
+## V4.4 — 2026-08-30 — 插件市场索引协议（v1）+ 示例插件
+
+> 纲领文档：`V4.4-V5.0-ITERATION-PROMPT.md`。协议先行、服务后建：核心价值是格式的标准化与容错解析。
+> 诚实边界：source.kind 仅 `file`；远程自动下载执行**刻意不做**——签名/校验和/沙箱隔离的供应链安全设计单独交付。
+
+### A. 市场索引协议（`src/tools/marketplace.ts`）
+- v1 静态 JSON 格式（version/plugins/name/version/description/source{kind,path}），可托管任意位置（GitHub raw / 内网 / 本地）
+- 容错解析：整体 → Markdown 围栏块 → 首末大括号子串三级尝试（README 分发场景）
+- 逐条形状校验（非法跳过）+ 同名去重（首个保留）+ 单索引 200 条上限（防恶意巨型索引）
+- `loadMarketplaceIndex`（本地文件，baseDir 为索引所在目录）/ `findEntry`（按名精确查找）
+- `installPlugin`：相对路径以索引目录为基准 → 复用 V4.1 `loadPlugin` 全部校验与去重；去重命中（count 0）= 幂等成功；返回 `pluginPath` 可直接写入 config.plugins 常驻
+
+### B. 示例插件与文档
+- `examples/plugins/echo-tools.mjs`：真实可加载运行的示例（word_count + timestamp 两工具）
+- `examples/marketplace-index.json`：v1 索引格式示例
+- `PLUGIN-PROTOCOL.md`：插件形状 / 加载语义 / 安全边界文档
+
+---
+
 ## V4.1 — 2026-08-30 — 插件开放协议（强化）+ IDE 侧 /plan 入口
 
 > 纲领文档：`V4.1-ITERATION-PROMPT.md`。诚实边界：V1.4 已有 loadPlugin 与 CLI 配置接线——本轮把弱协议补成可依赖的开放协议。

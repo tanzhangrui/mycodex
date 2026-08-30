@@ -351,6 +351,10 @@ class LRUCache<K, V> {
 
 export class ContextEngine {
   private workingDir: string = '';
+  /** V5.0 多根工作区（null = 单根模式，键空间无前缀，完全向后兼容） */
+  private multiRoots: import('../core/workspace.js').WorkspaceRoot[] | null = null;
+  /** 持久化指纹键：单根 = workingDir（兼容旧缓存）；多根 = 全部根路径拼接（缓存隔离） */
+  private persistKey: string = '';
   private fileIndex: FileIndexEntry[] = [];
   private filePathSet = new Set<string>();
   private fileTrie = new FileTrie();
@@ -375,10 +379,23 @@ export class ContextEngine {
    * 扫描项目目录，构建文件索引。
    * V3.2 懒加载：扫描阶段只 stat 不读内容——文件内容/符号/imports 全部按需读取。
    * V3.4：扫描后加载持久化符号缓存（指纹校验通过的直接种子，免读盘）。
+   * V5.0：支持多根（string[]）——键空间统一为 rootName/rel，四路召回与 import 图零改动即跨根。
+   * 单根（string）行为与旧版完全一致（无前缀键）。
    * 隐私：敏感文件（.env*、私钥、凭据等）绝不入索引。
    */
-  async index(workingDir: string): Promise<void> {
-    this.workingDir = resolve(workingDir);
+  async index(workingDir: string | string[]): Promise<void> {
+    if (Array.isArray(workingDir) && workingDir.length > 1) {
+      const { WorkspaceResolver } = await import('../core/workspace.js');
+      const resolver = new WorkspaceResolver(workingDir);
+      this.multiRoots = [...resolver.rootList];
+      this.workingDir = resolver.primaryRoot;
+      this.persistKey = this.multiRoots.map((r) => r.abs).join('|');
+    } else {
+      this.multiRoots = null;
+      this.workingDir = resolve(Array.isArray(workingDir) ? workingDir[0] : workingDir);
+      this.persistKey = this.workingDir;
+    }
+
     this.fileCache = new LRUCache<string, string>(LRU_SIZE);
     this.importCache = new LRUCache<string, string[]>(LRU_SIZE);
     this.symbolCache = new LRUCache<string, SymbolEntry[]>(LRU_SIZE);
@@ -387,7 +404,7 @@ export class ContextEngine {
     this.symbolIndex = null;
 
     const files: FileIndexEntry[] = [];
-    this.scanDirectory(this.workingDir, 0, files);
+    this.scanAllRoots(files);
     this.applyFileList(files);
     this.indexed = true;
 
@@ -398,17 +415,29 @@ export class ContextEngine {
     this.loadRules();
   }
 
+  /** 扫描全部根：单根无前缀；多根以 rootName/ 前缀统一键空间 */
+  private scanAllRoots(out: FileIndexEntry[]): void {
+    if (this.multiRoots) {
+      for (const root of this.multiRoots) {
+        this.scanDirectory(root.abs, 0, out, root.abs, `${root.name}/`);
+      }
+    } else {
+      this.scanDirectory(this.workingDir, 0, out, this.workingDir, '');
+    }
+  }
+
   /**
    * V3.4 增量刷新：重扫目录（stat-only 便宜），按 size/mtime 双指纹
    * 只失效变更文件的缓存（内容/符号/imports/嵌入/持久化种子）。
    * 符号索引置空惰性重建——未变文件命中逐文件缓存，无重读盘。
+   * V5.0：多根模式下重扫全部根（统一键空间不变）。
    */
   refresh(): void {
     if (!this.indexed || !this.workingDir) return;
 
     const prev = new Map(this.fileIndex.map((e) => [e.path, e]));
     const files: FileIndexEntry[] = [];
-    this.scanDirectory(this.workingDir, 0, files);
+    this.scanAllRoots(files);
     const nextPaths = new Set(files.map((e) => e.path));
 
     // 删除的文件 → 失效全部缓存
@@ -443,7 +472,11 @@ export class ContextEngine {
     for (const f of files) this.fileTrie.insert(f.path);
   }
 
-  private scanDirectory(dir: string, depth: number, out: FileIndexEntry[]): void {
+  /**
+   * 递归扫描目录。V5.0：baseDir + prefix 参数化——多根时以 rootName/ 前缀
+   * 生成统一键空间，单根时 prefix 为空串与旧行为完全一致。
+   */
+  private scanDirectory(dir: string, depth: number, out: FileIndexEntry[], baseDir: string, prefix: string): void {
     if (depth > 10) return;
 
     const ignored = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.venv', 'coverage']);
@@ -458,9 +491,9 @@ export class ContextEngine {
         try {
           const stat = statSync(fullPath);
           if (stat.isDirectory()) {
-            this.scanDirectory(fullPath, depth + 1, out);
+            this.scanDirectory(fullPath, depth + 1, out, baseDir, prefix);
           } else if (stat.isFile() && stat.size < 1_048_576) {
-            const relPath = normalizeRelPath(relative(this.workingDir, fullPath));
+            const relPath = prefix + normalizeRelPath(relative(baseDir, fullPath));
 
             // 隐私红线：敏感文件绝不入索引（复用 privacy-guard 判定）
             if (isSensitivePath(relPath) || isSensitivePath(entry)) continue;
@@ -496,6 +529,23 @@ export class ContextEngine {
   }
 
   /**
+   * V5.0 统一键 → 绝对路径。多根模式按 rootName 前缀路由到对应根；
+   * 单根模式与旧行为完全一致（join(workingDir, key)）。
+   */
+  private keyToAbs(key: string): string {
+    if (this.multiRoots) {
+      const sepIdx = key.indexOf('/');
+      const rootName = sepIdx === -1 ? key : key.slice(0, sepIdx);
+      const root = this.multiRoots.find((r) => r.name === rootName);
+      if (root) {
+        const rest = sepIdx === -1 ? '' : key.slice(sepIdx + 1);
+        return rest ? join(root.abs, rest) : root.abs;
+      }
+    }
+    return join(this.workingDir, key);
+  }
+
+  /**
    * 获取文件内容（懒加载 + LRU 缓存）
    */
   getFileContent(relPath: string): string | null {
@@ -504,7 +554,7 @@ export class ContextEngine {
     if (cached !== undefined) return cached;
     if (!this.filePathSet.has(key)) return null;
 
-    const fullPath = join(this.workingDir, key);
+    const fullPath = this.keyToAbs(key);
     try {
       const content = readFileSync(fullPath, 'utf-8');
       this.fileCache.set(key, content);
@@ -1067,7 +1117,7 @@ export class ContextEngine {
 
     const payload = {
       version: 1 as const,
-      workingDir: this.workingDir,
+      workingDir: this.persistKey,
       savedAt: new Date().toISOString(),
       files: [...byFile.entries()].slice(0, MAX_PERSIST_FILES).map(([path, s]) => ({
         path,
@@ -1080,8 +1130,8 @@ export class ContextEngine {
   }
 
   private cacheFilePath(): string | null {
-    if (!this.workingDir) return null;
-    const h = fnv1a(normalize(this.workingDir)).toString(36);
+    if (!this.persistKey) return null;
+    const h = fnv1a(normalize(this.persistKey)).toString(36);
     return join(getConfigDir(), 'cache', 'context', `${h}.json`);
   }
 
@@ -1098,7 +1148,7 @@ export class ContextEngine {
         workingDir: string;
         files: Array<{ path: string; size: number; mtime: number; symbols: Array<{ name: string; kind: SymbolKind; line: number }> }>;
       };
-      if (data.version !== 1 || data.workingDir !== this.workingDir) return;
+      if (data.version !== 1 || data.workingDir !== this.persistKey) return;
 
       const current = new Map(this.fileIndex.map((e) => [e.path, e]));
       for (const f of data.files ?? []) {
@@ -1253,14 +1303,18 @@ let sharedEngineDir = '';
  * 获取进程级共享引擎实例（按 workingDir 缓存）。
  * agent-loop 与 IDE 聊天 @codebase 共享同一索引——内核唯一原则，
  * 杜绝双份内存与双份扫描。失败返回 null（调用方静默降级）。
+ * V5.0：支持多根（string[]，键空间统一为 rootName/rel）。
  */
-export function getSharedContextEngine(workingDir: string): ContextEngine | null {
+export function getSharedContextEngine(workingDir: string | string[]): ContextEngine | null {
   try {
-    if (!sharedEngine || sharedEngineDir !== workingDir) {
+    const cacheKey = Array.isArray(workingDir)
+      ? workingDir.map((d) => resolve(d)).join('|')
+      : resolve(workingDir);
+    if (!sharedEngine || sharedEngineDir !== cacheKey) {
       sharedEngine = new ContextEngine();
       // 扫描是轻量的（stat-only 零内容读取）
       void sharedEngine.index(workingDir);
-      sharedEngineDir = workingDir;
+      sharedEngineDir = cacheKey;
     }
     return sharedEngine;
   } catch {

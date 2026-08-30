@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "name": "echo-tools",
+      "version": "1.0.0",
+      "description": "示例插件：word_count 词数统计 + timestamp 时间戳格式化",
+      "source": {
+        "kind": "file",
+        "path": "./plugins/echo-tools.mjs"
+      }
+    }
+  ]
+}
