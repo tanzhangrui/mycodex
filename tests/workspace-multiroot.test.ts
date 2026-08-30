@@ -4,7 +4,8 @@
  * ContextEngine 多根（统一键空间 rootName/rel、跨根检索、跨根读内容、
  * import 图同根解析、refresh 增量、单根兼容、共享单例多根缓存）+
  * V5.3 跨根包名互引（根 package.json name → 裸说明符跨根解析）+
- * V5.6 Python 跨根（pyproject.toml name 别名 + dotted 说明符解析）
+ * V5.6 Python 跨根（pyproject.toml name 别名 + dotted 说明符解析）+
+ * V5.7 tsconfig paths 别名（单根/多根、最长前缀匹配、baseUrl）
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
@@ -452,5 +453,151 @@ describe('ContextEngine Python 跨根 import（V5.6 pyproject 别名）', () => 
     await e3.index(p3);
     expect(e3.parseImports('pkg/m.py')).toEqual(['pkg/n.py']);
     rmSync(p3, { recursive: true, force: true });
+  });
+});
+
+// ---- V5.7 tsconfig paths 别名 ----
+
+describe('ContextEngine tsconfig paths 别名（V5.7）', () => {
+  let parent: string;
+  let webRoot: string; // 目录名 web：tsconfig paths "@/*" → "src/*"
+  let uiRoot: string; // 目录名 uikit：tsconfig paths "@ui/*" → "lib/*"（baseUrl="lib"）
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    parent = mkdtempSync(join(tmpdir(), 'codex-ws-tsp-'));
+    webRoot = join(parent, 'web');
+    uiRoot = join(parent, 'uikit');
+    mkdirSync(join(webRoot, 'src', 'utils'), { recursive: true });
+    mkdirSync(join(uiRoot, 'lib', 'button'), { recursive: true });
+
+    // web 根：`@/utils` → src/utils；`@legacy/*` 与 `@legacy/v2/*` 并存（最长前缀测试）
+    writeFileSync(
+      join(webRoot, 'tsconfig.json'),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: '.',
+            paths: {
+              '@/*': ['src/*'],
+              '@legacy/*': ['src/old/*'],
+              '@legacy/v2/*': ['src/new/*'],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(join(webRoot, 'src', 'utils', 'format.ts'), 'export function fmt(): string { return "F"; }\n');
+    mkdirSync(join(webRoot, 'src', 'old'), { recursive: true });
+    writeFileSync(join(webRoot, 'src', 'old', 'legacy.ts'), 'export const legacy = 1;\n');
+    mkdirSync(join(webRoot, 'src', 'new'), { recursive: true });
+    writeFileSync(join(webRoot, 'src', 'new', 'legacy.ts'), 'export const legacyV2 = 2;\n');
+
+    // uikit 根：baseUrl "lib" + `@ui/button` → lib/button
+    writeFileSync(
+      join(uiRoot, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { baseUrl: 'lib', paths: { '@ui/*': ['./*'] } } }, null, 2),
+    );
+    writeFileSync(join(uiRoot, 'lib', 'button', 'index.ts'), 'export class Button {}\n');
+
+    // 入口文件：混合 @/ 别名 / 跨根 @ui 别名 / 外部包 / 相对 import
+    writeFileSync(
+      join(webRoot, 'src', 'main.ts'),
+      [
+        "import { fmt } from '@/utils/format';",
+        "import { Button } from '@ui/button';",
+        "import { legacy } from '@legacy/legacy';",
+        "import { legacyV2 } from '@legacy/v2/legacy';",
+        "import _ from 'lodash';",
+        "import { local } from './local';",
+        'export function run(): void { void fmt; void Button; void legacy; void legacyV2; void local; }',
+        '',
+      ].join('\n'),
+    );
+    writeFileSync(join(webRoot, 'src', 'local.ts'), 'export const local = 1;\n');
+
+    e = new ContextEngine();
+    await e.index([webRoot, uiRoot]);
+  });
+
+  afterAll(() => {
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it('同根别名：@/utils/format → src/utils/format.ts', () => {
+    const deps = e.parseImports('web/src/main.ts');
+    expect(deps).toContain('web/src/utils/format.ts');
+  });
+
+  it('跨根别名 + baseUrl：@ui/button → 目标根 lib/button/index.ts', () => {
+    const deps = e.parseImports('web/src/main.ts');
+    expect(deps).toContain('uikit/lib/button/index.ts');
+  });
+
+  it('最长前缀匹配：@legacy/v2/legacy 走 v2 别名（src/new），不落 @legacy 的 src/old', () => {
+    const deps = e.parseImports('web/src/main.ts');
+    expect(deps).toContain('web/src/new/legacy.ts');
+    // 若误走短别名 @legacy：v2 说明符会被拼成 src/old/v2/legacy（不存在 → 弃）
+    expect(deps).not.toContain('web/src/old/v2/legacy.ts');
+  });
+
+  it('普通前缀别名：@legacy/legacy → src/old/legacy.ts', () => {
+    const deps = e.parseImports('web/src/main.ts');
+    expect(deps).toContain('web/src/old/legacy.ts');
+  });
+
+  it('外部包与相对 import 混合场景（总数恰为 5，lodash 不入图）', () => {
+    const deps = e.parseImports('web/src/main.ts');
+    expect(deps).toContain('web/src/local.ts');
+    expect(deps).toHaveLength(5); // format + button + old legacy + v2 legacy + local
+    expect(deps.some((d) => d.includes('lodash'))).toBe(false);
+  });
+
+  it('import 图 BFS 跨根扩展（tsconfig 别名路径）', () => {
+    const related = e.getRelatedFiles(['web/src/main.ts']);
+    expect(related).toContain('web/src/utils/format.ts');
+    expect(related).toContain('uikit/lib/button/index.ts');
+  });
+
+  it('单根 + tsconfig paths：别名同样生效（@/x → src/x）', async () => {
+    const solo = mkdtempSync(join(tmpdir(), 'codex-ws-tsp-solo-'));
+    mkdirSync(join(solo, 'src'), { recursive: true });
+    writeFileSync(
+      join(solo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } } }),
+    );
+    writeFileSync(join(solo, 'src', 'main.ts'), "import { v } from '@/val';\nexport const w = v;\n");
+    writeFileSync(join(solo, 'src', 'val.ts'), 'export const v = 1;\n');
+    const es = new ContextEngine();
+    await es.index(solo);
+    expect(es.parseImports('src/main.ts')).toEqual(['src/val.ts']);
+    rmSync(solo, { recursive: true, force: true });
+  });
+
+  it('JSONC 容错：带注释与尾逗号的 tsconfig 正常解析', async () => {
+    const solo = mkdtempSync(join(tmpdir(), 'codex-ws-tsp-jsonc-'));
+    mkdirSync(join(solo, 'src'), { recursive: true });
+    writeFileSync(
+      join(solo, 'tsconfig.json'),
+      [
+        '{',
+        '  // 编译选项',
+        '  "compilerOptions": {',
+        '    "baseUrl": ".",',
+        '    "paths": {',
+        '      "@/*": ["src/*"], // 别名',
+        '    },',
+        '  },',
+        '}',
+      ].join('\n'),
+    );
+    writeFileSync(join(solo, 'src', 'main.ts'), "import { v } from '@/val';\n");
+    writeFileSync(join(solo, 'src', 'val.ts'), 'export const v = 1;\n');
+    const es = new ContextEngine();
+    await es.index(solo);
+    expect(es.parseImports('src/main.ts')).toEqual(['src/val.ts']);
+    rmSync(solo, { recursive: true, force: true });
   });
 });

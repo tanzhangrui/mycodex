@@ -5,6 +5,50 @@
 
 ---
 
+## V5.8 — 2026-08-30 — 插件更新流（卸旧装新）
+
+> 市场协议至此补齐生命周期最后一环：install（V4.4）→ 远程源（V5.5）→ **update** → remove。
+> 更新不是"再装一次"：registry 去重键是 `name@version`、卸载按名前缀匹配，顺序错了会把刚装的新版卸掉。
+
+### A. `updatePlugin`（marketplace.ts）
+- 升级流：**先 `unloadPlugin(name)` 卸旧 → 再 `installPlugin` 装新**——顺序红线：
+  若先装新后卸旧，按名前缀卸载会命中刚注册的新版（name 相同）
+- 原子性：安装失败 → `removedPaths` 恒空、调用方不动 `config.plugins`——旧版配置原样保留，升级失败不留半成品
+- `removedPaths` 语义：成功后应从配置移除的旧路径（与新路径相同 → 原地刷新，配置零变更）
+- 运行时未加载旧版（`unloadPlugin` 返回 -1）→ 无副作用直装（CLI 冷更新场景）
+
+### B. CLI `codex plugin update <名称> [--index <路径>]`
+- 名称匹配规则与 remove 一致（插件名 / basename / 路径包含）；未安装 → 明确报错引导 install
+- 先 `loadPlugins(currentPaths)` 让运行时与真实启动一致（卸旧才有对象），再走 updatePlugin
+- 配置原子更新：移除 `removedPaths` + 写入新 `pluginPath`；用法/帮助文本同步
+
+### 验收
+- 新增 6 项测试：升级成功（含 unload→load 顺序断言）/ 安装失败原子性（旧版配置不动）/ 同路径原地刷新 / 多旧路径全量清理 / 未加载旧版冷更新 / url 源升级（新缓存路径替换旧缓存）
+- typecheck 零错误 / **270 测试全绿**（264 + 6）
+
+---
+
+## V5.7 — 2026-08-30 — tsconfig paths 别名解析
+
+> V5.3/V5.6 解决了裸包名跨根，但 monorepo 里更常见的引用形态是 `@/utils`、`@shared/ui` 这类
+> tsconfig paths 别名——此前全部被当外部包丢弃，import 图在别名处断裂。
+
+### A. 别名表构建（`buildPathAliases`）
+- 各根读 `tsconfig.json` 的 `compilerOptions.paths` + `baseUrl`：`@shared/*` → 键空间前缀 `<root>/baseUrl/target`
+- 一个别名多目标按序探测；同名别名跨根共存（合并候选）；单根键空间无前缀（`baseUrl/target` 直用）
+- JSONC 容错重写为**字符串感知状态机**：行内注释（`"a": 1, // note`）安全剥离，字符串字面量内的 `//`（URL）不误删，尾逗号容错
+
+### B. 解析接入（`resolvePathAliasImport`）
+- 最长前缀匹配：`@app/*` 与 `@app/legacy/*` 并存时后者优先；精确别名与通配别名统一处理
+- 候选前缀逐一替换 + `probeEntry` 探测（扩展名/index 文件），未命中回退包名别名、再未命中放弃（外部包无假路径）
+- `parseImports` 收集条件扩展：任一根有 paths 别名即收集裸说明符（单根也生效，无 tsconfig 零回归）
+
+### 验收
+- 新增 7 项测试：同根别名 / 跨根别名 + baseUrl / 最长前缀匹配（`@legacy/v2` 不落短别名路径）/ 普通前缀别名 / 外部包与相对 import 混合 / BFS 跨根扩展 / 单根 + JSONC 容错
+- typecheck 零错误 / **264 测试全绿**（257 + 7）
+
+---
+
 ## V5.6 — 2026-08-30 — Python 跨根 import（pyproject 别名）
 
 > V5.3 解决了 TS/JS 裸说明符跨根；Python monorepo（`from my_lib.core import helper`）依旧断在根边界。

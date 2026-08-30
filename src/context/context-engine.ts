@@ -232,6 +232,55 @@ function extractImportSpecifiers(content: string, lang: 'ts' | 'py', includeBare
   return [...new Set(specs)];
 }
 
+/**
+ * JSONC 容错：去行/块注释与尾逗号（tsconfig.json 场景）。
+ * 字符串感知状态机——行内注释（`"a": 1, // note`）安全剥离，
+ * 字符串字面量内的 `//`（如 URL）不会被误删。
+ */
+function stripJsonc(raw: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  while (i < raw.length) {
+    const c = raw[i];
+    if (inString) {
+      out += c;
+      if (c === '\\' && i + 1 < raw.length) {
+        out += raw[i + 1]; // 转义序列原样保留
+        i += 2;
+        continue;
+      }
+      if (c === '"') inString = false;
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      i++;
+      continue;
+    }
+    if (c === '/' && raw[i + 1] === '/') {
+      while (i < raw.length && raw[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && raw[i + 1] === '*') {
+      i += 2;
+      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out.replace(/,(\s*[}\]])/g, '$1'); // 尾逗号
+}
+
+/** 路径分隔符归一化（反斜杠 → 斜杠） */
+const BACKSLASH_RE = /\\/g;
+/** 去开头斜杠（别名剩余段拼接用） */
+const LEADING_SLASH_RE = /^\//;
+
 // ---- V3.4 n-gram 分词（轻量语义检索：token 覆盖率匹配） ----
 
 /**
@@ -373,6 +422,8 @@ export class ContextEngine {
   private multiRoots: WorkspaceRoot[] | null = null;
   /** V5.3 跨根包名互引：根 package.json name → 根名（多根模式构建；单根恒空） */
   private packageAliases = new Map<string, string>();
+  /** V5.7 tsconfig paths 别名：alias 前缀 → 候选键空间前缀列表（单根/多根均构建） */
+  private pathAliases = new Map<string, string[]>();
   /** 持久化指纹键：单根 = workingDir（兼容旧缓存）；多根 = 全部根路径拼接（缓存隔离） */
   private persistKey: string = '';
   private fileIndex: FileIndexEntry[] = [];
@@ -412,11 +463,13 @@ export class ContextEngine {
       this.workingDir = resolver.primaryRoot;
       this.persistKey = this.multiRoots.map((r) => r.abs).join('|');
       this.buildPackageAliases();
+      this.buildPathAliases();
     } else {
       this.multiRoots = null;
       this.workingDir = resolve(Array.isArray(workingDir) ? workingDir[0] : workingDir);
       this.persistKey = this.workingDir;
-      this.packageAliases = new Map(); // 单根：别名模式关闭，行为与旧版完全一致
+      this.packageAliases = new Map(); // 单根：包名别名模式关闭，行为与旧版完全一致
+      this.buildPathAliases(); // V5.7：tsconfig paths 单根也生效（有别名才收集裸说明符，无 tsconfig 零回归）
     }
 
     this.fileCache = new LRUCache<string, string>(LRU_SIZE);
@@ -479,6 +532,59 @@ export class ContextEngine {
         }
       } catch {
         // 无 pyproject.toml → 该根无别名
+      }
+    }
+  }
+
+  /**
+   * V5.7 tsconfig paths 别名：读各根 tsconfig.json 的 compilerOptions.paths，
+   * 将别名前缀映射到键空间前缀（rootName/baseUrl/target）。
+   * - JSONC 容错（行/块注释、尾逗号）
+   * - `@shared/*` → 前缀 `@shared`；目标 `src/shared/*` → 前缀 `<root>/src/shared`
+   * - 一个别名可有多个目标（按序探测）；无 tsconfig / 无 paths → 该根无别名
+   * - 单根键空间无前缀（target 直接是 baseUrl 相对路径）
+   */
+  private buildPathAliases(): void {
+    this.pathAliases = new Map();
+    const roots: Array<{ name: string; abs: string }> = this.multiRoots
+      ? this.multiRoots.map((r) => ({ name: r.name, abs: r.abs }))
+      : [{ name: '', abs: this.workingDir }];
+
+    for (const root of roots) {
+      let paths: Record<string, string[]> | null = null;
+      let baseUrl = '.';
+      try {
+        const raw = readFileSync(join(root.abs, 'tsconfig.json'), 'utf-8');
+        const tsconfig = JSON.parse(stripJsonc(raw)) as {
+          compilerOptions?: { baseUrl?: unknown; paths?: unknown };
+        };
+        const co = tsconfig.compilerOptions;
+        if (typeof co?.baseUrl === 'string' && co.baseUrl.trim()) baseUrl = co.baseUrl.trim();
+        if (co?.paths && typeof co.paths === 'object') {
+          paths = co.paths as Record<string, string[]>;
+        }
+      } catch {
+        continue; // 无 tsconfig / 损坏 → 跳过
+      }
+      if (!paths) continue;
+
+      for (const [alias, targets] of Object.entries(paths)) {
+        if (!Array.isArray(targets) || targets.length === 0) continue;
+        const aliasPrefix = alias.replace(/\/\*$/, '').trim();
+        if (!aliasPrefix) continue;
+        const candidates: string[] = [];
+        for (const t of targets) {
+          if (typeof t !== 'string' || !t.trim()) continue;
+          const targetRel = t.replace(/\/\*$/, '').replace(/\\/g, '/').replace(/\/+$/, '');
+          // 键空间前缀：多根 rootName/baseUrl/target；单根 baseUrl/target（无前缀）
+          const withBase = normalize(`${baseUrl}/${targetRel}`).replace(/\\/g, '/');
+          candidates.push(root.name ? `${root.name}/${withBase}` : withBase);
+        }
+        if (candidates.length > 0) {
+          // 同名别名跨根共存：合并候选（按根声明序探测）
+          const existing = this.pathAliases.get(aliasPrefix) ?? [];
+          this.pathAliases.set(aliasPrefix, [...existing, ...candidates]);
+        }
       }
     }
   }
@@ -762,8 +868,9 @@ export class ContextEngine {
     if (!content) return [];
 
     const resolved: string[] = [];
-    // 多根模式 + 存在包名别名 → 同时收集裸说明符（跨根互引解析用）
-    const includeBare = this.multiRoots !== null && this.packageAliases.size > 0;
+    // 多根模式 + 存在包名别名，或任一根有 tsconfig paths → 收集裸说明符（别名互引解析用）
+    const includeBare =
+      (this.multiRoots !== null && this.packageAliases.size > 0) || this.pathAliases.size > 0;
     for (const spec of extractImportSpecifiers(content, lang, includeBare)) {
       const target = this.resolveImport(key, spec, lang);
       if (target && target !== key) resolved.push(target);
@@ -777,10 +884,13 @@ export class ContextEngine {
    * 将相对 import 说明符解析为索引内的 relPath（扩展名/索引文件探测）
    */
   private resolveImport(fromFile: string, spec: string, lang: 'ts' | 'py'): string | null {
+    // V5.7 tsconfig paths 优先：`@shared/utils` → 键空间前缀替换后探测
     // V5.3 跨根包名互引：裸说明符（非 ./ ../ 开头）走包名别名解析。
-    // 未命中别名的外部包（node:fs / react / lodash 等）不属于工作区 → 直接放弃，
+    // 未命中任何别名的外部包（node:fs / react / lodash 等）不属于工作区 → 直接放弃，
     // 与旧版"裸说明符不收集"行为等价（不会误拼出 dirname/pkg 假路径）。
-    if (!spec.startsWith('.') && this.packageAliases.size > 0) {
+    if (!spec.startsWith('.') && (this.pathAliases.size > 0 || this.packageAliases.size > 0)) {
+      const viaPaths = this.resolvePathAliasImport(spec);
+      if (viaPaths) return viaPaths;
       return this.resolvePackageImport(spec);
     }
 
@@ -795,6 +905,36 @@ export class ContextEngine {
         const candidate = `${base}/${idx}`;
         if (this.filePathSet.has(candidate)) return candidate;
       }
+    }
+    return null;
+  }
+
+  /**
+   * V5.7 tsconfig paths 别名解析：`@shared/utils` → 候选前缀逐一替换探测。
+   * 最长前缀匹配（`@app/*` 与 `@app/legacy/*` 并存时优先后者）；
+   * 精确别名（无 `/*` 的 `@app`）与通配别名统一处理。
+   */
+  private resolvePathAliasImport(spec: string): string | null {
+    if (this.pathAliases.size === 0) return null;
+    const normalized = spec.replace(BACKSLASH_RE, '/');
+
+    // 最长前缀匹配：spec === prefix 或 spec 以 prefix/ 开头
+    let bestPrefix = '';
+    for (const prefix of this.pathAliases.keys()) {
+      if (
+        (normalized === prefix || normalized.startsWith(prefix + '/')) &&
+        prefix.length > bestPrefix.length
+      ) {
+        bestPrefix = prefix;
+      }
+    }
+    if (!bestPrefix) return null;
+
+    const rest = normalized.slice(bestPrefix.length).replace(LEADING_SLASH_RE, '');
+    for (const candidate of this.pathAliases.get(bestPrefix) ?? []) {
+      const base = rest.length > 0 ? candidate + '/' + rest : candidate;
+      const hit = this.probeEntry(base);
+      if (hit) return hit;
     }
     return null;
   }

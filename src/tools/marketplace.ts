@@ -1,6 +1,7 @@
 /**
  * V4.4 — 插件市场索引协议（v1）
  * V5.5 — 远程源（url）安全下载
+ * V5.8 — 插件更新（卸旧装新版本升级流）
  * ==========================================
  *
  * 索引是静态 JSON，可托管在任意位置（GitHub raw / 内网文件服务器 / 本地）。
@@ -52,6 +53,22 @@ export interface InstallResult {
   detail: string;
   /** 成功后可直接写入 config.plugins 的绝对路径 */
   pluginPath?: string;
+}
+
+/** V5.8 更新器：加载 + 卸载（测试可注入桩） */
+export interface PluginUpdater {
+  loadPlugin: (pluginPath: string) => Promise<number>;
+  unloadPlugin: (pluginId: string) => number;
+}
+
+export interface UpdateResult {
+  name: string;
+  success: boolean;
+  detail: string;
+  /** 成功后可直接写入 config.plugins 的新版绝对路径 */
+  pluginPath?: string;
+  /** 成功后应从 config.plugins 移除的旧路径（与新路径相同则不含） */
+  removedPaths: string[];
 }
 
 /** 单索引文件条目上限（防恶意巨型索引） */
@@ -222,6 +239,49 @@ async function defaultFetch(url: string): Promise<ArrayBuffer> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`下载失败: HTTP ${res.status}`);
   return res.arrayBuffer();
+}
+
+/**
+ * V5.8 插件更新：卸旧 → 装新（版本升级流）。
+ *
+ * 顺序红线：必须先 unloadPlugin(旧) 再 installPlugin(新)——
+ * registry 去重键是 name@version，卸载按名前缀匹配；
+ * 若先装新后卸旧，按名卸载可能误删刚注册的新版。
+ *
+ * 原子性：安装失败时 removedPaths 恒为空——调用方不动 config.plugins，
+ * 旧版配置原样保留（下次启动仍加载旧版，升级失败不留半成品）。
+ *
+ * @param currentPaths 旧版在 config.plugins 中的路径（与新路径相同 → 原地刷新）
+ */
+export async function updatePlugin(
+  loaded: { index: MarketplaceIndex; baseDir: string },
+  entry: MarketplaceEntry,
+  registry: PluginUpdater,
+  currentPaths: string[],
+  fetcher: UrlFetcher = defaultFetch,
+): Promise<UpdateResult> {
+  // 先卸旧（按名）：本进程未加载时返回 -1，无副作用
+  const unloadedTools = registry.unloadPlugin(entry.name);
+
+  const result = await installPlugin(loaded, entry, registry, fetcher);
+  if (!result.success) {
+    return {
+      name: entry.name,
+      success: false,
+      detail: `升级到 ${entry.version} 失败: ${result.detail}（旧版配置未动）`,
+      removedPaths: [],
+    };
+  }
+
+  const removedPaths = currentPaths.filter((p) => p !== result.pluginPath);
+  const unloadNote = unloadedTools > 0 ? `，卸载旧版 ${unloadedTools} 个工具` : '';
+  return {
+    name: entry.name,
+    success: true,
+    detail: `已升级到 ${entry.version}${unloadNote}（${result.detail}）`,
+    pluginPath: result.pluginPath,
+    removedPaths,
+  };
 }
 
 /**

@@ -15,7 +15,9 @@ import {
   loadMarketplaceIndex,
   findEntry,
   installPlugin,
+  updatePlugin,
   type PluginLoader,
+  type PluginUpdater,
   type UrlFetcher,
 } from '../src/tools/marketplace.js';
 
@@ -407,5 +409,115 @@ describe('url 源：installPlugin 下载与校验', () => {
     const result = await installPlugin({ index: { version: 1, plugins: [] }, baseDir: '.' }, entry, loader, fetcher);
     expect(result.success).toBe(true);
     expect(fetcher.calls).toBe(0);
+  });
+});
+
+// ---- V5.8 插件更新（卸旧装新版本升级流）----
+
+describe('updatePlugin', () => {
+  const loaded = (() => {
+    const idx = parseMarketplaceIndex(VALID_INDEX)!;
+    return { index: idx, baseDir: 'C:\\base' };
+  })();
+
+  /** 桩更新器：记录调用顺序，可配置 loadPlugin 行为 */
+  function stubRegistry(
+    behavior: { load?: (p: string) => number | Promise<number>; unloadReturn?: number } = {},
+  ): PluginUpdater & { calls: string[] } {
+    const stub = {
+      calls: [] as string[],
+      async loadPlugin(p: string): Promise<number> {
+        stub.calls.push(`load:${p}`);
+        if (behavior.load) return await behavior.load(p);
+        return 2;
+      },
+      unloadPlugin(id: string): number {
+        stub.calls.push(`unload:${id}`);
+        return behavior.unloadReturn ?? 2;
+      },
+    };
+    return stub;
+  }
+
+  it('升级成功：先卸旧（按名）后装新，removedPaths 含旧路径、pluginPath 为新路径', async () => {
+    const reg = stubRegistry();
+    const oldPath = 'C:\\config\\plugins\\echo-tools-0.9.0-abcd1234.mjs';
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, [oldPath]);
+    expect(result.success).toBe(true);
+    expect(result.pluginPath).toBe(join('C:\\base', 'plugins', 'echo-tools.mjs'));
+    expect(result.removedPaths).toEqual([oldPath]);
+    expect(result.detail).toContain('已升级到 1.0.0');
+    // 顺序红线：unload 必须先于 load（按名卸载晚于装新会误删新版注册）
+    expect(reg.calls[0]).toBe('unload:echo-tools');
+    expect(reg.calls[1]).toBe('load:' + join('C:\\base', 'plugins', 'echo-tools.mjs'));
+    expect(reg.calls).toHaveLength(2);
+  });
+
+  it('原子性：安装失败 → removedPaths 恒空（旧版配置不动），detail 含失败原因', async () => {
+    const reg = stubRegistry({ load: () => { throw new Error('新版协议校验失败'); } });
+    const oldPath = 'C:\\config\\plugins\\echo-tools-0.9.0-abcd1234.mjs';
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, [oldPath]);
+    expect(result.success).toBe(false);
+    expect(result.removedPaths).toEqual([]);
+    expect(result.pluginPath).toBeUndefined();
+    expect(result.detail).toContain('升级到 1.0.0 失败');
+    expect(result.detail).toContain('新版协议校验失败');
+    expect(result.detail).toContain('旧版配置未动');
+  });
+
+  it('同路径原地刷新：新旧路径相同 → removedPaths 为空（配置无需变更）', async () => {
+    const reg = stubRegistry();
+    const samePath = join('C:\\base', 'plugins', 'echo-tools.mjs');
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, [samePath]);
+    expect(result.success).toBe(true);
+    expect(result.pluginPath).toBe(samePath);
+    expect(result.removedPaths).toEqual([]);
+  });
+
+  it('多条旧路径（url 缓存 + file 源并存）全部列入 removedPaths', async () => {
+    const reg = stubRegistry();
+    const old1 = 'C:\\config\\plugins\\echo-tools-0.9.0-11111111.mjs';
+    const old2 = 'D:\\legacy\\echo-tools.mjs';
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, [old1, old2]);
+    expect(result.success).toBe(true);
+    expect(result.removedPaths).toEqual([old1, old2]);
+  });
+
+  it('运行时未加载旧版（unloadPlugin 返回 -1）→ 仍可升级，detail 不含卸载信息', async () => {
+    const reg = stubRegistry({ unloadReturn: -1 });
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, ['C:\\old\\echo-tools.mjs']);
+    expect(result.success).toBe(true);
+    expect(result.detail).not.toContain('卸载旧版');
+  });
+
+  it('url 源升级：新版本缓存文件名不同 → 旧缓存路径列入 removedPaths', async () => {
+    const PLUGIN_V2 = `export const plugin = { name: 'remote-tool', version: '2.0.0', register: () => 1 };\n`;
+    const shaV2 = createHash('sha256').update(PLUGIN_V2).digest('hex');
+    const configDir = join(tmpdir(), `codex-test-config-v58-${Date.now()}`);
+    process.env.CODEX_CONFIG_PATH = configDir;
+    try {
+      const fetcher = (async () =>
+        new TextEncoder().encode(PLUGIN_V2).buffer as ArrayBuffer) as UrlFetcher;
+      const reg = stubRegistry();
+      const oldCache = join(configDir, 'plugins', 'remote-tool-1.0.0-aaaaaaaa.mjs');
+      const entry = {
+        name: 'remote-tool',
+        version: '2.0.0',
+        source: { kind: 'url' as const, url: 'https://cdn.example.com/remote-tool.mjs', sha256: shaV2 },
+      };
+      const result = await updatePlugin(
+        { index: { version: 1, plugins: [] }, baseDir: '.' },
+        entry,
+        reg,
+        [oldCache],
+        fetcher,
+      );
+      expect(result.success).toBe(true);
+      expect(result.pluginPath).not.toBe(oldCache);
+      expect(result.removedPaths).toEqual([oldCache]);
+      expect(existsSync(result.pluginPath!)).toBe(true);
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 });
