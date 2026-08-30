@@ -83,12 +83,54 @@ class ToolRegistry {
   private cache: Map<string, CacheEntry> = new Map();
   /** V4.1 已加载插件（name@version），防重复加载 */
   private loadedPlugins = new Set<string>();
+  /** V5.2 工具 → 所属插件（name@version）；卸载插件时按归属清理工具 */
+  private toolOwner = new Map<string, string>();
+  /** 当前正在注册的插件（loadPlugin 期间设置，register 归属记录用） */
+  private currentPlugin: string | null = null;
 
   register(tool: RegisteredTool): void {
     if (this.tools.has(tool.name)) {
       throw new Error(`工具 "${tool.name}" 已注册`);
     }
     this.tools.set(tool.name, tool);
+    if (this.currentPlugin) {
+      this.toolOwner.set(tool.name, this.currentPlugin);
+    }
+  }
+
+  /**
+   * V5.2 卸载插件：移除其注册的全部工具 + 去重标记。
+   * @param pluginId name@version（或仅 name——前缀匹配）
+   * @returns 移除的工具数量（插件未加载返回 -1）
+   */
+  unloadPlugin(pluginId: string): number {
+    // 精确 id 或 name 前缀匹配（name 不含 @ 时）
+    const exact = this.loadedPlugins.has(pluginId);
+    const match = exact
+      ? pluginId
+      : [...this.loadedPlugins].find((id) => id.split('@')[0] === pluginId);
+    if (!match) return -1;
+
+    let removed = 0;
+    for (const [toolName, owner] of this.toolOwner) {
+      if (owner === match) {
+        this.tools.delete(toolName);
+        this.toolOwner.delete(toolName);
+        // 失效该工具的全部缓存条目
+        for (const key of this.cache.keys()) {
+          if (key.startsWith(`${toolName}:`)) this.cache.delete(key);
+        }
+        removed++;
+      }
+    }
+    this.loadedPlugins.delete(match);
+    logger.info(`已卸载插件 "${match}"（移除 ${removed} 个工具）`);
+    return removed;
+  }
+
+  /** V5.2 已加载插件 id 列表（name@version） */
+  get loadedPluginIds(): string[] {
+    return [...this.loadedPlugins];
   }
 
   get(name: string): RegisteredTool | undefined {
@@ -269,10 +311,20 @@ class ToolRegistry {
       return 0;
     }
 
-    const count = await plugin.register(this);
+    const count = await this.withPluginScope(pluginId, async () => await plugin.register!(this));
     this.loadedPlugins.add(pluginId);
     logger.info(`从插件 "${pluginId}" (${pluginPath}) 加载了 ${count} 个工具`);
     return count;
+  }
+
+  /** 在插件注册期间标记归属（register 的工具记入 toolOwner） */
+  private async withPluginScope(pluginId: string, fn: () => Promise<number>): Promise<number> {
+    this.currentPlugin = pluginId;
+    try {
+      return await fn();
+    } finally {
+      this.currentPlugin = null;
+    }
   }
 
   /**
@@ -311,6 +363,7 @@ class ToolRegistry {
     this.tools.clear();
     this.cache.clear();
     this.loadedPlugins.clear();
+    this.toolOwner.clear();
   }
 }
 

@@ -119,3 +119,62 @@ describe('loadPlugins（批量隔离）', () => {
     expect(toolRegistry.get('echo_tool')).toBeDefined();
   });
 });
+
+// ---- V5.2 插件卸载 ----
+
+describe('unloadPlugin（V5.2）', () => {
+  it('按 name 卸载：工具移除 + 去重标记清除（可重新加载）', async () => {
+    const path = writeValidPlugin('removable', '1.0.0', 'remove_tool');
+    expect(await toolRegistry.loadPlugin(path)).toBe(1);
+    expect(toolRegistry.get('remove_tool')).toBeDefined();
+
+    const removed = toolRegistry.unloadPlugin('removable');
+    expect(removed).toBe(1);
+    expect(toolRegistry.get('remove_tool')).toBeUndefined();
+    expect(toolRegistry.size).toBe(0);
+    expect(toolRegistry.loadedPluginIds).toEqual([]);
+
+    // 去重标记已清除 → 同一插件可重新加载
+    expect(await toolRegistry.loadPlugin(path)).toBe(1);
+    expect(toolRegistry.get('remove_tool')).toBeDefined();
+  });
+
+  it('按完整 id（name@version）卸载', async () => {
+    const path = writeValidPlugin('id-based', '3.1.4', 'id_tool');
+    await toolRegistry.loadPlugin(path);
+    expect(toolRegistry.unloadPlugin('id-based@3.1.4')).toBe(1);
+    expect(toolRegistry.get('id_tool')).toBeUndefined();
+  });
+
+  it('卸载只移除目标插件的工具（其他插件不受影响）', async () => {
+    const a = writeValidPlugin('plugin-a', '1.0.0', 'tool_a');
+    const b = writeValidPlugin('plugin-b', '1.0.0', 'tool_b');
+    await toolRegistry.loadPlugin(a);
+    await toolRegistry.loadPlugin(b);
+    expect(toolRegistry.size).toBe(2);
+
+    expect(toolRegistry.unloadPlugin('plugin-a')).toBe(1);
+    expect(toolRegistry.get('tool_a')).toBeUndefined();
+    expect(toolRegistry.get('tool_b')).toBeDefined(); // plugin-b 完好
+    expect(toolRegistry.loadedPluginIds).toEqual(['plugin-b@1.0.0']);
+  });
+
+  it('未加载的插件返回 -1', () => {
+    expect(toolRegistry.unloadPlugin('never-loaded')).toBe(-1);
+  });
+
+  it('卸载后同名工具可被其他来源重新注册（缓存失效）', async () => {
+    const path = writeValidPlugin('cache-test', '1.0.0', 'cache_tool');
+    await toolRegistry.loadPlugin(path);
+    expect(toolRegistry.unloadPlugin('cache-test')).toBe(1);
+
+    // 同名工具重新注册不冲突（工具 Map 已清理）
+    toolRegistry.register({
+      name: 'cache_tool',
+      description: '新来源',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => ({ success: true, output: 'ok' }),
+    });
+    expect(toolRegistry.get('cache_tool')).toBeDefined();
+  });
+});

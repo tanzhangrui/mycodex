@@ -5,6 +5,27 @@
 
 ---
 
+## V5.2 — 2026-08-30 — IDE 多根感知 + 插件卸载
+
+> V5.1 的两个收尾：IDE 侧接上多根（VS Code 多根文件夹零配置生效）；插件生命周期闭环（装 → 常驻 → 卸）。
+
+### A. IDE 多根感知（`codex-ide`）
+- `AgentService.workspaceDirs` getter：VS Code 多根文件夹（File > Add Folder to Workspace）→ 全部根透传内核（跨根检索）；单根返回 string（零开销兼容）
+- `send` / `sendPlanned` / `newSession` 全部走 `workspaceDirs`；沙箱/命令确认以主根为基准（`primaryRootOf`）
+- **零配置零 UI 改动**：用户在 VS Code 里加个文件夹，检索域自动扩展
+
+### B. 插件卸载（registry + CLI）
+- `ToolRegistry.unloadPlugin(name 或 name@version)`：按归属移除该插件注册的全部工具 + 清去重标记 + 失效工具缓存；未加载返回 -1
+- 归属跟踪：`loadPlugin` 注册期间经 `withPluginScope` 标记 `toolOwner`（register 的工具记入所属插件）
+- `codex plugin remove <名称>`（别名 uninstall）：配置移除（路径/basename/包含三重匹配）+ 运行时卸载
+- `codex plugin list` 增强：对照 config.plugins 标注 `[已安装]`
+
+### 验收
+- 新增 5 项测试：按 name 卸载（工具移除 + 可重载）/ 按完整 id 卸载 / 卸载隔离（他插件不受影响）/ 未加载 -1 / 卸载后同名工具可重注册
+- 双侧 typecheck 零错误 / **228 测试全绿**（223 + 5）/ 双侧打包成功 / install → remove 全生命周期 CLI 冒烟通过
+
+---
+
 ## V5.1 — 2026-08-30 — 多根入口接线 + 插件市场命令
 
 > V5.0 交付了多根核心层原语，本轮把它接到用户手里：CLI 一参数进多根，插件市场一条命令装常驻。

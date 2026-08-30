@@ -27,7 +27,7 @@ import { config as loadDotenv } from 'dotenv';
 loadDotenv(); // 必须在所有其他 import 之前加载 .env
 
 import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, isAbsolute, basename } from 'node:path';
 import { render } from 'ink';
 import React from 'react';
 import { initConfig, loadConfig, saveConfig, getConfigDir, getProviderDisplayName } from './config/config.js';
@@ -369,11 +369,14 @@ async function handlePlugin(args: string[]): Promise<void> {
       console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
       process.exit(1);
     }
+    const installed = new Set(loadConfig().plugins ?? []);
     console.log(`市场索引: ${indexFile}（${loaded.index.plugins.length} 个插件）`);
     console.log('');
     for (const p of loaded.index.plugins) {
+      const pluginPath = isAbsolute(p.source.path) ? p.source.path : resolve(loaded.baseDir, p.source.path);
+      const mark = installed.has(pluginPath) ? ' [已安装]' : '';
       const desc = p.description ? ` — ${p.description}` : '';
-      console.log(`  ${p.name}@${p.version}${desc}`);
+      console.log(`  ${p.name}@${p.version}${mark}${desc}`);
       console.log(`    源: ${p.source.path}`);
     }
     return;
@@ -421,9 +424,51 @@ async function handlePlugin(args: string[]): Promise<void> {
     return;
   }
 
+  if (sub === 'remove' || sub === 'uninstall') {
+    const positional = rest.filter((a, i) => a !== '--index' && rest[i - 1] !== '--index');
+    const name = positional[0];
+    if (!name) {
+      console.error('用法: codex plugin remove <名称>');
+      process.exit(1);
+    }
+
+    const config = loadConfig();
+    const plugins = config.plugins ?? [];
+    if (plugins.length === 0) {
+      console.error('当前配置中没有常驻插件。');
+      process.exit(1);
+    }
+
+    // 名称匹配：插件名（basename 去扩展名）或路径包含
+    const matches = plugins.filter(
+      (p) => p === name || basename(p).replace(/\.\w+$/, '') === name || p.includes(name),
+    );
+    if (matches.length === 0) {
+      console.error(`错误: 未找到匹配 "${name}" 的已配置插件`);
+      console.error(`已配置: ${plugins.join(', ')}`);
+      process.exit(1);
+    }
+
+    config.plugins = plugins.filter((p) => !matches.includes(p));
+    saveConfig(config);
+
+    // 运行中卸载（本进程内注册过的插件同步移除工具）
+    registerBuiltinTools();
+    const removedTools = toolRegistry.unloadPlugin(name);
+
+    for (const p of matches) {
+      console.log(`✔ 已从配置移除: ${p}`);
+    }
+    if (removedTools > 0) {
+      console.log(`  运行时已卸载 ${removedTools} 个工具`);
+    }
+    return;
+  }
+
   console.error('用法:');
   console.error('  codex plugin list [--index <索引路径>]           列出市场索引中的插件');
   console.error('  codex plugin install <名称> [--index <索引路径>]  安装插件并写入配置常驻');
+  console.error('  codex plugin remove <名称>                       移除常驻插件（配置 + 运行时）');
   process.exit(sub ? 1 : 0);
 }
 

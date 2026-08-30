@@ -6,7 +6,7 @@
  */
 
 import * as vscode from 'vscode';
-import { runAgentLoop, type AgentLoopResult, type TokenUsage } from '../../../src/core/agent-loop.js';
+import { runAgentLoop, primaryRootOf, type AgentLoopResult, type TokenUsage, type WorkingDirInput } from '../../../src/core/agent-loop.js';
 import { runPlannedTask, type PlannedTaskResult } from '../../../src/core/orchestrator.js';
 import { InMemoryFileSystem, type FsCheckpoint } from '../../../src/core/in-memory-fs.js';
 import { createSandbox, type Sandbox } from '../../../src/sandbox/sandbox.js';
@@ -82,9 +82,20 @@ export class AgentService {
     private readonly log?: (msg: string) => void,
   ) {}
 
-  /** 工作区根目录 */
+  /** 工作区根目录（主根——单根语义，供相对路径展示等） */
   get workingDir(): string | undefined {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
+
+  /**
+   * V5.2 多根工作区：VS Code 多根文件夹（File > Add Folder to Workspace）时
+   * 返回全部根（string[]，跨根检索）；单根/无文件夹时返回 string/undefined。
+   */
+  get workspaceDirs(): WorkingDirInput | undefined {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) return undefined;
+    if (folders.length === 1) return folders[0].uri.fsPath;
+    return folders.map((f) => f.uri.fsPath);
   }
 
   get isRunning(): boolean {
@@ -161,7 +172,7 @@ export class AgentService {
       this.log?.('[agent] 任务已排队，等待当前任务完成');
       return;
     }
-    const workingDir = this.workingDir;
+    const workingDir = this.workspaceDirs;
     if (!workingDir) {
       this.emitter.fire({ type: 'error', message: '请先打开一个工作区文件夹' });
       return;
@@ -184,7 +195,7 @@ export class AgentService {
     }
     const { preset, apiKey } = resolved;
 
-    // 惰性初始化：注册工具 + 快照工作区
+    // 惰性初始化：注册工具 + 快照工作区（多根时跨根快照）
     if (!this.toolsRegistered) {
       registerBuiltinTools();
       this.toolsRegistered = true;
@@ -194,7 +205,7 @@ export class AgentService {
       await this.fs.snapshot(workingDir);
     }
 
-    const sandbox = this.buildSandbox(workingDir);
+    const sandbox = this.buildSandbox(primaryRootOf(workingDir));
 
     // 检查点：任务前存档（回滚时间线）
     this.pushCheckpoint(userText);
@@ -296,7 +307,7 @@ export class AgentService {
       this.emitter.fire({ type: 'error', message: '当前有任务运行中，请稍候或取消' });
       return;
     }
-    const workingDir = this.workingDir;
+    const workingDir = this.workspaceDirs;
     if (!workingDir) {
       this.emitter.fire({ type: 'error', message: '请先打开一个工作区文件夹' });
       return;
@@ -328,7 +339,7 @@ export class AgentService {
       await this.fs.snapshot(workingDir);
     }
 
-    const sandbox = this.buildSandbox(workingDir);
+    const sandbox = this.buildSandbox(primaryRootOf(workingDir));
     this.pushCheckpoint(userText);
 
     const content = editorContext ? `${editorContext}\n\n${userText}` : userText;
@@ -476,8 +487,9 @@ export class AgentService {
     this.messages = [];
     this.sessionCostCny = 0;
     this.sessionUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-    if (this.fs && this.workingDir) {
-      await this.fs.snapshot(this.workingDir);
+    const dirs = this.workspaceDirs;
+    if (this.fs && dirs) {
+      await this.fs.snapshot(dirs);
     }
     this.emitDirty();
     this.persistSession();
