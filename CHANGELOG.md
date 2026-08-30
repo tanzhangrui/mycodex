@@ -13,13 +13,17 @@
 ### A. v2 负载结构（context-engine.ts）
 
 * `files[]` 新增 `imports`（已解析的仓库内键路径，上限 100/文件；空数组也持久化——区分"无 import"与"未解析"）
+
 * 新增 `roots`（多根元数据：name + abs）、`manifests`（各根 package.json / pyproject.toml / tsconfig.json 的 size+mtime 指纹）、`structureHash`（路径集 + 清单指纹哈希）
+
 * 序列化合并 importCache（本会话）∪ persistedImports（历史种子）；LRUCache 补 `entries()` 遍历接口
 
 ### B. 双门控加载（宁重读勿陈旧）
 
 * 符号种子（v1/v2 通用）：逐文件 size+mtime 指纹，不变
+
 * import 种子（仅 v2）：额外要求 `structureHash` 一致——新增/删除文件、别名清单（tsconfig paths / 包名）任一变化即整体弃用，重新读盘解析（否则"新增文件让原本未解析的 import 变可解析"这类更新会永久丢失）
+
 * v1 旧缓存照常加载（无 imports 字段 → 行为与旧版一致）；损坏/不可读整体弃用静默重建
 
 ### C. 接线
@@ -29,6 +33,7 @@
 ### 验收
 
 * 新增 5 项测试：种子免读盘（索引后改盘上内容种子结果不变）/ 结构指纹门控（新增文件后重解析）/ 清单变化门控（tsconfig 新增走新别名）/ v1 向后兼容（幽灵符号证明旧格式被加载）/ 多根 roots 落盘 + 跨根键空间种子复用
+
 * typecheck 零错误 / **310 测试全绿**（301 + 5 + V5.15 的 4）/ 构建产物 117.2KB
 
 ***
@@ -48,6 +53,7 @@
 ### 验收
 
 * 新增 4 项测试：多根 absToKey（含嵌套根最长优先、越界 null）/ 单根（根本身空串、越界 null）/ cwd 加权改变召回排序
+
 * 修正历史遗留测试期望：嵌套根无 basename 冲突不去重（`inner` 非 `inner-2`）
 
 ***

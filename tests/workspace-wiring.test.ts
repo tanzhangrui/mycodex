@@ -7,7 +7,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { primaryRootOf, runAgentLoop, type AgentCallbacks } from '../src/core/agent-loop.js';
+import { primaryRootOf, runAgentLoop, loadCodexRules, type AgentCallbacks } from '../src/core/agent-loop.js';
 import { InMemoryFileSystem } from '../src/core/in-memory-fs.js';
 import { resetSharedContextEngine } from '../src/context/context-engine.js';
 import type { AIProvider, StreamEvent } from '../src/utils/ai-client.js';
@@ -146,5 +146,84 @@ describe('runAgentLoop 多根接线', () => {
 
     expect(provider.lastSystemPrompt).toContain('Widget');
     resetSharedContextEngine();
+  });
+
+  it('V5.17 多根 CODEX.md：次根规则也注入（标注根名）', async () => {
+    writeFileSync(join(backendRoot, 'CODEX.md'), '后端仓规则：接口必须带错误码。');
+    resetSharedContextEngine();
+    const provider = new PromptCaptureProvider();
+    const fs = new InMemoryFileSystem();
+    await fs.snapshot([frontendRoot, backendRoot]);
+
+    await runAgentLoop(
+      provider,
+      [{ role: 'user', content: 'InvoiceService 在哪里定义', timestamp: new Date().toISOString() }],
+      fs,
+      [frontendRoot, backendRoot],
+      noopCallbacks(),
+    );
+
+    // 两根规则都注入，且带根名标签（Agent 可区分归属）
+    expect(provider.lastSystemPrompt).toContain('前端仓规则');
+    expect(provider.lastSystemPrompt).toContain('后端仓规则');
+    expect(provider.lastSystemPrompt).toContain('CODEX.md（frontend）');
+    expect(provider.lastSystemPrompt).toContain('CODEX.md（backend）');
+    resetSharedContextEngine();
+  });
+});
+
+// ---- V5.17 loadCodexRules ----
+
+describe('loadCodexRules 多根规则合并', () => {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  let isolatedHome: string;
+
+  beforeAll(() => {
+    // 隔离用户级规则目录（避免真实 ~/.codex/CODEX.md 污染断言）
+    isolatedHome = mkdtempSync(join(tmpdir(), 'codex-v517-home-'));
+    process.env.HOME = isolatedHome;
+    process.env.USERPROFILE = isolatedHome;
+  });
+
+  afterAll(() => {
+    process.env.HOME = savedHome;
+    process.env.USERPROFILE = savedUserProfile;
+    rmSync(isolatedHome, { recursive: true, force: true });
+  });
+
+  it('多根：逐根加载 + 根名标签 + 根声明顺序', () => {
+    const rules = loadCodexRules([frontendRoot, backendRoot]);
+    const feIdx = rules.indexOf('前端仓规则');
+    const beIdx = rules.indexOf('后端仓规则');
+    expect(feIdx).toBeGreaterThanOrEqual(0);
+    expect(beIdx).toBeGreaterThan(feIdx); // 首根规则在前
+    expect(rules).toContain('[项目规则 — CODEX.md（frontend）]');
+    expect(rules).toContain('[项目规则 — CODEX.md（backend）]');
+  });
+
+  it('单根：标签无根名（与旧版完全一致）', () => {
+    const rules = loadCodexRules(frontendRoot);
+    expect(rules).toContain('[项目规则 — CODEX.md]');
+    expect(rules).not.toContain('CODEX.md（frontend）');
+    expect(rules).toContain('前端仓规则');
+  });
+
+  it('用户级规则追加在项目规则之后', () => {
+    mkdirSync(join(isolatedHome, '.codex'), { recursive: true });
+    writeFileSync(join(isolatedHome, '.codex', 'CODEX.md'), '用户级全局规则。');
+    const rules = loadCodexRules([frontendRoot, backendRoot]);
+    expect(rules.indexOf('用户级全局规则')).toBeGreaterThan(rules.indexOf('后端仓规则'));
+  });
+
+  it('无规则文件的根静默跳过（用户级仍加载）', () => {
+    const emptyRoot = mkdtempSync(join(tmpdir(), 'codex-v517-empty-'));
+    try {
+      const rules = loadCodexRules(emptyRoot);
+      expect(rules).not.toContain('[项目规则'); // 空根无项目级规则
+      expect(rules).toContain('用户级全局规则'); // 用户级不受影响（前一测试写入）
+    } finally {
+      rmSync(emptyRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -13,7 +13,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, basename } from 'node:path';
 import type { AIProvider } from '../utils/ai-client.js';
 import { TOOL_SYSTEM_PROMPT } from '../utils/ai-client.js';
 import { toolRegistry, type ToolContext } from '../tools/registry.js';
@@ -71,20 +71,28 @@ const MAX_TOOL_LOOPS = 10;
 /**
  * 加载项目规则文件
  * 优先级：项目级 CODEX.md > 用户级 ~/.codex/CODEX.md
+ * V5.17：多根工作区逐根加载 CODEX.md（标注根名，Agent 可区分规则归属根）；
+ * 单根行为与旧版完全一致（标签无根名）。
  */
-function loadCodexRules(workingDir: string): string {
+export function loadCodexRules(workingDir: WorkingDirInput): string {
   const rules: string[] = [];
 
-  // 1. 项目级 CODEX.md
-  const projectRulesPath = join(workingDir, 'CODEX.md');
-  if (existsSync(projectRulesPath)) {
-    try {
-      const content = readFileSync(projectRulesPath, 'utf-8').trim();
-      if (content) {
-        rules.push(`[项目规则 — CODEX.md]\n${content}`);
+  // 1. 项目级 CODEX.md（多根：每根独立）
+  const roots = Array.isArray(workingDir) ? workingDir : [workingDir];
+  for (let i = 0; i < roots.length; i++) {
+    const rootAbs = resolve(roots[i]);
+    const label =
+      Array.isArray(workingDir) && roots.length > 1 ? `CODEX.md（${basename(rootAbs)}）` : 'CODEX.md';
+    const projectRulesPath = join(rootAbs, 'CODEX.md');
+    if (existsSync(projectRulesPath)) {
+      try {
+        const content = readFileSync(projectRulesPath, 'utf-8').trim();
+        if (content) {
+          rules.push(`[项目规则 — ${label}]\n${content}`);
+        }
+      } catch {
+        // 读取失败，忽略
       }
-    } catch {
-      // 读取失败，忽略
     }
   }
 
@@ -115,7 +123,7 @@ function loadCodexRules(workingDir: string): string {
 function buildSystemPrompt(workingDir: WorkingDirInput, userQuery: string, sessionCwd?: string): string {
   const parts: string[] = [TOOL_SYSTEM_PROMPT];
 
-  const rules = loadCodexRules(primaryRootOf(workingDir));
+  const rules = loadCodexRules(workingDir);
   if (rules) {
     parts.push(`<project_rules>\n${rules}\n</project_rules>`);
   }

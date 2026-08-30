@@ -424,6 +424,126 @@ describe('V5.16 持久化格式 v2（imports 种子 + 多根/别名元数据）'
   });
 });
 
+// ---- V5.18 索引体检报告 ----
+
+describe('V5.18 getContextReport（codex context stats 数据源）', () => {
+  it('单根：规模/别名/缓存字段齐全，无缓存 → persisted null', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v518-solo-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'a.ts'), `import { b } from './b';\nexport class Alpha {}\n`);
+    writeFileSync(join(r, 'src', 'b.ts'), `export function beta(): void {}\n`);
+    writeFileSync(join(r, 'README.md'), `非源码文件\n`);
+
+    const e = new ContextEngine();
+    await e.index(r);
+    const report = e.getContextReport();
+
+    expect(report.mode).toBe('single');
+    expect(report.roots).toHaveLength(1);
+    expect(report.roots[0].fileCount).toBe(3);
+    expect(report.fileCount).toBe(3);
+    expect(report.sourceFileCount).toBe(2); // README.md 不计
+    expect(report.symbolCount).toBeGreaterThanOrEqual(2); // Alpha + beta
+    expect(report.importEdgeCount).toBe(1); // a.ts → b.ts
+    expect(report.persisted).toBeNull(); // 首次索引无缓存
+    expect(report.topFiles.length).toBeGreaterThan(0);
+    expect(report.topFiles[0].symbols).toBeGreaterThanOrEqual(report.topFiles[report.topFiles.length - 1].symbols);
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('缓存诊断：落盘后新实例 v2 命中（结构一致 → 种子计数 > 0）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v518-cache-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'a.ts'), `import { b } from './b';\nexport class Alpha {}\n`);
+    writeFileSync(join(r, 'src', 'b.ts'), `export function beta(): void {}\n`);
+
+    const first = new ContextEngine();
+    await first.index(r);
+    first.getContextReport(); // 触发构建 + 排队落盘
+    await first.flushIndexCache();
+
+    const second = new ContextEngine();
+    await second.index(r);
+    const report = second.getContextReport();
+    expect(report.persisted).not.toBeNull();
+    expect(report.persisted!.version).toBe(2);
+    expect(report.persisted!.structureOk).toBe(true);
+    expect(report.persisted!.symbolSeeds).toBeGreaterThan(0);
+    expect(report.persisted!.importSeeds).toBeGreaterThan(0);
+    expect(report.persisted!.savedAt).toBeTruthy();
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('结构指纹失配诊断：新增文件后 structureOk false + importSeeds 归零', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v518-stale-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'a.ts'), `import { helper } from './helper';\nexport class Alpha {}\n`);
+
+    const first = new ContextEngine();
+    await first.index(r);
+    first.getContextReport();
+    await first.flushIndexCache();
+
+    writeFileSync(join(r, 'src', 'helper.ts'), `export const helper = 1;\n`);
+    const second = new ContextEngine();
+    await second.index(r);
+    const report = second.getContextReport();
+    expect(report.persisted!.version).toBe(2);
+    expect(report.persisted!.structureOk).toBe(false);
+    expect(report.persisted!.importSeeds).toBe(0);
+    // 符号种子不受结构指纹影响（逐文件指纹校验）
+    expect(report.persisted!.symbolSeeds).toBeGreaterThan(0);
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('TS ESM `.js` 后缀约定：`./x.js` 解析到 `x.ts`（真实仓库主路径）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v518-esm-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'a.ts'), `import { b } from './b.js';\nexport const a = b;\n`);
+    writeFileSync(join(r, 'src', 'b.ts'), `export const b = 1;\n`);
+    writeFileSync(join(r, 'src', 'c.ts'), `import { d } from './sub/index.js';\nexport const c = d;\n`);
+    mkdirSync(join(r, 'src', 'sub'), { recursive: true });
+    writeFileSync(join(r, 'src', 'sub', 'index.ts'), `export const d = 1;\n`);
+    // 真实 .js 文件仍优先命中（原样候选在前）
+    writeFileSync(join(r, 'src', 'e.ts'), `import { f } from './f.js';\nexport const e = f;\n`);
+    writeFileSync(join(r, 'src', 'f.js'), `export const f = 1;\n`);
+
+    const e = new ContextEngine();
+    await e.index(r);
+    expect(e.parseImports('src/a.ts')).toEqual(['src/b.ts']); // .js → .ts
+    expect(e.parseImports('src/c.ts')).toEqual(['src/sub/index.ts']); // 目录 + index.js → index.ts
+    expect(e.parseImports('src/e.ts')).toEqual(['src/f.js']); // 真实 .js 优先
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('多根：根清单/按根文件数/包名别名计数/跨根 import 边', async () => {
+    const rA = mkdtempSync(join(tmpdir(), 'codex-v518-mr-a-'));
+    const rB = mkdtempSync(join(tmpdir(), 'codex-v518-mr-b-'));
+    mkdirSync(join(rA, 'src'), { recursive: true });
+    mkdirSync(join(rB, 'src'), { recursive: true });
+    writeFileSync(join(rA, 'package.json'), JSON.stringify({ name: '@v518/app' }));
+    writeFileSync(join(rB, 'package.json'), JSON.stringify({ name: '@v518/lib' }));
+    writeFileSync(join(rA, 'src', 'main.ts'), `import { core } from '@v518/lib/src/core';\nexport class Main {}\n`);
+    writeFileSync(join(rB, 'src', 'core.ts'), `export function core(): void {}\n`);
+    writeFileSync(join(rB, 'src', 'util.ts'), `export function util(): void {}\n`);
+
+    const e = new ContextEngine();
+    await e.index([rA, rB]);
+    const report = e.getContextReport();
+
+    expect(report.mode).toBe('multi');
+    expect(report.roots).toHaveLength(2);
+    const nameB = report.roots.find((x) => x.abs === resolve(rB))!.name;
+    expect(report.roots.find((x) => x.abs === resolve(rA))!.fileCount).toBe(2); // package.json + main.ts
+    expect(report.roots.find((x) => x.abs === resolve(rB))!.fileCount).toBe(3);
+    expect(report.packageAliasCount).toBe(2); // @v518/app + @v518/lib
+    expect(report.importEdgeCount).toBe(1); // 跨根：main.ts → lib 根 core.ts
+    expect(report.topFiles.some((f) => f.path.startsWith(`${nameB}/src/`))).toBe(true);
+    rmSync(rA, { recursive: true, force: true });
+    rmSync(rB, { recursive: true, force: true });
+  });
+});
+
 // ---- 增量刷新 ----
 
 describe('refresh（增量更新）', () => {

@@ -38,6 +38,7 @@ import { getSessionTokenUsage, resetSessionTokenUsage } from './core/agent-loop.
 import { createSandbox } from './sandbox/sandbox.js';
 import { createLogger } from './utils/logger.js';
 import { toolRegistry } from './tools/registry.js';
+import { ContextEngine } from './context/context-engine.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import {
   loadMarketplaceIndex,
@@ -107,11 +108,13 @@ Codex — 顶级 CLI AI 编程工具 v${VERSION}
   codex update    检查更新
   codex doctor    环境体检（配置 / 运行时 / 插件健康）
   codex plugin    插件市场（list / search / install / update / outdated / remove）
+  codex context   上下文引擎（stats — 索引/缓存/召回体检）
   codex --help    显示此帮助
   codex --version 显示版本号
 
 多仓库工作区:
   codex chat --workspace <目录1>,<目录2>   多根模式（跨仓检索，首根为主根）
+  codex context stats <目录1> <目录2>      多根索引体检
 
 功能:
   - AI 对话（流式响应）+ 并行工具执行
@@ -814,6 +817,103 @@ async function handleDoctor(): Promise<void> {
   }
 }
 
+// ---- V5.18 上下文引擎体检 ----
+
+/**
+ * `codex context stats [目录...]`
+ * 索引/缓存/召回体检：多根元数据、文件与符号规模、import 边、别名表、
+ * 持久化缓存命中状态（版本/结构指纹/种子数）、符号 top-5 文件。
+ * 目录参数缺省 cwd；多个目录 = 多根工作区。
+ */
+async function handleContext(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (sub !== 'stats') {
+    console.log('用法: codex context stats [目录...]（缺省当前目录；多目录 = 多根工作区）');
+    return;
+  }
+
+  const targets = args.slice(1).filter((a) => !a.startsWith('-'));
+  const workingDir: string | string[] =
+    targets.length > 1 ? targets.map((t) => resolve(t)) : resolve(targets[0] ?? '.');
+
+  console.log(`Codex v${VERSION} 上下文引擎体检`);
+  console.log('');
+  let warnings = 0;
+  const warn = (msg: string, hint?: string) => {
+    warnings++;
+    console.log(`  ! ${msg}`);
+    if (hint) console.log(`    → ${hint}`);
+  };
+
+  const engine = new ContextEngine();
+  try {
+    await engine.index(workingDir);
+  } catch (err) {
+    console.error(`错误: 索引失败 — ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  const report = engine.getContextReport();
+
+  // 1) 工作区
+  console.log('[工作区]');
+  console.log(`  模式: ${report.mode === 'multi' ? '多根' : '单根'}`);
+  for (const root of report.roots) {
+    console.log(`  - ${root.name}（${root.fileCount} 文件） ${root.abs}`);
+  }
+
+  // 2) 索引
+  console.log('[索引]');
+  console.log(`  文件总数: ${report.fileCount}（源码 ${report.sourceFileCount}）`);
+  console.log(`  符号数: ${report.symbolCount}`);
+  console.log(`  import 边: ${report.importEdgeCount}`);
+  console.log(`  懒加载模式: ${report.lazy ? '是（大仓库，内容按需读取）' : '否'}`);
+  if (report.sourceFileCount === 0) {
+    warn('未发现源码文件（.ts/.tsx/.js/.jsx/.mjs/.cjs/.py）', '上下文召回依赖源码索引');
+  }
+
+  // 3) 别名
+  console.log('[别名]');
+  console.log(`  包名别名（跨根互引）: ${report.packageAliasCount} 条`);
+  console.log(`  tsconfig paths 别名: ${report.pathAliasCount} 条`);
+
+  // 4) 持久化缓存
+  console.log('[持久化缓存]');
+  if (report.persisted) {
+    const p = report.persisted;
+    console.log(`  缓存版本: v${p.version}${p.savedAt ? `（保存于 ${p.savedAt}）` : ''}`);
+    console.log(`  符号种子: ${p.symbolSeeds} 文件`);
+    if (p.version >= 2) {
+      console.log(
+        p.structureOk
+          ? `  import 种子: ${p.importSeeds} 文件（结构指纹一致）`
+          : `  import 种子: 0（结构指纹失配，已弃用重解析）`,
+      );
+      if (!p.structureOk) {
+        warn('缓存结构指纹与当前工作区不一致', '文件集或别名清单（package.json/tsconfig）变化后属预期行为，下次对话自动重建');
+      }
+    } else {
+      console.log('  import 种子: 不适用（v1 缓存无 imports；对话后自动升级为 v2）');
+    }
+  } else {
+    console.log('  无缓存（首次索引此工作区）');
+  }
+
+  // 5) 规则
+  console.log('[规则]');
+  console.log(`  规则文件: ${report.ruleCount} 条（项目级 CODEX.md 每根独立 + 用户级）`);
+
+  // 6) 符号 top-5
+  if (report.topFiles.length > 0) {
+    console.log('[符号数 top-5]');
+    for (const f of report.topFiles) {
+      console.log(`  ${f.path} — ${f.symbols} 符号（${(f.size / 1024).toFixed(1)}KB）`);
+    }
+  }
+
+  console.log('');
+  console.log(warnings === 0 ? '体检结果: 全部正常 ✔' : `体检结果: ${warnings} 项提示`);
+}
+
 // ---- 主入口 ----
 
 async function main(): Promise<void> {
@@ -835,6 +935,9 @@ async function main(): Promise<void> {
       break;
     case 'plugin':
       await handlePlugin(args.slice(1));
+      break;
+    case 'context':
+      await handleContext(args.slice(1));
       break;
     case '--help':
     case '-h':

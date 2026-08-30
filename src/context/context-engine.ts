@@ -19,7 +19,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { join, relative, resolve, dirname, normalize, sep } from 'node:path';
+import { join, relative, resolve, dirname, normalize, sep, basename } from 'node:path';
 import { getConfigDir } from '../config/config.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
 import { WorkspaceResolver, type WorkspaceRoot } from '../core/workspace.js';
@@ -89,6 +89,32 @@ export interface AssembleOptions {
   cwd?: string;
 }
 
+/** V5.18 索引体检报告（`codex context stats` 数据源） */
+export interface ContextReport {
+  mode: 'single' | 'multi';
+  roots: Array<{ name: string; abs: string; fileCount: number }>;
+  fileCount: number;
+  sourceFileCount: number;
+  symbolCount: number;
+  importEdgeCount: number;
+  packageAliasCount: number;
+  pathAliasCount: number;
+  ruleCount: number;
+  memoryCount: number;
+  lazy: boolean;
+  /** 无持久化缓存 / 被拒（版本不符、persistKey 不符、损坏）→ null */
+  persisted: {
+    version: number;
+    structureOk: boolean;
+    savedAt: string | null;
+    symbolSeeds: number;
+    importSeeds: number;
+    cacheFile: string | null;
+  } | null;
+  /** 符号数 top-5 文件 */
+  topFiles: Array<{ path: string; symbols: number; size: number }>;
+}
+
 // ---- 常量 ----
 
 /** 单文件符号解析的大小上限（512KB） */
@@ -121,6 +147,13 @@ const MAX_PERSIST_FILES = 1500;
 const MAX_PERSIST_SYMBOLS_PER_FILE = 200;
 /** V5.16 单文件持久化 import 数上限 */
 const MAX_PERSIST_IMPORTS_PER_FILE = 100;
+/**
+ * V5.18 import 解析器版本——纳入结构指纹。
+ * 解析逻辑升级（如 `.js`→`.ts` 后缀剥离）后旧缓存里的解析结果全部失配弃用，
+ * 避免"旧解析器写入的空/错 imports 种子被新解析器永久继承"。
+ * 改动 resolveImport / resolvePackageImport / resolvePathAliasImport 行为时必须 +1。
+ */
+const IMPORT_RESOLVER_VERSION = 2;
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py']);
 
@@ -455,6 +488,8 @@ export class ContextEngine {
    * imports 的解析结果依赖"当时"的文件集与别名表，任一变化即整体弃用（宁重读勿陈旧）。
    */
   private persistedImports = new Map<string, string[]>();
+  /** V5.18 上次加载的持久化缓存诊断（无缓存/被拒 → null；context stats 用） */
+  private persistedInfo: { version: number; structureOk: boolean; savedAt: string | null } | null = null;
   /** 全局符号索引（name 小写 → 符号列表），惰性构建 */
   private symbolIndex: Map<string, SymbolEntry[]> | null = null;
   private memoryStore: MemoryEntry[] = [];
@@ -497,6 +532,7 @@ export class ContextEngine {
     this.tokenCache = new LRUCache<string, Set<string>>(LRU_SIZE);
     this.persistedSymbols = new Map();
     this.persistedImports = new Map();
+    this.persistedInfo = null;
     this.symbolIndex = null;
 
     const files: FileIndexEntry[] = [];
@@ -937,6 +973,8 @@ export class ContextEngine {
 
   /**
    * 将相对 import 说明符解析为索引内的 relPath（扩展名/索引文件探测）
+   * V5.18：TS ESM 约定——`./x.js` 常实际指 `./x.ts`（tsc emit 后扩展名不变），
+   * 探测失败时剥离 `.js/.mjs/.cjs` 后缀再探测一轮。
    */
   private resolveImport(fromFile: string, spec: string, lang: 'ts' | 'py'): string | null {
     // V5.7 tsconfig paths 优先：`@shared/utils` → 键空间前缀替换后探测
@@ -951,14 +989,25 @@ export class ContextEngine {
 
     const base = normalize(join(dirname(fromFile), spec)).replace(/\\/g, '/');
 
-    for (const ext of RESOLVE_EXTS) {
-      const candidate = base + ext;
-      if (this.filePathSet.has(candidate)) return candidate;
+    // V5.18 候选基名：原样 + 剥离 JS 扩展（TS ESM `.js` → `.ts` 约定；Python 不适用）
+    const bases = [base];
+    if (lang !== 'py') {
+      const jsExt = base.match(/\.(js|mjs|cjs)$/)?.[0];
+      if (jsExt) bases.push(base.slice(0, -jsExt.length));
+    }
+
+    for (const b of bases) {
+      for (const ext of RESOLVE_EXTS) {
+        const candidate = b + ext;
+        if (this.filePathSet.has(candidate)) return candidate;
+      }
     }
     if (lang !== 'py') {
-      for (const idx of RESOLVE_INDEX_FILES) {
-        const candidate = `${base}/${idx}`;
-        if (this.filePathSet.has(candidate)) return candidate;
+      for (const b of bases) {
+        for (const idx of RESOLVE_INDEX_FILES) {
+          const candidate = `${b}/${idx}`;
+          if (this.filePathSet.has(candidate)) return candidate;
+        }
       }
     }
     return null;
@@ -1474,14 +1523,15 @@ export class ContextEngine {
   }
 
   /**
-   * V5.16 工作区结构指纹：全部键空间路径（排序后）+ 别名清单指纹的哈希。
-   * imports 解析结果依赖解析时刻的文件集与别名表——任一变化此指纹即变，
+   * V5.16 工作区结构指纹：全部键空间路径（排序后）+ 别名清单指纹 + 解析器版本的哈希。
+   * imports 解析结果依赖解析时刻的文件集、别名表与解析器逻辑——任一变化此指纹即变，
    * 回载时用于整体门控 persistedImports（符号种子不受影响：只依赖自身内容）。
+   * V5.18：纳入 IMPORT_RESOLVER_VERSION——解析器升级后旧缓存种子整体失效。
    */
   private structureFingerprint(): string {
     const paths = this.fileIndex.map((e) => e.path).sort();
     const manifests = this.manifestFingerprints().map((m) => `${m.path}:${m.size}:${m.mtime}`);
-    return fnv1a(paths.join('|') + '##' + manifests.join('|')).toString(36);
+    return fnv1a(`rv${IMPORT_RESOLVER_VERSION}##` + paths.join('|') + '##' + manifests.join('|')).toString(36);
   }
 
   /** 持久化文件条目（符号/import 省略冗余字段，回载时回填） */
@@ -1574,6 +1624,7 @@ export class ContextEngine {
       const data = JSON.parse(raw) as {
         version: number;
         workingDir: string;
+        savedAt?: unknown;
         structureHash?: string;
         files: Array<{
           path: string;
@@ -1590,6 +1641,13 @@ export class ContextEngine {
         data.version === 2 && typeof data.structureHash === 'string'
           ? data.structureHash === this.structureFingerprint()
           : false;
+
+      // V5.18 记录缓存诊断（context stats 展示；savedAt 可选字段容错）
+      this.persistedInfo = {
+        version: data.version,
+        structureOk,
+        savedAt: typeof data.savedAt === 'string' ? data.savedAt : null,
+      };
 
       const current = new Map(this.fileIndex.map((e) => [e.path, e]));
       for (const f of data.files ?? []) {
@@ -1717,6 +1775,73 @@ export class ContextEngine {
         ? [...this.symbolIndex.values()].reduce((n, list) => n + list.length, 0)
         : 0,
       lazy: this.fileIndex.length > FULL_CONTENT_SCAN_MAX_FILES,
+    };
+  }
+
+  /**
+   * V5.18 索引体检报告（`codex context stats` 数据源）。
+   * 会触发符号索引构建与全量 import 解析（用户显式调用的诊断命令，可接受全量成本）；
+   * 边界与构建一致：符号上限 SYMBOL_INDEX_MAX_FILES、单文件 512KB。
+   */
+  getContextReport(): ContextReport {
+    // 符号索引（惰性触发，含持久化种子回填）
+    const index = this.buildSymbolIndex();
+    let symbolCount = 0;
+    const symbolsByFile = new Map<string, number>();
+    for (const list of index.values()) {
+      symbolCount += list.length;
+      for (const sym of list) {
+        symbolsByFile.set(sym.file, (symbolsByFile.get(sym.file) ?? 0) + 1);
+      }
+    }
+
+    // import 边（与符号索引同一文件集：源码扩展名 + 大小上限内）
+    let importEdgeCount = 0;
+    let sourceFileCount = 0;
+    let scanned = 0;
+    for (const entry of this.fileIndex) {
+      if (scanned >= SYMBOL_INDEX_MAX_FILES) break;
+      if (!SOURCE_EXTS.has(extOf(entry.path))) continue;
+      if (entry.size > SYMBOL_FILE_MAX_BYTES) continue;
+      scanned++;
+      sourceFileCount++;
+      importEdgeCount += this.parseImports(entry.path).length;
+    }
+
+    const roots = this.multiRoots
+      ? this.multiRoots.map((r) => ({
+          name: r.name,
+          abs: r.abs,
+          fileCount: this.fileIndex.filter((e) => e.path.startsWith(`${r.name}/`)).length,
+        }))
+      : [{ name: basename(this.workingDir) || '.', abs: this.workingDir, fileCount: this.fileIndex.length }];
+
+    const topFiles = [...symbolsByFile.entries()]
+      .map(([path, symbols]) => ({ path, symbols, size: this.fileIndex.find((e) => e.path === path)?.size ?? 0 }))
+      .sort((a, b) => b.symbols - a.symbols)
+      .slice(0, 5);
+
+    return {
+      mode: this.multiRoots ? 'multi' : 'single',
+      roots,
+      fileCount: this.fileIndex.length,
+      sourceFileCount,
+      symbolCount,
+      importEdgeCount,
+      packageAliasCount: this.packageAliases.size,
+      pathAliasCount: this.pathAliases.size,
+      ruleCount: this.rules.length,
+      memoryCount: this.memoryStore.length,
+      lazy: this.fileIndex.length > FULL_CONTENT_SCAN_MAX_FILES,
+      persisted: this.persistedInfo
+        ? {
+            ...this.persistedInfo,
+            symbolSeeds: this.persistedSymbols.size,
+            importSeeds: this.persistedImports.size,
+            cacheFile: this.cacheFilePath(),
+          }
+        : null,
+      topFiles,
     };
   }
 }
