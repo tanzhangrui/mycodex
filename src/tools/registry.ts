@@ -8,6 +8,8 @@
  * - LRU 工具结果缓存（5s TTL，最多 20 条）
  */
 
+import { pathToFileURL } from 'node:url';
+import { isAbsolute } from 'node:path';
 import type { ToolDefinition, JSONSchema } from '../utils/ai-client.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -79,6 +81,8 @@ const SIDE_EFFECT_TOOLS = new Set([
 class ToolRegistry {
   private tools: Map<string, RegisteredTool> = new Map();
   private cache: Map<string, CacheEntry> = new Map();
+  /** V4.1 已加载插件（name@version），防重复加载 */
+  private loadedPlugins = new Set<string>();
 
   register(tool: RegisteredTool): void {
     if (this.tools.has(tool.name)) {
@@ -234,20 +238,60 @@ class ToolRegistry {
   }
 
   /**
-   * 从 npm 包或本地文件加载工具插件
-   * 插件必须导出: { name: string, version: string, register(registry: ToolRegistry): number }
-   * @returns 加载的工具数量
+   * 从 npm 包或本地文件加载工具插件（V4.1 开放协议强化）
+   * 插件必须导出符合 CodexPlugin 的形状：{ name, version, register(registry) }
+   * - 形状校验：name 非空字符串 / version 字符串 / register 函数，不符即抛错（拒绝加载）
+   * - 去重：name@version 已加载 → 跳过（返回 0），不因工具名冲突炸掉启动
+   * - Windows 兼容：绝对路径经 pathToFileURL 转换
+   * @returns 本次实际加载的工具数量
    */
   async loadPlugin(pluginPath: string): Promise<number> {
-    const plugin = await import(pluginPath);
+    const moduleUrl = isAbsolute(pluginPath) ? pathToFileURL(pluginPath).href : pluginPath;
+    const mod = (await import(moduleUrl)) as Record<string, unknown> | undefined;
+    // 宽容解析三种导出形态：命名导出 plugin / default 导出 / 顶层导出（register 等直接挂模块上）
+    const plugin = (mod?.plugin ?? mod?.default ?? mod) as Partial<CodexPlugin> | undefined;
 
-    if (typeof plugin.register !== 'function') {
-      throw new Error(`插件 "${pluginPath}" 未导出 register 函数`);
+    if (
+      !plugin ||
+      typeof plugin.name !== 'string' ||
+      plugin.name.trim().length === 0 ||
+      typeof plugin.version !== 'string' ||
+      typeof plugin.register !== 'function'
+    ) {
+      throw new Error(
+        `插件 "${pluginPath}" 不符合 CodexPlugin 协议（需导出 name: string, version: string, register: (registry) => number）`,
+      );
+    }
+
+    const pluginId = `${plugin.name}@${plugin.version}`;
+    if (this.loadedPlugins.has(pluginId)) {
+      logger.warn(`插件 "${pluginId}" 已加载，跳过重复加载`);
+      return 0;
     }
 
     const count = await plugin.register(this);
-    logger.info(`从插件 "${pluginPath}" 加载了 ${count} 个工具`);
+    this.loadedPlugins.add(pluginId);
+    logger.info(`从插件 "${pluginId}" (${pluginPath}) 加载了 ${count} 个工具`);
     return count;
+  }
+
+  /**
+   * 批量加载插件（单插件失败不拖累其他）
+   * @returns 各插件加载结果（成功数量 / 失败原因）
+   */
+  async loadPlugins(paths: string[]): Promise<Array<{ path: string; count: number; error?: string }>> {
+    const results: Array<{ path: string; count: number; error?: string }> = [];
+    for (const p of paths) {
+      try {
+        const count = await this.loadPlugin(p);
+        results.push({ path: p, count });
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        logger.warn(`插件 "${p}" 加载失败: ${error}`);
+        results.push({ path: p, count: 0, error });
+      }
+    }
+    return results;
   }
 
   /**
@@ -266,10 +310,35 @@ class ToolRegistry {
   clear(): void {
     this.tools.clear();
     this.cache.clear();
+    this.loadedPlugins.clear();
   }
 }
 
-// ---- 参数验证 ----
+// ---- V4.1 插件开放协议 ----
+
+/**
+ * 第三方工具插件协议（开放给插件作者）。
+ * 插件模块必须默认导出或命名导出符合本接口的对象：
+ *
+ * ```ts
+ * export const plugin: CodexPlugin = {
+ *   name: 'my-tools',
+ *   version: '1.0.0',
+ *   register(registry) {
+ *     registry.register({ name: 'my_tool', description: '...', parameters: {...}, execute: async () => {...} });
+ *     return 1;
+ *   },
+ * };
+ * ```
+ */
+export interface CodexPlugin {
+  /** 插件名（非空，与 version 组成去重键） */
+  name: string;
+  /** 语义化版本 */
+  version: string;
+  /** 注册工具；返回注册的工具数量 */
+  register: (registry: { register: (tool: RegisteredTool) => void }) => number | Promise<number>;
+}
 
 interface ValidationResult {
   valid: boolean;

@@ -383,4 +383,52 @@ describe('runPlannedTask', () => {
     expect(result.mode).toBe('planned');
     expect(result.steps[0].status).toBe('completed');
   });
+
+  // ---- V4.3 计划人工确认 ----
+
+  it('V4.3 onPlanCreated 返回 true → 正常执行', async () => {
+    const provider = new FakeProvider('{"steps": ["步骤甲"]}');
+    const onPlanCreated = vi.fn().mockResolvedValue(true);
+    const verify = vi.fn().mockResolvedValue({ success: true, output: '' });
+
+    const result = await runPlannedTask({
+      provider,
+      messages: [userMsg('任务')],
+      fs: new InMemoryFileSystem(),
+      workingDir: workDir,
+      callbacks: noopCallbacks(),
+      verify,
+      onPlanCreated,
+    });
+
+    expect(onPlanCreated).toHaveBeenCalledTimes(1);
+    expect(onPlanCreated.mock.calls[0][0].steps).toHaveLength(1);
+    expect(result.mode).toBe('planned');
+    expect(result.steps[0].status).toBe('completed');
+  });
+
+  it('V4.3 onPlanCreated 返回 false → 取消（零副作用）', async () => {
+    const provider = new FakeProvider('{"steps": ["步骤甲", "步骤乙"]}');
+    const onPlanCreated = vi.fn().mockResolvedValue(false);
+    const verify = vi.fn();
+    const fs = new InMemoryFileSystem();
+
+    const result = await runPlannedTask({
+      provider,
+      messages: [userMsg('任务')],
+      fs,
+      workingDir: workDir,
+      callbacks: noopCallbacks(),
+      verify,
+      onPlanCreated,
+    });
+
+    expect(result.mode).toBe('cancelled');
+    // 零副作用：无步骤执行、无编辑、无验证调用
+    expect(result.steps).toEqual([]);
+    expect(verify).not.toHaveBeenCalled();
+    expect(provider.receivedUserMsgs).toEqual([]);
+    expect(fs.isDirty()).toBe(false);
+    expect(result.tokenUsage.totalTokens).toBe(0);
+  });
 });

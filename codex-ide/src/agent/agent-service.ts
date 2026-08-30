@@ -7,6 +7,7 @@
 
 import * as vscode from 'vscode';
 import { runAgentLoop, type AgentLoopResult, type TokenUsage } from '../../../src/core/agent-loop.js';
+import { runPlannedTask, type PlannedTaskResult } from '../../../src/core/orchestrator.js';
 import { InMemoryFileSystem, type FsCheckpoint } from '../../../src/core/in-memory-fs.js';
 import { createSandbox, type Sandbox } from '../../../src/sandbox/sandbox.js';
 import { createProvider, type AIProvider } from '../../../src/utils/ai-client.js';
@@ -281,6 +282,146 @@ export class AgentService {
         this.log?.('[agent] 执行排队任务');
         void this.send(pending.text, pending.context);
       }
+    }
+  }
+
+  /**
+   * V4.1 多步计划任务（IDE 侧 /plan 入口）。
+   * 复用 send 的初始化/成本/事件管线，内核走 runPlannedTask（Planner/Editor/Verifier 编排）。
+   * V4.3：计划生成后模态确认（步骤列表 + 执行/取消），否决即零副作用退出。
+   * 计划进度以 delta 文本流式呈现（零 webview 协议改动）。
+   */
+  async sendPlanned(userText: string, editorContext?: string): Promise<void> {
+    if (this.running) {
+      this.emitter.fire({ type: 'error', message: '当前有任务运行中，请稍候或取消' });
+      return;
+    }
+    const workingDir = this.workingDir;
+    if (!workingDir) {
+      this.emitter.fire({ type: 'error', message: '请先打开一个工作区文件夹' });
+      return;
+    }
+
+    // 成本预算熔断
+    const budget = vscode.workspace.getConfiguration('codex-ide').get<number>('costBudgetCny', 0);
+    if (budget > 0 && this.sessionCostCny >= budget) {
+      this.emitter.fire({
+        type: 'error',
+        message: `已达成本预算上限 ¥${budget.toFixed(2)}（当前 ¥${this.sessionCostCny.toFixed(4)}）`,
+      });
+      return;
+    }
+
+    const resolved = await this.resolvePreset(userText);
+    if ('error' in resolved) {
+      this.emitter.fire({ type: 'error', message: resolved.error });
+      return;
+    }
+    const { preset, apiKey } = resolved;
+
+    if (!this.toolsRegistered) {
+      registerBuiltinTools();
+      this.toolsRegistered = true;
+    }
+    if (!this.fs) {
+      this.fs = new InMemoryFileSystem();
+      await this.fs.snapshot(workingDir);
+    }
+
+    const sandbox = this.buildSandbox(workingDir);
+    this.pushCheckpoint(userText);
+
+    const content = editorContext ? `${editorContext}\n\n${userText}` : userText;
+    this.messages.push({ role: 'user', content, timestamp: new Date().toISOString() });
+
+    this.running = true;
+    this.abortController = new AbortController();
+    const signal = this.abortController.signal;
+    const provider = this.buildProvider(preset, apiKey);
+
+    this.emitter.fire({ type: 'streamStart', presetLabel: `${preset.label} · 计划模式` });
+    this.emitter.fire({ type: 'delta', text: `> 📋 多步计划模式\n\n` });
+
+    try {
+      const result: PlannedTaskResult = await runPlannedTask({
+        provider,
+        messages: this.messages,
+        fs: this.fs,
+        workingDir,
+        signal,
+        sandbox,
+        onPlanCreated: async (plan) => {
+          const steps = plan.steps.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
+          const choice = await vscode.window.showWarningMessage(
+            `Codex 计划执行以下 ${plan.steps.length} 个步骤：\n\n${steps}`,
+            { modal: true },
+            '执行',
+            '取消',
+          );
+          return choice === '执行';
+        },
+        callbacks: {
+          onTextDelta: (text) => this.emitter.fire({ type: 'delta', text }),
+          onToolUse: (name, input) => this.emitter.fire({ type: 'tool', name, input, phase: 'call' }),
+          onToolResult: (name, success, output) => {
+            this.emitter.fire({ type: 'tool', name, input: {}, phase: 'result', success, output });
+            this.emitDirty();
+          },
+          onError: (message) => this.emitter.fire({ type: 'error', message }),
+          onDone: () => {},
+        },
+      });
+
+      if (result.mode === 'cancelled') {
+        this.emitter.fire({ type: 'delta', text: `\n> ⏹ 计划已取消（未做任何修改）\n` });
+        this.messages.push({
+          role: 'assistant',
+          content: '[多步计划已取消：用户未确认执行]',
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        // 成本与用量（planned/fallback 均含 tokenUsage 汇总）
+        const cost = estimateCost(preset, result.tokenUsage.promptTokens, result.tokenUsage.completionTokens);
+        this.sessionCostCny += cost;
+        this.sessionUsage.promptTokens += result.tokenUsage.promptTokens;
+        this.sessionUsage.completionTokens += result.tokenUsage.completionTokens;
+        this.sessionUsage.totalTokens += result.tokenUsage.totalTokens;
+
+        if (result.mode === 'fallback') {
+          this.emitter.fire({ type: 'delta', text: `\n> ⚠ 计划解析失败，已降级为直接执行\n` });
+        } else {
+          const summary = result.steps
+            .map((s, i) => `${i + 1}. ${s.status === 'completed' ? '✓' : '✗'} ${s.step.description}${s.rolledBack ? '（已回滚）' : ''}`)
+            .join('\n');
+          this.emitter.fire({ type: 'delta', text: `\n\n> 📋 计划执行结果：\n${summary}\n` });
+        }
+
+        const assistantText =
+          result.mode === 'fallback'
+            ? result.text
+            : `[多步计划执行完成]\n${result.steps
+                .map((s, i) => `${i + 1}. ${s.status === 'completed' ? '✓' : '✗'} ${s.step.description}`)
+                .join('\n')}${result.text ? `\n\n${result.text}` : ''}`;
+        this.messages.push({ role: 'assistant', content: assistantText, timestamp: new Date().toISOString() });
+        this.trimHistory();
+
+        this.emitter.fire({
+          type: 'usage',
+          usage: { ...this.sessionUsage },
+          sessionCostCny: this.sessionCostCny,
+          presetLabel: preset.label,
+        });
+      }
+      this.emitDirty();
+      this.persistSession();
+      this.log?.(`[agent] 计划任务完成: ${result.mode}, ${result.toolCalls.length} 次工具调用`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log?.(`[agent] 计划任务异常: ${message}`);
+      this.emitter.fire({ type: 'error', message });
+    } finally {
+      this.running = false;
+      this.abortController = null;
     }
   }
 

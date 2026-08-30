@@ -268,6 +268,38 @@ interface PlanCommandOptions {
   onSummary: (summary: string) => void;
 }
 
+/**
+ * V4.3 计划确认。
+ * 交互 TTY：readline y/n；非交互（管道——text-repl 的实际运行环境）：自动确认 +
+ * 显著警告（管道任务是用户主动投喂，意图明确；真正的交互确认在 IDE 侧 sendPlanned）。
+ */
+function confirmPlanExecution(plan: { steps: Array<{ description: string }> }): Promise<boolean> {
+  console.log(`\n[plan] 生成计划（${plan.steps.length} 步）：`);
+  plan.steps.forEach((s, i) => console.log(`  ${i + 1}. ${s.description}`));
+
+  if (!process.stdin.isTTY) {
+    console.log('\n[plan] ⚠ 非交互模式：计划将直接执行（交互确认请在 IDE 侧使用 /plan）。\n');
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question('\n[plan] 确认执行以上计划? (y/n) ', (answer) => {
+      rl.close();
+      settle(answer.trim().toLowerCase() === 'y');
+    });
+    // EOF/中断先于回答 → 取消
+    rl.on('close', () => settle(false));
+  });
+}
+
 async function handlePlanCommand(options: PlanCommandOptions): Promise<void> {
   const { provider, messages, fs, workingDir, sandbox, verifyCommand, callbacks, onSummary } = options;
 
@@ -281,7 +313,14 @@ async function handlePlanCommand(options: PlanCommandOptions): Promise<void> {
       callbacks,
       sandbox,
       verifyCommand,
+      onPlanCreated: confirmPlanExecution,
     });
+
+    if (result.mode === 'cancelled') {
+      console.log('\n[plan] 已取消执行（计划被否决，未做任何修改）。\n');
+      onSummary('[多步计划已取消：用户未确认执行]');
+      return;
+    }
 
     if (result.mode === 'fallback') {
       console.log('[plan] 计划解析失败，已降级为直接执行。\n');

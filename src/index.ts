@@ -199,14 +199,14 @@ async function handleChat(): Promise<void> {
     }
   }
 
-  // 自动加载配置中的插件
-  if (config.plugins) {
-    for (const pluginPath of config.plugins) {
-      try {
-        const count = await toolRegistry.loadPlugin(pluginPath);
-        console.log(`[插件] 已加载 ${count} 个工具 (${pluginPath})\n`);
-      } catch (err) {
-        logger.warn(`插件 "${pluginPath}" 加载失败: ${err instanceof Error ? err.message : String(err)}`);
+  // 自动加载配置中的插件（批量隔离：单插件失败不拖累其他）
+  if (config.plugins && config.plugins.length > 0) {
+    const results = await toolRegistry.loadPlugins(config.plugins);
+    for (const r of results) {
+      if (r.error) {
+        console.log(`[插件] 加载失败 (${r.path}): ${r.error}\n`);
+      } else {
+        console.log(`[插件] 已加载 ${r.count} 个工具 (${r.path})\n`);
       }
     }
   }

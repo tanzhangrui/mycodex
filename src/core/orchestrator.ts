@@ -39,8 +39,8 @@ export interface StepOutcome {
 }
 
 export interface PlannedTaskResult {
-  /** planned = 计划模式；fallback = 解析失败降级单循环 */
-  mode: 'planned' | 'fallback';
+  /** planned = 计划模式；fallback = 解析失败降级单循环；cancelled = 用户否决计划（零副作用） */
+  mode: 'planned' | 'fallback' | 'cancelled';
   plan?: ExecutionPlan;
   steps: StepOutcome[];
   text: string;
@@ -61,6 +61,8 @@ export interface OrchestratorOptions {
   sandbox?: Sandbox;
   /** V4.2 验证命令（缺省 VERIFY_COMMAND；测试驱动项目可配 vitest run 等） */
   verifyCommand?: string;
+  /** V4.3 计划确认钩子：计划生成后调用；返回 false → 取消执行（mode: 'cancelled'，零副作用） */
+  onPlanCreated?: (plan: ExecutionPlan) => Promise<boolean>;
   /** 验证器（可注入测试桩）；缺省：有沙箱跑 verifyCommand，无沙箱跳过（恒过） */
   verify?: (workingDir: string) => Promise<VerifyResult>;
   /** 单步验证失败后的重试次数（默认 1） */
@@ -103,6 +105,19 @@ export async function runPlannedTask(options: OrchestratorOptions): Promise<Plan
       tokenUsage: result.tokenUsage,
       hasError: result.hasError,
       error: result.error,
+    };
+  }
+
+  // V4.3 人工确认：计划被否决 → 取消（零副作用：不执行任何步骤、不动内存 FS）
+  if (options.onPlanCreated && !(await options.onPlanCreated(plan))) {
+    return {
+      mode: 'cancelled',
+      plan,
+      steps: [],
+      text: '',
+      toolCalls: [],
+      tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      hasError: false,
     };
   }
 

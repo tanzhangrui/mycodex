@@ -63,6 +63,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.agent.emitDirty();
             break;
           case 'send': {
+            // V4.1：/plan 前缀 → 多步计划模式（计划确认 + 步骤验证编排）
+            if (msg.text.trim().toLowerCase().startsWith('/plan')) {
+              const task = msg.text.trim().replace(/^\/plan\s*/i, '');
+              if (!task) {
+                vscode.window.showInformationMessage('用法：/plan <任务描述>');
+                break;
+              }
+              const editorCtx = this.buildEditorContext();
+              await this.agent.sendPlanned(task, editorCtx || undefined);
+              break;
+            }
             const refs = await this.resolveAtMentions(msg.text);
             const codebase = this.resolveCodebaseContext(msg.text);
             const editorCtx = this.buildEditorContext();
