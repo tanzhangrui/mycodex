@@ -14,6 +14,9 @@ import { existsSync, writeFileSync, mkdirSync, unlinkSync, rmdirSync } from 'nod
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+// 隔离配置目录：agent-loop 触发的上下文引擎持久化绝不写入真实 ~/.codex
+process.env.CODEX_CONFIG_PATH = join(tmpdir(), 'codex-test-config-e2e');
+
 // ---- 辅助函数 ----
 
 function createTestDir(): string {
