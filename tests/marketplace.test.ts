@@ -13,14 +13,17 @@ import { createHash } from 'node:crypto';
 import {
   parseMarketplaceIndex,
   loadMarketplaceIndex,
+  loadMarketplaceIndexFromUrl,
   findEntry,
   installPlugin,
   updatePlugin,
+  updateAllPlugins,
   searchEntries,
   compareVersions,
   type PluginLoader,
   type PluginUpdater,
   type UrlFetcher,
+  type InstalledPlugin,
 } from '../src/tools/marketplace.js';
 
 const VALID_INDEX = JSON.stringify({
@@ -655,5 +658,133 @@ describe('searchEntries', () => {
 
   it('无命中 → 空数组', () => {
     expect(searchEntries(loaded, 'zzz不存在')).toEqual([]);
+  });
+});
+
+// ---- V5.11 远程市场索引 ----
+
+describe('loadMarketplaceIndexFromUrl', () => {
+  const REMOTE_INDEX = JSON.stringify({
+    version: 1,
+    plugins: [
+      { name: 'remote-entry', version: '1.0.0', source: { kind: 'url', url: 'https://cdn.example.com/r.mjs', sha256: 'a'.repeat(64) } },
+    ],
+  });
+
+  function fetcherWith(content: string | null): UrlFetcher {
+    return async () => {
+      if (content === null) throw new Error('下载失败: HTTP 404');
+      return new TextEncoder().encode(content).buffer as ArrayBuffer;
+    };
+  }
+
+  it('成功拉取：https 索引解析返回（baseDir 为 cwd）', async () => {
+    const loaded = await loadMarketplaceIndexFromUrl('https://cdn.example.com/index.json', fetcherWith(REMOTE_INDEX));
+    expect(loaded).not.toBeNull();
+    expect(loaded!.index.plugins).toHaveLength(1);
+    expect(loaded!.index.plugins[0].name).toBe('remote-entry');
+    expect(loaded!.baseDir).toBe(process.cwd());
+  });
+
+  it('http:// 拒绝（明文传输红线，返回 null 不抛错）', async () => {
+    const loaded = await loadMarketplaceIndexFromUrl('http://cdn.example.com/index.json', fetcherWith(REMOTE_INDEX));
+    expect(loaded).toBeNull();
+  });
+
+  it('非 URL 输入（本地路径误传）→ null（本地路径走 loadMarketplaceIndex）', async () => {
+    const loaded = await loadMarketplaceIndexFromUrl('./marketplace.json', fetcherWith(REMOTE_INDEX));
+    expect(loaded).toBeNull();
+  });
+
+  it('下载失败（网络错误）→ null（不抛错）', async () => {
+    const loaded = await loadMarketplaceIndexFromUrl('https://cdn.example.com/missing.json', fetcherWith(null));
+    expect(loaded).toBeNull();
+  });
+
+  it('空内容 / 非法 JSON → null', async () => {
+    expect(await loadMarketplaceIndexFromUrl('https://x.com/i.json', fetcherWith(''))).toBeNull();
+    expect(await loadMarketplaceIndexFromUrl('https://x.com/i.json', fetcherWith('不是 JSON'))).toBeNull();
+  });
+
+  it('超过大小上限（1MB）→ null', async () => {
+    const huge = 'x'.repeat(1024 * 1024 + 1);
+    const loaded = await loadMarketplaceIndexFromUrl('https://x.com/big.json', fetcherWith(huge));
+    expect(loaded).toBeNull();
+  });
+
+  it('围栏块容错：README 分发的索引同样可解析', async () => {
+    const raw = `# 市场\n\n\`\`\`json\n${REMOTE_INDEX}\n\`\`\`\n`;
+    const loaded = await loadMarketplaceIndexFromUrl('https://x.com/readme.md', fetcherWith(raw));
+    expect(loaded).not.toBeNull();
+    expect(loaded!.index.plugins).toHaveLength(1);
+  });
+});
+
+// ---- V5.12 批量更新 ----
+
+describe('updateAllPlugins', () => {
+  /** 索引：echo-tools 2.0.0（可升级）/ lint-helper 0.2.1（同版）/ absent 无条目 */
+  const loaded = (() => {
+    const idx = parseMarketplaceIndex(
+      JSON.stringify({
+        version: 1,
+        plugins: [
+          { name: 'echo-tools', version: '2.0.0', source: { kind: 'file', path: 'plugins/echo-tools.mjs' } },
+          { name: 'lint-helper', version: '0.2.1', source: { kind: 'file', path: 'shared/lint-helper.mjs' } },
+        ],
+      }),
+    )!;
+    return { index: idx, baseDir: 'C:\\base' };
+  })();
+
+  function stubRegistry(failOn?: string): PluginUpdater {
+    return {
+      async loadPlugin(p: string): Promise<number> {
+        if (p.includes(failOn ?? '\u0000')) throw new Error('新版协议校验失败');
+        return 1;
+      },
+      unloadPlugin: () => 1,
+    };
+  }
+
+  it('三态分派：可更新升级 / 已最新跳过 / 无来源跳过', async () => {
+    const installed: InstalledPlugin[] = [
+      { name: 'echo-tools', version: '1.0.0', paths: ['C:\\old\\echo-tools.mjs'] },
+      { name: 'lint-helper', version: '0.2.1', paths: ['C:\\old\\lint-helper.mjs'] },
+      { name: 'absent', version: '1.0.0', paths: ['C:\\old\\absent.mjs'] },
+    ];
+    const summary = await updateAllPlugins(loaded, stubRegistry(), installed);
+    expect(summary.updated).toHaveLength(1);
+    expect(summary.updated[0]).toMatchObject({ name: 'echo-tools', from: '1.0.0', to: '2.0.0' });
+    expect(summary.upToDate).toEqual(['lint-helper']);
+    expect(summary.noSource).toEqual(['absent']);
+    expect(summary.failed).toEqual([]);
+  });
+
+  it('已装比索引新 → upToDate（不触发升级流）', async () => {
+    const installed: InstalledPlugin[] = [
+      { name: 'echo-tools', version: '3.0.0', paths: ['C:\\old\\echo-tools.mjs'] },
+    ];
+    const summary = await updateAllPlugins(loaded, stubRegistry(), installed);
+    expect(summary.updated).toEqual([]);
+    expect(summary.upToDate).toEqual(['echo-tools']);
+  });
+
+  it('失败不阻断：单插件失败，其余照常升级（失败项旧版配置未动）', async () => {
+    const installed: InstalledPlugin[] = [
+      { name: 'echo-tools', version: '1.0.0', paths: ['C:\\old\\echo-tools.mjs'] },
+      { name: 'lint-helper', version: '0.1.0', paths: ['C:\\old\\lint-helper.mjs'] }, // lint 也会被升级
+    ];
+    // echo-tools 升级失败（loadPlugin 抛错）、lint-helper 成功
+    const summary = await updateAllPlugins(loaded, stubRegistry('echo-tools'), installed);
+    expect(summary.failed).toHaveLength(1);
+    expect(summary.failed[0].name).toBe('echo-tools');
+    expect(summary.failed[0].detail).toContain('旧版配置未动');
+    expect(summary.updated.map((u) => u.name)).toEqual(['lint-helper']);
+  });
+
+  it('空已装列表 → 空汇总', async () => {
+    const summary = await updateAllPlugins(loaded, stubRegistry(), []);
+    expect(summary).toEqual({ updated: [], upToDate: [], failed: [], noSource: [] });
   });
 });

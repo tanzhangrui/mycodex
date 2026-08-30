@@ -41,9 +41,11 @@ import { toolRegistry } from './tools/registry.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import {
   loadMarketplaceIndex,
+  loadMarketplaceIndexFromUrl,
   findEntry,
   installPlugin,
   updatePlugin,
+  updateAllPlugins,
   searchEntries,
   compareVersions,
 } from './tools/marketplace.js';
@@ -365,13 +367,19 @@ async function handlePlugin(args: string[]): Promise<void> {
   const sub = args[0];
   const rest = args.slice(1);
 
-  // 解析 --index <path>（默认 ./marketplace.json）
+  // 解析 --index <path|url>（默认 ./marketplace.json；V5.11 支持 https 远程索引）
   const idxFlag = rest.indexOf('--index');
   const indexArg = idxFlag !== -1 ? rest[idxFlag + 1] : undefined;
   const indexFile = indexArg ?? DEFAULT_MARKETPLACE;
 
+  /** V5.11 双源索引加载：https:// → 远程拉取；其余 → 本地文件 */
+  const loadIndex = () =>
+    indexFile.startsWith('https://')
+      ? loadMarketplaceIndexFromUrl(indexFile)
+      : Promise.resolve(loadMarketplaceIndex(indexFile));
+
   if (sub === 'list') {
-    const loaded = loadMarketplaceIndex(indexFile);
+    const loaded = await loadIndex();
     if (!loaded) {
       console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
       process.exit(1);
@@ -404,7 +412,7 @@ async function handlePlugin(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const loaded = loadMarketplaceIndex(indexFile);
+    const loaded = await loadIndex();
     if (!loaded) {
       console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
       process.exit(1);
@@ -445,7 +453,7 @@ async function handlePlugin(args: string[]): Promise<void> {
       return;
     }
 
-    const loaded = loadMarketplaceIndex(indexFile);
+    const loaded = await loadIndex();
     if (!loaded) {
       console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
       process.exit(1);
@@ -485,7 +493,7 @@ async function handlePlugin(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const loaded = loadMarketplaceIndex(indexFile);
+    const loaded = await loadIndex();
     if (!loaded) {
       console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
       process.exit(1);
@@ -514,7 +522,72 @@ async function handlePlugin(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const loaded = loadMarketplaceIndex(indexFile);
+    // V5.12 批量升级：update --all
+    if (name === '--all' || name === '-a') {
+      const config = loadConfig();
+      const pluginPaths = config.plugins ?? [];
+      if (pluginPaths.length === 0) {
+        console.log('当前配置中没有常驻插件。');
+        return;
+      }
+
+      const loaded = await loadIndex();
+      if (!loaded) {
+        console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
+        process.exit(1);
+      }
+
+      // 加载全部已装插件以读取真实版本号（name@version）
+      registerBuiltinTools();
+      await toolRegistry.loadPlugins(pluginPaths);
+
+      const installed = toolRegistry.loadedPluginIds.map((id) => {
+        const pname = id.split('@')[0];
+        return {
+          name: pname,
+          version: id.split('@').slice(1).join('@'),
+          paths: pluginPaths.filter(
+            (p) => p === pname || basename(p).replace(/\.\w+$/, '') === pname || p.includes(pname),
+          ),
+        };
+      });
+
+      const summary = await updateAllPlugins(loaded, toolRegistry, installed);
+
+      for (const u of summary.updated) {
+        console.log(`✔ ${u.name}: ${u.from} → ${u.to}`);
+      }
+      for (const n of summary.upToDate) {
+        console.log(`= ${n}: 已是最新`);
+      }
+      for (const n of summary.noSource) {
+        console.log(`- ${n}: 索引中无此插件（跳过）`);
+      }
+      for (const f of summary.failed) {
+        console.error(`× ${f.name}: ${f.detail}`);
+      }
+
+      // 配置原子替换：移除全部旧路径 + 写入新路径
+      if (summary.updated.length > 0) {
+        const allRemoved = summary.updated.flatMap((u) => u.removedPaths);
+        if (allRemoved.length > 0) {
+          config.plugins = (config.plugins ?? []).filter((p) => !allRemoved.includes(p));
+        }
+        for (const u of summary.updated) {
+          if (u.pluginPath && !(config.plugins ?? []).includes(u.pluginPath)) {
+            config.plugins = [...(config.plugins ?? []), u.pluginPath];
+          }
+        }
+        saveConfig(config);
+        console.log(`已升级 ${summary.updated.length} 个插件，配置已更新（下次启动自动加载新版）`);
+      } else {
+        console.log('没有可升级的插件。');
+      }
+      if (summary.failed.length > 0) process.exit(1);
+      return;
+    }
+
+    const loaded = await loadIndex();
     if (!loaded) {
       console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
       process.exit(1);
@@ -612,12 +685,13 @@ async function handlePlugin(args: string[]): Promise<void> {
   }
 
   console.error('用法:');
-  console.error('  codex plugin list [--index <索引路径>]           列出市场索引中的插件');
-  console.error('  codex plugin search <关键词> [--index <索引路径>] 按关键词搜索插件');
-  console.error('  codex plugin install <名称> [--index <索引路径>]  安装插件并写入配置常驻');
-  console.error('  codex plugin update <名称> [--index <索引路径>]  升级插件（已是最新则跳过）');
-  console.error('  codex plugin outdated [--index <索引路径>]       检查已装插件的可更新项');
+  console.error('  codex plugin list [--index <路径|https URL>]      列出市场索引中的插件');
+  console.error('  codex plugin search <关键词> [--index <路径|URL>] 按关键词搜索插件');
+  console.error('  codex plugin install <名称> [--index <路径|URL>]  安装插件并写入配置常驻');
+  console.error('  codex plugin update <名称|--all> [--index <…>]   升级插件（已是最新则跳过）');
+  console.error('  codex plugin outdated [--index <路径|URL>]       检查已装插件的可更新项');
   console.error('  codex plugin remove <名称>                       移除常驻插件（配置 + 运行时）');
+  console.error('索引源：本地文件路径或 https URL（远程索引，V5.11）');
   process.exit(sub ? 1 : 0);
 }
 

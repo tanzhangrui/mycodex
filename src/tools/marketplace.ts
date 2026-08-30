@@ -3,6 +3,7 @@
  * V5.5 — 远程源（url）安全下载
  * V5.8 — 插件更新（卸旧装新版本升级流）
  * V5.9 — 版本感知更新（semver 对比跳过无效升级）+ V5.10 关键词搜索
+ * V5.11 — 远程市场索引（https 拉取）+ V5.12 批量更新（update --all）
  * ==========================================
  *
  * 索引是静态 JSON，可托管在任意位置（GitHub raw / 内网文件服务器 / 本地）。
@@ -221,6 +222,38 @@ export function loadMarketplaceIndex(indexFilePath: string): {
 }
 
 /**
+ * V5.11 从远程 https URL 拉取市场索引。
+ *
+ * 供应链边界：索引是元数据而非可执行代码（插件本体的执行门槛由 V5.5 的
+ * sha256 pin 把关），因此索引拉取不要求 pin，但：
+ * - 仅 https（http 明文可被中间人替换 → 拒绝，与插件下载红线一致）
+ * - 大小上限 1MB（索引远小于插件，防巨型载荷）
+ * - 不缓存：outdated/update 需要每次看到最新索引（缓存会让索引滞后静默化）
+ * - 失败 → null（调用方提示，不抛错）
+ *
+ * baseDir 语义：远程索引的 file 源相对路径以进程 cwd 为基准（与默认
+ * ./marketplace.json 一致）；远程索引条目应使用 url 源（绝对地址）。
+ */
+export async function loadMarketplaceIndexFromUrl(
+  url: string,
+  fetcher: UrlFetcher = defaultFetch,
+): Promise<{ index: MarketplaceIndex; baseDir: string } | null> {
+  if (!url.startsWith('https://')) return null; // http 拒绝（含本地 file 路径误传）
+  const MAX_INDEX_BYTES = 1024 * 1024;
+  try {
+    const buf = await fetcher(url);
+    if (buf.byteLength === 0) return null;
+    if (buf.byteLength > MAX_INDEX_BYTES) return null;
+    const raw = new TextDecoder().decode(new Uint8Array(buf));
+    const index = parseMarketplaceIndex(raw);
+    if (!index) return null;
+    return { index, baseDir: process.cwd() };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * V5.10 市场关键词搜索。
  * 匹配域：name + description；大小写不敏感；多关键词（空白分隔）全部命中才算匹配（AND）。
  * 排序（相关性降序）：name 精确 > name 前缀 > name 包含 > 仅 description 命中。
@@ -364,6 +397,68 @@ export async function updatePlugin(
     pluginPath: result.pluginPath,
     removedPaths,
   };
+}
+
+// ---- V5.12 批量更新 ----
+
+/** 已装插件信息（名称 / 版本 / 配置中的路径） */
+export interface InstalledPlugin {
+  name: string;
+  version: string;
+  paths: string[];
+}
+
+export interface BatchUpdateSummary {
+  /** 成功升级：name + 旧版本 + 新版本 */
+  updated: Array<{ name: string; from: string; to: string; pluginPath?: string; removedPaths: string[] }>;
+  /** 已是最新（含比索引新）：插件名 */
+  upToDate: string[];
+  /** 升级失败：插件名 + 原因（旧版配置未动，可重试） */
+  failed: Array<{ name: string; detail: string }>;
+  /** 索引中无此插件（无更新来源）：插件名 */
+  noSource: string[];
+}
+
+/**
+ * V5.12 批量更新全部已装插件（update --all）。
+ *
+ * 逐插件走 V5.9 版本感知 updatePlugin：已是最新跳过、失败不阻断后续
+ * （单插件失败不影响其他插件的升级与配置变更——失败项旧版配置原样保留）。
+ * 调用方负责按 summary.updated 的 removedPaths 与 pluginPath 做配置原子替换。
+ */
+export async function updateAllPlugins(
+  loaded: { index: MarketplaceIndex; baseDir: string },
+  registry: PluginUpdater,
+  installed: InstalledPlugin[],
+  fetcher: UrlFetcher = defaultFetch,
+): Promise<BatchUpdateSummary> {
+  const summary: BatchUpdateSummary = { updated: [], upToDate: [], failed: [], noSource: [] };
+
+  for (const p of installed) {
+    const entry = findEntry(loaded, p.name);
+    if (!entry) {
+      summary.noSource.push(p.name);
+      continue;
+    }
+    // 比索引新也算 upToDate（无需变更），由 updatePlugin 统一判定
+    if (compareVersions(p.version, entry.version) >= 0) {
+      summary.upToDate.push(p.name);
+      continue;
+    }
+    const result = await updatePlugin(loaded, entry, registry, p.paths, fetcher, p.version);
+    if (result.success) {
+      summary.updated.push({
+        name: p.name,
+        from: p.version,
+        to: entry.version,
+        pluginPath: result.pluginPath,
+        removedPaths: result.removedPaths,
+      });
+    } else {
+      summary.failed.push({ name: p.name, detail: result.detail });
+    }
+  }
+  return summary;
 }
 
 /**

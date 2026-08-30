@@ -5,6 +5,48 @@
 
 ---
 
+## V5.12 — 2026-08-30 — 批量更新（update --all）
+
+> 插件装多了逐个 `update` 不可运维——需要一键全量升级。
+
+### A. `updateAllPlugins`（marketplace.ts）
+- 三态分派：**可更新**（走 V5.9 版本感知升级流）/ **已最新**（含比索引新，跳过）/ **无来源**（索引中无此插件，跳过）
+- 失败不阻断：单插件升级失败不中断批量流，失败项旧版配置原样保留（可重试）
+- 汇总 `BatchUpdateSummary`：updated（含 from/to/新路径/旧路径）/ upToDate / failed / noSource
+- 调用方按 summary 做配置原子替换（移除全部旧路径 + 写入新路径）
+
+### B. CLI `codex plugin update --all [--index <路径|URL>]`
+- 从 `registry.loadedPluginIds` 读全部已装插件真实版本；逐项输出 `✔ 升级 / = 最新 / - 无来源 / × 失败`
+- 有失败项退出码 1（CI 可感知）；无升级时提示"没有可升级的插件"
+
+### 验收
+- 新增 4 项测试：三态分派 / 比索引新跳过 / 失败不阻断（失败项配置未动、其余照常）/ 空列表
+- typecheck 零错误 / **294 测试全绿**（283 + 11）
+
+---
+
+## V5.11 — 2026-08-30 — 远程市场索引（https 拉取）
+
+> 索引此前只能本地文件——分发要靠 clone。GitHub raw / 内网服务器托管索引才是常态。
+
+### A. `loadMarketplaceIndexFromUrl`（marketplace.ts）
+- 供应链边界：索引是元数据非可执行代码（插件本体的执行门槛由 V5.5 sha256 pin 把关），故索引不要求 pin，但：
+  - 仅 https（http 明文可被中间人替换 → 拒绝，与插件下载红线一致）
+  - 大小上限 1MB（索引远小于插件）；空内容 / 非法 JSON → null
+- **不缓存**：outdated/update 需要每次看到最新索引（缓存会让索引滞后静默化）
+- 复用 `parseMarketplaceIndex` 全部容错（围栏块 / 噪声文本 / 条目校验）
+- baseDir 语义：远程索引的 file 源相对路径以进程 cwd 为基准；远程索引条目应使用 url 源（绝对地址）
+
+### B. CLI `--index <路径|https URL>`
+- 全部 6 个 plugin 子命令（list/search/install/update/outdated/remove…）统一走双源加载：`https://` 前缀 → 远程拉取，其余 → 本地文件
+- 用法帮助标注索引源双形态
+
+### 验收
+- 新增 7 项测试：成功拉取（baseDir=cwd）/ http 拒绝 / 非 URL 误传防护 / 网络错误 / 空内容与非法 JSON / 1MB 上限 / 围栏块容错
+- typecheck 零错误 / **283 测试全绿**（277 + 6，含 V5.12 批量更新 4 项与 1 项修正）
+
+---
+
 ## V5.10 — 2026-08-30 — 市场关键词搜索
 
 > 索引大了之后 `plugin list` 全量翻屏不可用——需要 `search`。
