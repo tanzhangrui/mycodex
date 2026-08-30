@@ -142,6 +142,76 @@ describe('assembleContext（V3.4 四路融合）', () => {
   });
 });
 
+// ---- V5.4 IDF 加权语义召回 ----
+
+describe('semanticRecall IDF 加权（V5.4）', () => {
+  let idfRoot: string;
+  let idfEngine: ContextEngine;
+
+  beforeAll(async () => {
+    idfRoot = mkdtempSync(join(tmpdir(), 'codex-ctx-v54-'));
+    mkdirSync(join(idfRoot, 'src'), { recursive: true });
+    // 目标文件：唯一含 createUser / 创建用户 的文件（同时含常见 token export/const）
+    writeFileSync(
+      join(idfRoot, 'src', 'user-service.ts'),
+      `export const createUser = (name: string) => {\n  // 创建用户 记录审计日志\n  return { id: 1, name };\n};\n`,
+    );
+    // 10 个填充文件：仅含常见 token（export/const），无任何区分性词
+    for (let i = 0; i < 10; i++) {
+      writeFileSync(
+        join(idfRoot, 'src', `filler-${i}.ts`),
+        `export const value${i} = ${i};\nexport const helper${i} = () => value${i} * 2;\n`,
+      );
+    }
+    idfEngine = new ContextEngine();
+    await idfEngine.index(idfRoot);
+  });
+
+  afterAll(() => {
+    rmSync(idfRoot, { recursive: true, force: true });
+  });
+
+  it('区分性 token 主导：仅常见词的文件被 IDF 压到阈值之下（不再虚高召回）', () => {
+    // 混合查询：区分性词（createUser/创建用户）+ 常见词（export）
+    // 旧版（无 IDF）：填充文件仅靠 export 覆盖率即可越过 0.15 阈值入榜；
+    // IDF 后常见 token 权重被文档频率压低 → 填充文件覆盖率跌破阈值被过滤
+    const chunks = idfEngine.semanticRecall('createUser 创建用户 export');
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks[0].path).toBe('src/user-service.ts');
+    expect(chunks.every((c) => c.path === 'src/user-service.ts')).toBe(true);
+  });
+
+  it('常见词更重的混合查询：目标文件仍排第一，常见词文件严格靠后', () => {
+    const chunks = idfEngine.semanticRecall('export const createUser');
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks[0].path).toBe('src/user-service.ts');
+    const target = chunks[0];
+    for (const c of chunks) {
+      if (c.path !== target.path) {
+        expect(c.path.startsWith('src/filler-')).toBe(true);
+        expect(c.relevance).toBeLessThan(target.relevance);
+      }
+    }
+  });
+
+  it('单文件退化：IDF 均匀（N=1），召回行为正常不除零', async () => {
+    const solo = mkdtempSync(join(tmpdir(), 'codex-ctx-v54-solo-'));
+    mkdirSync(join(solo, 'src'), { recursive: true });
+    writeFileSync(join(solo, 'src', 'only.ts'), `export const only = 1;\n`);
+    const e = new ContextEngine();
+    await e.index(solo);
+    const chunks = e.semanticRecall('only export');
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks[0].path).toBe('src/only.ts');
+    rmSync(solo, { recursive: true, force: true });
+  });
+
+  it('无信号查询依旧被过滤（IDF 不引入误召回）', () => {
+    expect(idfEngine.semanticRecall('zzz')).toEqual([]);
+    expect(idfEngine.semanticRecall('   ')).toEqual([]);
+  });
+});
+
 // ---- 索引持久化 ----
 
 describe('索引持久化', () => {

@@ -850,8 +850,9 @@ export class ContextEngine {
 
   /**
    * V3.4 语义召回：查询 token 覆盖率匹配（无哈希碰撞、可预测、可调试）。
-   * 覆盖率 = 文件命中的查询 token 权重 / 查询 token 总权重，
-   * 排序取 top-K。轻量语义（模糊词法），兜底符号/关键词都未命中的口语化查询。
+   * V5.4 IDF 加权：覆盖率 = 文件命中的查询 token IDF 权重 / 总 IDF 权重——
+   * 常见 token（export/const 等）权重被文档频率压低，区分性 token 主导排序。
+   * 轻量语义（模糊词法），兜底符号/关键词都未命中的口语化查询。
    */
   semanticRecall(query: string, topK = SEMANTIC_TOP_K): ContextChunk[] {
     if (!this.indexed) return [];
@@ -882,16 +883,43 @@ export class ContextEngine {
         .map((s) => s.entry);
     }
 
-    const scored: Array<{ entry: FileIndexEntry; coverage: number }> = [];
+    // V5.4 两遍扫描 + IDF 加权：
+    // 第一遍收集候选 token 集并统计查询 token 的文档频率（df）；
+    // 第二遍以 idf = ln(1 + N/df) 加权命中率——常见 token（export/const/function
+    // 等几乎每文件都有的）权重被压到接近 ln2，区分性 token（createUser、
+    // token-store、领域词等）主导覆盖率与排序，常见词虚高覆盖率的问题消除。
+    const tokenSets: Array<{ entry: FileIndexEntry; tokens: Set<string> }> = [];
+    const df = new Map<string, number>();
     for (const entry of candidates) {
       const fileTokens = this.getFileTokens(entry.path);
       if (!fileTokens) continue;
-
-      let hitWeight = 0;
-      for (const [tok, weight] of queryWeights) {
-        if (fileTokens.has(tok)) hitWeight += weight;
+      tokenSets.push({ entry, tokens: fileTokens });
+      for (const tok of queryWeights.keys()) {
+        if (fileTokens.has(tok)) df.set(tok, (df.get(tok) ?? 0) + 1);
       }
-      const coverage = hitWeight / totalQueryWeight;
+    }
+    const N = tokenSets.length;
+    if (N === 0) return [];
+
+    // IDF 加权查询权重（df=0 的 token 无文件命中，仅稀释分母，与旧版语义一致）
+    const idfWeights = new Map<string, number>();
+    let totalIdfWeight = 0;
+    for (const [tok, w] of queryWeights) {
+      const d = df.get(tok) ?? 0;
+      const idf = Math.log(1 + N / Math.max(1, d));
+      const weight = w * idf;
+      idfWeights.set(tok, weight);
+      totalIdfWeight += weight;
+    }
+    if (totalIdfWeight <= 0) return [];
+
+    const scored: Array<{ entry: FileIndexEntry; coverage: number }> = [];
+    for (const { entry, tokens } of tokenSets) {
+      let hitWeight = 0;
+      for (const [tok, weight] of idfWeights) {
+        if (tokens.has(tok)) hitWeight += weight;
+      }
+      const coverage = hitWeight / totalIdfWeight;
       if (coverage > SEMANTIC_THRESHOLD) scored.push({ entry, coverage });
     }
     scored.sort((a, b) => b.coverage - a.coverage);
