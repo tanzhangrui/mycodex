@@ -14,11 +14,14 @@ import type { StatusBar } from '../status/status-bar.js';
 import type { SecretManager } from '../agent/secrets.js';
 import { MODEL_PRESETS, AUTO_PRESET_ID } from '../agent/presets.js';
 import { isSensitivePath } from '../../../src/core/privacy-guard.js';
+import { getSharedContextEngine } from '../../../src/context/context-engine.js';
 
 /** @引用单文件最大注入字符数（成本意识：精确引用而非全文投喂） */
 const MAX_REF_CHARS = 4000;
 /** 单条消息最多引用文件数 */
 const MAX_REFS = 3;
+/** @codebase 全库检索的 token 预算（与 agent-loop 注入同源同预算） */
+const CODEBASE_MAX_TOKENS = 8_000;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'codex-ide.chat';
@@ -61,8 +64,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
           case 'send': {
             const refs = await this.resolveAtMentions(msg.text);
+            const codebase = this.resolveCodebaseContext(msg.text);
             const editorCtx = this.buildEditorContext();
-            const context = [refs, editorCtx].filter(Boolean).join('\n\n') || undefined;
+            const context = [refs, codebase, editorCtx].filter(Boolean).join('\n\n') || undefined;
             await this.agent.send(msg.text, context);
             break;
           }
@@ -212,6 +216,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return parts.length > 0 ? parts.join('\n\n') : undefined;
   }
 
+  /**
+   * V3.4：@codebase 全库检索（Cursor 式入口）。
+   * 复用 CLI 内核共享引擎（符号/语义/关键词/依赖图四路召回）——内核唯一原则，
+   * 与 agent-loop 自动注入同源同预算（8K token）。
+   * 隐私：敏感文件在引擎侧已被排除，永不进入检索结果。
+   */
+  private resolveCodebaseContext(text: string): string | undefined {
+    if (!/@codebase\b/.test(text)) return undefined;
+
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return undefined;
+
+    const engine = getSharedContextEngine(folder.uri.fsPath);
+    if (!engine) return '[代码库检索] 引擎不可用';
+
+    try {
+      // 检索查询 = 去掉指令标记后的自然语言部分
+      const query = text.replace(/@codebase\b/g, ' ').trim() || text;
+      const chunks = engine.assembleContext(query, { maxTokens: CODEBASE_MAX_TOKENS });
+      if (chunks.length === 0) return '[代码库检索] 未找到相关代码';
+
+      const body = chunks
+        .map((c) => `[${c.path}:${c.startLine}-${c.endLine}]\n\`\`\`\n${c.content}\n\`\`\``)
+        .join('\n\n');
+      return `[代码库检索结果 — ${chunks.length} 个片段（符号+语义+依赖图自动检索，以实时内容为准）]\n\n${body}`;
+    } catch {
+      return '[代码库检索] 检索失败（已忽略，不影响任务执行）';
+    }
+  }
+
   /** 提取当前编辑器上下文（成本意识：只带选中内容，不盲目全文投喂） */
   private buildEditorContext(): string | undefined {
     const editor = vscode.window.activeTextEditor;
@@ -271,7 +305,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </section>
 
   <footer id="composer">
-    <textarea id="input" placeholder="描述任务… 用 @路径 引用文件（Enter 发送，Shift+Enter 换行）" rows="3"></textarea>
+    <textarea id="input" placeholder="描述任务… @路径 引用文件，@codebase 全库检索（Enter 发送，Shift+Enter 换行）" rows="3"></textarea>
     <div id="composer-bar">
       <span id="usage"></span>
       <button id="send-btn" class="primary">发送</button>

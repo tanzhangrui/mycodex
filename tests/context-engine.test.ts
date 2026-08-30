@@ -8,6 +8,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextEngine, extractSymbols } from '../src/context/context-engine.js';
 
+// V3.4：隔离配置目录，持久化缓存绝不污染真实用户 home
+process.env.CODEX_CONFIG_PATH = join(tmpdir(), 'codex-test-config-v32');
+
 // ---- 测试夹具：模拟小型项目 ----
 
 let root: string;

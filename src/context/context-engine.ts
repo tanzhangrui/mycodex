@@ -17,7 +17,8 @@
  *   engine.resolveQuerySymbols(query);     // 符号名 → 定义位置
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { join, relative, resolve, dirname, normalize } from 'node:path';
 import { getConfigDir } from '../config/config.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
@@ -95,6 +96,22 @@ const KEYWORD_CANDIDATE_LIMIT = 20;
 const IMPORT_EXPAND_MAX_FILES = 3;
 /** LRU 缓存大小 */
 const LRU_SIZE = 200;
+
+// ---- V3.4 语义检索（n-gram token 覆盖率匹配） ----
+
+/** 单文件参与匹配的内容截断（字符） */
+const EMBED_CONTENT_CAP = 20_000;
+/** 语义召回覆盖率阈值（查询 token 权重被文件命中的比例，低于则弃） */
+const SEMANTIC_THRESHOLD = 0.15;
+/** 语义召回 top-K */
+const SEMANTIC_TOP_K = 5;
+
+// ---- V3.4 索引持久化 ----
+
+/** 持久化文件数上限 */
+const MAX_PERSIST_FILES = 1500;
+/** 单文件持久化符号数上限 */
+const MAX_PERSIST_SYMBOLS_PER_FILE = 200;
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py']);
 
@@ -197,6 +214,39 @@ function extractImportSpecifiers(content: string, lang: 'ts' | 'py'): string[] {
   return [...new Set(specs)];
 }
 
+// ---- V3.4 n-gram 分词（轻量语义检索：token 覆盖率匹配） ----
+
+/**
+ * 分词：英文词 unigram/bigram + 词内字符 trigram（≥4 字符词）+ CJK 字 bigram。
+ * 判别力来源是共享 n-gram token 覆盖率（词形变体靠字符 trigram：login/logging 共享 log/gin）。
+ */
+export function tokenizeForEmbedding(text: string): string[] {
+  const tokens: string[] = [];
+  const lower = text.toLowerCase();
+  const words = lower.match(/[a-z0-9_$]+/g) ?? [];
+  for (const w of words) {
+    tokens.push(w);
+    // 字符 trigram：词形变体/拼写容错的模糊信号
+    if (w.length >= 4) {
+      for (let i = 0; i + 3 <= w.length; i++) tokens.push(w.slice(i, i + 3));
+    }
+  }
+  for (let i = 0; i < words.length - 1; i++) tokens.push(`${words[i]}_${words[i + 1]}`);
+  const cjk = lower.match(/[\u4e00-\u9fa5]/g) ?? [];
+  for (let i = 0; i < cjk.length - 1; i++) tokens.push(cjk[i] + cjk[i + 1]);
+  return tokens;
+}
+
+/** FNV-1a 哈希（32 位） */
+function fnv1a(token: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < token.length; i++) {
+    h ^= token.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
 // ---- Trie 树文件索引（路径前缀检索） ----
 
 class TrieNode {
@@ -290,6 +340,11 @@ class LRUCache<K, V> {
   has(key: K): boolean {
     return this.map.has(key);
   }
+
+  /** V3.4 增量刷新：删除单个条目（文件变更时失效缓存） */
+  delete(key: K): void {
+    this.map.delete(key);
+  }
 }
 
 // ---- 上下文引擎 ----
@@ -302,35 +357,93 @@ export class ContextEngine {
   private fileCache = new LRUCache<string, string>(LRU_SIZE);
   private importCache = new LRUCache<string, string[]>(LRU_SIZE);
   private symbolCache = new LRUCache<string, SymbolEntry[]>(LRU_SIZE);
+  /** V3.4 文件 token 集缓存（path → n-gram token 集，覆盖率匹配用） */
+  private tokenCache = new LRUCache<string, Set<string>>(LRU_SIZE);
+  /** V3.4 持久化符号种子（path → 符号列表，指纹校验通过后加载；refresh 时按文件失效） */
+  private persistedSymbols = new Map<string, SymbolEntry[]>();
   /** 全局符号索引（name 小写 → 符号列表），惰性构建 */
   private symbolIndex: Map<string, SymbolEntry[]> | null = null;
   private memoryStore: MemoryEntry[] = [];
   private rules: CodexRule[] = [];
   private indexed = false;
 
+  /** V3.4 持久化写盘串行链 + 防重入标记 */
+  private saveChain: Promise<void> = Promise.resolve();
+  private savePending = false;
+
   /**
    * 扫描项目目录，构建文件索引。
    * V3.2 懒加载：扫描阶段只 stat 不读内容——文件内容/符号/imports 全部按需读取。
+   * V3.4：扫描后加载持久化符号缓存（指纹校验通过的直接种子，免读盘）。
    * 隐私：敏感文件（.env*、私钥、凭据等）绝不入索引。
    */
   async index(workingDir: string): Promise<void> {
     this.workingDir = resolve(workingDir);
-    this.fileIndex = [];
-    this.filePathSet = new Set();
-    this.fileTrie = new FileTrie();
     this.fileCache = new LRUCache<string, string>(LRU_SIZE);
     this.importCache = new LRUCache<string, string[]>(LRU_SIZE);
     this.symbolCache = new LRUCache<string, SymbolEntry[]>(LRU_SIZE);
+    this.tokenCache = new LRUCache<string, Set<string>>(LRU_SIZE);
+    this.persistedSymbols = new Map();
     this.symbolIndex = null;
 
-    this.scanDirectory(this.workingDir);
+    const files: FileIndexEntry[] = [];
+    this.scanDirectory(this.workingDir, 0, files);
+    this.applyFileList(files);
     this.indexed = true;
+
+    // V3.4：持久化缓存种子（size+mtime 指纹逐文件校验，不匹配即弃）
+    this.loadPersistedIndex();
 
     // 加载规则文件
     this.loadRules();
   }
 
-  private scanDirectory(dir: string, depth = 0): void {
+  /**
+   * V3.4 增量刷新：重扫目录（stat-only 便宜），按 size/mtime 双指纹
+   * 只失效变更文件的缓存（内容/符号/imports/嵌入/持久化种子）。
+   * 符号索引置空惰性重建——未变文件命中逐文件缓存，无重读盘。
+   */
+  refresh(): void {
+    if (!this.indexed || !this.workingDir) return;
+
+    const prev = new Map(this.fileIndex.map((e) => [e.path, e]));
+    const files: FileIndexEntry[] = [];
+    this.scanDirectory(this.workingDir, 0, files);
+    const nextPaths = new Set(files.map((e) => e.path));
+
+    // 删除的文件 → 失效全部缓存
+    for (const path of prev.keys()) {
+      if (!nextPaths.has(path)) this.invalidateFile(path);
+    }
+    // 新增/变更的文件 → 失效全部缓存（同 size 不同 mtime 也失效，宁多勿漏）
+    for (const entry of files) {
+      const old = prev.get(entry.path);
+      if (!old || old.size !== entry.size || old.modifiedAt.getTime() !== entry.modifiedAt.getTime()) {
+        this.invalidateFile(entry.path);
+      }
+    }
+
+    this.applyFileList(files);
+    this.symbolIndex = null;
+  }
+
+  /** 失效单文件的全部派生缓存 */
+  private invalidateFile(relPath: string): void {
+    this.fileCache.delete(relPath);
+    this.importCache.delete(relPath);
+    this.symbolCache.delete(relPath);
+    this.tokenCache.delete(relPath);
+    this.persistedSymbols.delete(relPath);
+  }
+
+  private applyFileList(files: FileIndexEntry[]): void {
+    this.fileIndex = files;
+    this.filePathSet = new Set(files.map((f) => f.path));
+    this.fileTrie = new FileTrie();
+    for (const f of files) this.fileTrie.insert(f.path);
+  }
+
+  private scanDirectory(dir: string, depth: number, out: FileIndexEntry[]): void {
     if (depth > 10) return;
 
     const ignored = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.venv', 'coverage']);
@@ -345,7 +458,7 @@ export class ContextEngine {
         try {
           const stat = statSync(fullPath);
           if (stat.isDirectory()) {
-            this.scanDirectory(fullPath, depth + 1);
+            this.scanDirectory(fullPath, depth + 1, out);
           } else if (stat.isFile() && stat.size < 1_048_576) {
             const relPath = normalizeRelPath(relative(this.workingDir, fullPath));
 
@@ -353,14 +466,12 @@ export class ContextEngine {
             if (isSensitivePath(relPath) || isSensitivePath(entry)) continue;
             if (!this.isTextFile(entry)) continue;
 
-            this.fileIndex.push({
+            out.push({
               path: relPath,
               name: entry,
               size: stat.size,
               modifiedAt: stat.mtime,
             });
-            this.filePathSet.add(relPath);
-            this.fileTrie.insert(relPath);
           }
         } catch {
           // 跳过
@@ -418,12 +529,19 @@ export class ContextEngine {
   // ---- 符号索引 ----
 
   /**
-   * 解析单个文件的符号（带 LRU 缓存）
+   * 解析单个文件的符号（LRU 缓存 → 持久化种子 → 读盘解析）
    */
   extractFileSymbols(relPath: string): SymbolEntry[] {
     const key = normalizeRelPath(relPath);
     const cached = this.symbolCache.get(key);
     if (cached !== undefined) return cached;
+
+    // V3.4：持久化种子（指纹已校验，免读盘）
+    const persisted = this.persistedSymbols.get(key);
+    if (persisted) {
+      this.symbolCache.set(key, persisted);
+      return persisted;
+    }
 
     const lang = this.langOf(key);
     if (!lang) return [];
@@ -461,6 +579,9 @@ export class ContextEngine {
       count++;
     }
     this.symbolIndex = index;
+
+    // V3.4：构建完成后异步落盘（串行链，不阻塞查询）
+    this.queueSavePersistedIndex();
     return index;
   }
 
@@ -589,10 +710,89 @@ export class ContextEngine {
     return results.slice(0, maxFiles);
   }
 
-  // ---- 三路召回融合 ----
+  // ---- 四路召回融合 ----
 
   /**
-   * 根据查询组装上下文（符号定义处 → 关键词最优窗口 → import 图扩展）
+   * V3.4 语义召回：查询 token 覆盖率匹配（无哈希碰撞、可预测、可调试）。
+   * 覆盖率 = 文件命中的查询 token 权重 / 查询 token 总权重，
+   * 排序取 top-K。轻量语义（模糊词法），兜底符号/关键词都未命中的口语化查询。
+   */
+  semanticRecall(query: string, topK = SEMANTIC_TOP_K): ContextChunk[] {
+    if (!this.indexed) return [];
+
+    const queryTokens = tokenizeForEmbedding(query);
+    if (queryTokens.length === 0) return [];
+
+    // 查询 token 权重（类 TF：越靠前的 token 越重要）
+    const queryWeights = new Map<string, number>();
+    queryTokens.forEach((tok, idx) => {
+      const weight = 1 / Math.log2(idx + 2);
+      queryWeights.set(tok, (queryWeights.get(tok) || 0) + weight);
+    });
+    const totalQueryWeight = [...queryWeights.values()].reduce((a, b) => a + b, 0);
+    if (totalQueryWeight === 0) return [];
+
+    const keywords = this.extractKeywords(query);
+
+    // 候选池：小仓全量；大仓只取名称相关性 top-30（与关键词召回同一闸门）
+    let candidates: FileIndexEntry[];
+    if (this.fileIndex.length <= FULL_CONTENT_SCAN_MAX_FILES) {
+      candidates = this.fileIndex;
+    } else {
+      candidates = this.fileIndex
+        .map((entry) => ({ entry, score: this.nameRelevance(entry, keywords) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 30)
+        .map((s) => s.entry);
+    }
+
+    const scored: Array<{ entry: FileIndexEntry; coverage: number }> = [];
+    for (const entry of candidates) {
+      const fileTokens = this.getFileTokens(entry.path);
+      if (!fileTokens) continue;
+
+      let hitWeight = 0;
+      for (const [tok, weight] of queryWeights) {
+        if (fileTokens.has(tok)) hitWeight += weight;
+      }
+      const coverage = hitWeight / totalQueryWeight;
+      if (coverage > SEMANTIC_THRESHOLD) scored.push({ entry, coverage });
+    }
+    scored.sort((a, b) => b.coverage - a.coverage);
+
+    const chunks: ContextChunk[] = [];
+    for (const { entry, coverage } of scored.slice(0, topK)) {
+      const content = this.getFileContent(entry.path);
+      if (!content) continue;
+      // 窗口优先关键词命中处，否则文件头
+      const chunk = this.findBestChunk(content, keywords, entry.path) ?? this.chunkAroundLine(entry.path, 1, 60);
+      if (chunk) {
+        // 语义相关性上限 80：低于符号精确命中（100），高于关键词（≤50）
+        chunk.relevance = Math.min(80, Math.max(1, Math.round(coverage * 100)));
+        chunks.push(chunk);
+      }
+    }
+    return chunks;
+  }
+
+  /** 文件 token 集（路径 + 内容截断分词，LRU 缓存；未索引/不可读返回 null） */
+  private getFileTokens(relPath: string): Set<string> | null {
+    const key = normalizeRelPath(relPath);
+    const cached = this.tokenCache.get(key);
+    if (cached !== undefined) return cached;
+    if (!this.filePathSet.has(key)) return null;
+
+    const content = this.getFileContent(key);
+    if (content === null) return null;
+
+    const text = `${key}\n${content.slice(0, EMBED_CONTENT_CAP)}`;
+    const tokens = new Set(tokenizeForEmbedding(text));
+    this.tokenCache.set(key, tokens);
+    return tokens;
+  }
+
+  /**
+   * 根据查询组装上下文（符号定义处 → 关键词最优窗口 → 语义召回 → import 图扩展）
    */
   assembleContext(query: string, opts: AssembleOptions = {}): ContextChunk[] {
     if (!this.indexed) return [];
@@ -601,7 +801,7 @@ export class ContextEngine {
     const keywords = this.extractKeywords(query);
     const byPath = new Map<string, ContextChunk>();
 
-    // 1) 符号命中：定义处 ±20 行（相关性 100+，远高于关键词命中）
+    // 1) 符号命中：定义处 ±20 行（相关性 100+，远高于其他召回）
     const symbolHits = this.resolveQuerySymbols(query);
     for (const sym of symbolHits) {
       const chunk = this.chunkAroundLine(sym.file, sym.line, 20);
@@ -612,17 +812,25 @@ export class ContextEngine {
       }
     }
 
-    // 2) 关键词召回：名称/路径排序 → 内容最优窗口
+    // 2) 关键词召回：名称/路径排序 → 内容最优窗口（相关性 ≤50）
     const keywordChunks = this.keywordRecall(keywords);
     for (const chunk of keywordChunks) {
       const existing = byPath.get(chunk.path);
       if (!existing || existing.relevance < chunk.relevance) byPath.set(chunk.path, chunk);
     }
 
-    // 3) import 图扩展：从（符号命中 + 关键词命中 + 种子文件）出发 1 跳
+    // 3) V3.4 语义召回：n-gram token 覆盖率匹配（相关性 ≤80，介于符号与关键词之间）
+    const semanticChunks = this.semanticRecall(query);
+    for (const chunk of semanticChunks) {
+      const existing = byPath.get(chunk.path);
+      if (!existing || existing.relevance < chunk.relevance) byPath.set(chunk.path, chunk);
+    }
+
+    // 4) import 图扩展：从（符号命中 + 关键词/语义命中 + 种子文件）出发 1 跳
     const seeds = [
       ...symbolHits.map((s) => s.file),
       ...keywordChunks.map((c) => c.path),
+      ...semanticChunks.map((c) => c.path),
       ...(opts.seedFiles ?? []).map(normalizeRelPath),
     ].filter((p) => this.filePathSet.has(p));
     const related = this.getRelatedFiles([...new Set(seeds)], 1, IMPORT_EXPAND_MAX_FILES);
@@ -833,6 +1041,105 @@ export class ContextEngine {
     }
   }
 
+  // ---- V3.4 索引持久化 ----
+
+  /** 持久化文件条目（符号省略 file 字段，回载时回填） */
+  private serializeIndex(): string {
+    const byFile = new Map<string, { size: number; mtime: number; symbols: SymbolEntry[] }>();
+    const entryByPath = new Map(this.fileIndex.map((e) => [e.path, e]));
+
+    if (this.symbolIndex) {
+      for (const list of this.symbolIndex.values()) {
+        for (const sym of list) {
+          const entry = entryByPath.get(sym.file);
+          if (!entry) continue;
+          let slot = byFile.get(sym.file);
+          if (!slot) {
+            slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [] };
+            byFile.set(sym.file, slot);
+          }
+          if (slot.symbols.length < MAX_PERSIST_SYMBOLS_PER_FILE) {
+            slot.symbols.push({ name: sym.name, kind: sym.kind, file: sym.file, line: sym.line });
+          }
+        }
+      }
+    }
+
+    const payload = {
+      version: 1 as const,
+      workingDir: this.workingDir,
+      savedAt: new Date().toISOString(),
+      files: [...byFile.entries()].slice(0, MAX_PERSIST_FILES).map(([path, s]) => ({
+        path,
+        size: s.size,
+        mtime: s.mtime,
+        symbols: s.symbols.map((sym) => ({ name: sym.name, kind: sym.kind, line: sym.line })),
+      })),
+    };
+    return JSON.stringify(payload);
+  }
+
+  private cacheFilePath(): string | null {
+    if (!this.workingDir) return null;
+    const h = fnv1a(normalize(this.workingDir)).toString(36);
+    return join(getConfigDir(), 'cache', 'context', `${h}.json`);
+  }
+
+  /** 加载持久化符号缓存：逐文件校验 size+mtime 指纹，不匹配即弃 */
+  private loadPersistedIndex(): void {
+    const cacheFile = this.cacheFilePath();
+    if (!cacheFile) return;
+
+    try {
+      if (!existsSync(cacheFile)) return;
+      const raw = readFileSync(cacheFile, 'utf-8');
+      const data = JSON.parse(raw) as {
+        version: number;
+        workingDir: string;
+        files: Array<{ path: string; size: number; mtime: number; symbols: Array<{ name: string; kind: SymbolKind; line: number }> }>;
+      };
+      if (data.version !== 1 || data.workingDir !== this.workingDir) return;
+
+      const current = new Map(this.fileIndex.map((e) => [e.path, e]));
+      for (const f of data.files ?? []) {
+        const entry = current.get(f.path);
+        // 双指纹校验：size 与 mtime 都必须一致
+        if (!entry || entry.size !== f.size || entry.modifiedAt.getTime() !== f.mtime) continue;
+        if (!Array.isArray(f.symbols) || f.symbols.length === 0) continue;
+
+        this.persistedSymbols.set(
+          f.path,
+          f.symbols.map((s) => ({ name: s.name, kind: s.kind, file: f.path, line: s.line })),
+        );
+      }
+    } catch {
+      // 损坏/不可读 → 整体弃用，静默重建
+    }
+  }
+
+  /** 异步串行落盘（防重入；执行时序列化最新状态） */
+  private queueSavePersistedIndex(): void {
+    const cacheFile = this.cacheFilePath();
+    if (!cacheFile) return;
+    if (this.savePending) return;
+    this.savePending = true;
+
+    this.saveChain = this.saveChain.then(async () => {
+      this.savePending = false;
+      try {
+        mkdirSync(join(getConfigDir(), 'cache', 'context'), { recursive: true });
+        await writeFile(cacheFile, this.serializeIndex(), 'utf-8');
+      } catch {
+        // 写盘失败静默（磁盘满/无权限）——缓存是优化不是依赖
+      }
+    });
+  }
+
+  /** 等待排队中的落盘完成（测试用） */
+  async flushIndexCache(): Promise<void> {
+    await this.saveChain;
+  }
+
   // ---- 工具方法 ----
 
   /**
@@ -935,4 +1242,34 @@ function extOf(path: string): string {
 function extractIdentifierTokens(query: string): string[] {
   const tokens = query.match(/[A-Za-z_$][\w$]*/g) ?? [];
   return [...new Set(tokens)].filter((t) => t.length >= 2);
+}
+
+// ---- V3.4 模块级共享单例 ----
+
+let sharedEngine: ContextEngine | null = null;
+let sharedEngineDir = '';
+
+/**
+ * 获取进程级共享引擎实例（按 workingDir 缓存）。
+ * agent-loop 与 IDE 聊天 @codebase 共享同一索引——内核唯一原则，
+ * 杜绝双份内存与双份扫描。失败返回 null（调用方静默降级）。
+ */
+export function getSharedContextEngine(workingDir: string): ContextEngine | null {
+  try {
+    if (!sharedEngine || sharedEngineDir !== workingDir) {
+      sharedEngine = new ContextEngine();
+      // 扫描是轻量的（stat-only 零内容读取）
+      void sharedEngine.index(workingDir);
+      sharedEngineDir = workingDir;
+    }
+    return sharedEngine;
+  } catch {
+    return null;
+  }
+}
+
+/** 重置共享单例（测试用） */
+export function resetSharedContextEngine(): void {
+  sharedEngine = null;
+  sharedEngineDir = '';
 }
