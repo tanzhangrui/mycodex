@@ -373,11 +373,17 @@ async function handlePlugin(args: string[]): Promise<void> {
     console.log(`市场索引: ${indexFile}（${loaded.index.plugins.length} 个插件）`);
     console.log('');
     for (const p of loaded.index.plugins) {
-      const pluginPath = isAbsolute(p.source.path) ? p.source.path : resolve(loaded.baseDir, p.source.path);
-      const mark = installed.has(pluginPath) ? ' [已安装]' : '';
+      // V5.5 双源：file → 本地路径；url → https 远程（sha256 pin）
+      const pluginPath =
+        p.source.kind === 'url'
+          ? undefined
+          : isAbsolute(p.source.path)
+            ? p.source.path
+            : resolve(loaded.baseDir, p.source.path);
+      const mark = pluginPath && installed.has(pluginPath) ? ' [已安装]' : '';
       const desc = p.description ? ` — ${p.description}` : '';
       console.log(`  ${p.name}@${p.version}${mark}${desc}`);
-      console.log(`    源: ${p.source.path}`);
+      console.log(p.source.kind === 'url' ? `    源: ${p.source.url}（sha256 pin）` : `    源: ${p.source.path}`);
     }
     return;
   }

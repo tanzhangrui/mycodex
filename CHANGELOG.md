@@ -5,6 +5,54 @@
 
 ---
 
+## V5.6 — 2026-08-30 — Python 跨根 import（pyproject 别名）
+
+> V5.3 解决了 TS/JS 裸说明符跨根；Python monorepo（`from my_lib.core import helper`）依旧断在根边界。
+> 顺带修复一个存量缺陷：`from . import sibling` 形态（纯 dots 说明符）从未被解析。
+
+### A. pyproject.toml 包名别名
+- `buildPackageAliases` 扩展：根无 package.json 时读 pyproject.toml 的 `name`（正则解析 `[project] name = "..."`）
+- 连字符归一化：pyproject name `my-lib` → 别名键 `my_lib`（PEP 8 包名约束，import 侧用下划线形态）
+- 目录名不自动成为别名（避免与 pip 外部包名冲突）——诚实边界记录在案
+
+### B. dotted 说明符解析（`resolvePackageImport`）
+- Python 形态：`mylib` / `mylib.core` / `mylib.core.util`（无 `/` 含 `.` → 按 `.` 分段）
+- `import mylib` → 根 `__init__.py` 入口（`probeEntry` 新增 `__init__.py` 探测，TS 侧无影响）
+- src-layout 兜底：根下与包同名目录（`lib2/data_kit/loader.py`）——目录 = 归一化包名惯例
+- stdlib / pip 外部包不命中别名 → 放弃，无假路径
+
+### C. 存量缺陷修复：`from . import x` 从未解析
+- 旧逻辑收集纯 dots 说明符（`.`）→ resolveImport 探测目录本身必然失败 → 丢弃
+- 新增展开规则：`from . import a, b` / `from .. import (a, b)` → `./a` / `../b` 走相对解析（单根/多根均生效）
+
+### 验收
+- 新增 7 项测试：连字符归一化互引 / `import my_lib` → `__init__.py` / 同根相对不受影响 / stdlib 不入图 / BFS 跨根（Python 混合仓）/ src-layout 嵌套探测 / 单根 Python 不回归（含 `from . import` 修复验证）
+- typecheck 零错误 / **256 测试全绿**（249 + 7）
+
+---
+
+## V5.5 — 2026-08-30 — 插件市场远程源（url）安全下载
+
+> V4.4 的诚实边界兑现：`source.kind` 从仅 file 扩展到 url，远程插件可装了——
+> 但供应链安全是红线，无 pin 的远程下载执行等于任意代码注入入口。
+
+### A. 协议扩展（`MarketplaceSource`）
+- `source: { kind: 'url', url, sha256 }`：https 强制（http 明文可被中间人替换 → 拒绝）；sha256 必填且必须 64 位 hex（缺失/畸短 → 条目剔除，不降级）
+- file / url 条目可混存于同一索引；旧客户端自动忽略 url 条目（向后兼容）
+
+### B. 下载与校验（`downloadRemotePlugin`）
+- 落缓存目录 `config/plugins/<name>-<version>-<urlTag>.mjs`（url 短哈希防冲突），校验通过后才 `loadPlugin`
+- 缓存命中先复核内容 sha256（防本地缓存被篡改后绕过校验）；不符 → 作废重下
+- 大小上限 2MB / 空内容拒绝 / 下载器错误结构化失败（网络错误不炸）
+- `installPlugin` 增加可注入 `fetcher`（默认 global fetch，Node 18+）——测试零真实网络
+- CLI `plugin list` 兼容双源显示（url 条目标注 sha256 pin）
+
+### 验收
+- 新增 10 项测试：合法 url 条目解析 / http+缺 sha256+短 sha256 剔除 / 混合源共存 / 成功下载安装 / 缓存复用零重复下载 / 篡改内容拒绝且不落盘 / 空内容拒绝 / 污染缓存作废重下 / 下载错误结构化失败 / file 源不经下载器回归
+- typecheck 零错误 / **249 测试全绿**（239 + 10）
+
+---
+
 ## V5.4 — 2026-08-30 — 语义召回 IDF 加权
 
 > V3.4 的 token 覆盖率匹配有个盲区：export/const/function 这类几乎每文件都有的常见 token

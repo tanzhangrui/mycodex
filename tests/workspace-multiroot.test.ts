@@ -3,7 +3,8 @@
  * 覆盖：WorkspaceResolver（多根注册/根名去重/双向映射/越界拒绝/输入解析）+
  * ContextEngine 多根（统一键空间 rootName/rel、跨根检索、跨根读内容、
  * import 图同根解析、refresh 增量、单根兼容、共享单例多根缓存）+
- * V5.3 跨根包名互引（根 package.json name → 裸说明符跨根解析）
+ * V5.3 跨根包名互引（根 package.json name → 裸说明符跨根解析）+
+ * V5.6 Python 跨根（pyproject.toml name 别名 + dotted 说明符解析）
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
@@ -343,6 +344,113 @@ describe('ContextEngine 跨根 import（V5.3 包名别名）', () => {
     await e3.index(p3);
     // 'solo' 是自己的包名，但单根模式别名关闭 → 只解析相对 import
     expect(e3.parseImports('src/m.ts')).toEqual(['src/n.ts']);
+    rmSync(p3, { recursive: true, force: true });
+  });
+});
+
+// ---- V5.6 Python 跨根 ----
+
+describe('ContextEngine Python 跨根 import（V5.6 pyproject 别名）', () => {
+  let parent: string;
+  let pyAppRoot: string; // 目录名 pyapp，package.json name = py-app（package.json 优先演示）
+  let pyLibRoot: string; // 目录名 pylib，pyproject.toml name = my-lib → 别名 my_lib
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    parent = mkdtempSync(join(tmpdir(), 'codex-ws-py-'));
+    pyAppRoot = join(parent, 'pyapp');
+    pyLibRoot = join(parent, 'pylib');
+    mkdirSync(join(pyAppRoot, 'src'), { recursive: true });
+    mkdirSync(pyLibRoot, { recursive: true });
+
+    // 共享库根：pyproject name "my-lib"（连字符）→ Python 包名 my_lib
+    // 布局：根即包（__init__.py + core.py 直接在根下）
+    writeFileSync(join(pyLibRoot, 'pyproject.toml'), `[project]\nname = "my-lib"\nversion = "0.1.0"\n`);
+    writeFileSync(join(pyLibRoot, '__init__.py'), `from .core import helper\n`);
+    writeFileSync(join(pyLibRoot, 'core.py'), `def helper():\n    return 'ok'\n`);
+
+    // 应用根：裸模块互引 + stdlib + 同根相对 import 混合
+    writeFileSync(join(pyAppRoot, 'package.json'), JSON.stringify({ name: 'py-app' }));
+    writeFileSync(
+      join(pyAppRoot, 'src', 'main.py'),
+      [
+        `from my_lib.core import helper`,
+        `import my_lib`,
+        `import os`,
+        `import json`,
+        `from . import sibling`,
+        ``,
+        `def run():`,
+        `    return helper() + sibling.val`,
+        ``,
+      ].join('\n'),
+    );
+    writeFileSync(join(pyAppRoot, 'src', 'sibling.py'), `val = 1\n`);
+
+    e = new ContextEngine();
+    await e.index([pyAppRoot, pyLibRoot]);
+  });
+
+  afterAll(() => {
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it('pyproject 连字符归一化：from my_lib.core import x → 目标根 core.py', () => {
+    const deps = e.parseImports('pyapp/src/main.py');
+    expect(deps).toContain('pylib/core.py');
+  });
+
+  it('import my_lib（包整体）→ 根 __init__.py 入口', () => {
+    const deps = e.parseImports('pyapp/src/main.py');
+    expect(deps).toContain('pylib/__init__.py');
+  });
+
+  it('同根相对 import（from . import sibling）不受影响', () => {
+    const deps = e.parseImports('pyapp/src/main.py');
+    expect(deps).toContain('pyapp/src/sibling.py');
+    expect(deps).toHaveLength(3); // 恰好三个：core + __init__ + sibling
+  });
+
+  it('stdlib 不入图（os/json 未命中别名 → 放弃）', () => {
+    const deps = e.parseImports('pyapp/src/main.py');
+    expect(deps.some((d) => d.includes('/os') || d.endsWith('/os.py'))).toBe(false);
+    expect(deps.some((d) => d.includes('json'))).toBe(false);
+  });
+
+  it('import 图 BFS 跨根扩展（Python 混合仓）', () => {
+    const related = e.getRelatedFiles(['pyapp/src/main.py']);
+    expect(related).toContain('pylib/core.py');
+    expect(related).toContain('pylib/__init__.py');
+    expect(related).toContain('pyapp/src/sibling.py');
+  });
+
+  it('py 子路径嵌套探测：根下同名包目录（src-layout）', async () => {
+    const p2 = mkdtempSync(join(tmpdir(), 'codex-ws-py2-'));
+    const app2 = join(p2, 'app2');
+    const lib2 = join(p2, 'lib2');
+    mkdirSync(join(app2), { recursive: true });
+    // lib2 布局：根下 data_kit/ 包（src-layout 惯例：目录 = 归一化包名）
+    mkdirSync(join(lib2, 'data_kit'), { recursive: true });
+    writeFileSync(join(lib2, 'pyproject.toml'), `[project]\nname = "data-kit"\n`);
+    writeFileSync(join(lib2, 'data_kit', '__init__.py'), `from .loader import load\n`);
+    writeFileSync(join(lib2, 'data_kit', 'loader.py'), `def load():\n    return []\n`);
+    writeFileSync(join(app2, 'main.py'), `from data_kit.loader import load\nimport json\n`);
+    const e2 = new ContextEngine();
+    await e2.index([app2, lib2]);
+    // data_kit.loader → 直探 lib2/loader.* 失败 → 嵌套兜底 lib2/data_kit/loader.py 命中
+    expect(e2.parseImports('app2/main.py')).toContain('lib2/data_kit/loader.py');
+    rmSync(p2, { recursive: true, force: true });
+  });
+
+  it('单根 Python 不回归：裸模块（含自身 pyproject name）从不解析', async () => {
+    const p3 = mkdtempSync(join(tmpdir(), 'codex-ws-py3-'));
+    mkdirSync(join(p3, 'pkg'), { recursive: true });
+    writeFileSync(join(p3, 'pyproject.toml'), `[project]\nname = "solo-py"\n`);
+    writeFileSync(join(p3, 'pkg', 'm.py'), `from solo_py.core import x\nfrom . import n\n`);
+    writeFileSync(join(p3, 'pkg', 'n.py'), `x = 1\n`);
+    const e3 = new ContextEngine();
+    await e3.index(p3);
+    expect(e3.parseImports('pkg/m.py')).toEqual(['pkg/n.py']);
     rmSync(p3, { recursive: true, force: true });
   });
 });

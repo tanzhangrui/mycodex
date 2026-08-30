@@ -197,6 +197,18 @@ const PY_IMPORT_RES: RegExp[] = [
  */
 function extractImportSpecifiers(content: string, lang: 'ts' | 'py', includeBare = false): string[] {
   const specs: string[] = [];
+  if (lang === 'py') {
+    // V5.6 `from . import a, b` / `from .. import (a, b)` 形态：
+    // 说明符是纯 dots，导入的是包内名字 → 展开为 './a' / '../b' 走相对解析
+    const dotImport = /from\s+(\.+)\s+import\s+(?:\(([^)]+)\)|([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*))/g;
+    let dm: RegExpExecArray | null;
+    while ((dm = dotImport.exec(content)) !== null) {
+      const dots = dm[1].length;
+      const names = (dm[2] ?? dm[3] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+      const prefix = dots === 1 ? './' : '../'.repeat(dots - 1);
+      for (const name of names) specs.push(`${prefix}${name}`);
+    }
+  }
   const res = lang === 'py' ? PY_IMPORT_RES : TS_IMPORT_RES;
   for (const re of res) {
     re.lastIndex = 0;
@@ -209,8 +221,11 @@ function extractImportSpecifiers(content: string, lang: 'ts' | 'py', includeBare
         if (spec.startsWith('./') || spec.startsWith('../')) specs.push(spec);
         else if (includeBare && !spec.startsWith('.')) specs.push(spec);
       } else {
-        // Python：`from .mod import x` / `from ..pkg import y`
-        if (spec.startsWith('.')) specs.push(spec);
+        // Python：`from .mod import x`（dots+模块）恒收集；
+        // 纯 dots（`from . import x`）已由上方展开规则处理，跳过；
+        // 裸模块（`from mylib.core import x` / `import mylib`）仅在多根别名模式下收集
+        if (/^\.+\w/.test(spec)) specs.push(spec);
+        else if (includeBare && !spec.startsWith('.')) specs.push(spec);
       }
     }
   }
@@ -436,8 +451,11 @@ export class ContextEngine {
 
   /**
    * V5.3 跨根包名互引：读各根 package.json 的 name → 包名别名映射。
-   * monorepo 场景（backend import '@acme/shared-lib'）经此映射进入目标根的键空间。
-   * 无 package.json / name 缺失 / JSON 损坏 → 该根无别名（静默跳过）。
+   * V5.6 Python 根：无 package.json 时读 pyproject.toml 的 name（连字符归一化为
+   * 下划线——PEP 8 包名约束，pyproject name "my-lib" 对应 import my_lib）。
+   * monorepo 场景（backend import '@acme/shared-lib' / app `from mylib.core import x`）
+   * 经此映射进入目标根的键空间。
+   * 无清单 / name 缺失 / 内容损坏 → 该根无别名（静默跳过）。
    */
   private buildPackageAliases(): void {
     this.packageAliases = new Map();
@@ -447,9 +465,20 @@ export class ContextEngine {
         const pkg = JSON.parse(readFileSync(join(root.abs, 'package.json'), 'utf-8')) as { name?: unknown };
         if (typeof pkg.name === 'string' && pkg.name.trim().length > 0) {
           this.packageAliases.set(pkg.name.trim(), root.name);
+          continue;
         }
       } catch {
-        // 无 package.json 或损坏 → 跳过
+        // 无 package.json → 尝试 pyproject.toml（Python 根）
+      }
+      try {
+        const pyproject = readFileSync(join(root.abs, 'pyproject.toml'), 'utf-8');
+        const m = pyproject.match(/^\s*name\s*=\s*["']([^"']+)["']/m);
+        if (m && m[1].trim().length > 0) {
+          // Python 包名不含连字符：my-lib → my_lib
+          this.packageAliases.set(m[1].trim().replace(/-/g, '_'), root.name);
+        }
+      } catch {
+        // 无 pyproject.toml → 该根无别名
       }
     }
   }
@@ -772,19 +801,22 @@ export class ContextEngine {
 
   /**
    * V5.3 裸说明符 → 跨根键解析。
-   * 形态：`@scope/pkg` / `@scope/pkg/sub` / `pkg` / `pkg/sub`。
-   * 包名（含 scope）命中别名 → 目标根键空间内探测：
-   *   - 无子路径：根 index 入口（顶层 / dist / src / lib 布局）
-   *   - 有子路径：`root/sub`（+扩展名/index）→ dist/src/lib 前缀兜底
+   * 形态：`@scope/pkg` / `@scope/pkg/sub` / `pkg` / `pkg/sub`（TS/JS）；
+   * V5.6 dotted 形态：`mylib` / `mylib.core` / `mylib.core.util`（Python）。
+   * 包名（含 scope / pyproject 归一化名）命中别名 → 目标根键空间内探测：
+   *   - 无子路径：根入口（TS：index.*；Python：__init__.py）
+   *   - 有子路径：`root/sub`（+扩展名/index/__init__）→ dist/src/lib 前缀兜底
    */
   private resolvePackageImport(spec: string): string | null {
     const normalized = spec.replace(/\\/g, '/').replace(/\/+$/, '');
     if (!normalized || normalized.startsWith('node:')) return null;
 
-    const segs = normalized.split('/');
+    // Python dotted 说明符（无 '/'，含 '.'）：按 '.' 分段（mylib.core → mylib + core）
+    const isDotted = !normalized.includes('/') && normalized.includes('.');
+    const segs = isDotted ? normalized.split('.') : normalized.split('/');
     let pkg: string;
     let rest: string[];
-    if (segs[0].startsWith('@')) {
+    if (!isDotted && segs[0].startsWith('@')) {
       if (segs.length < 2) return null; // 裸 '@scope' 不是合法包名
       pkg = `${segs[0]}/${segs[1]}`;
       rest = segs.slice(2);
@@ -799,7 +831,11 @@ export class ContextEngine {
     const base = rest.length === 0 ? rootName : `${rootName}/${rest.join('/')}`;
     const direct = this.probeEntry(base);
     if (direct) return direct;
-    // 源码/发布产物布局差异兜底：dist/ src/ lib/
+    // src-layout 兜底：根下与包同名的目录（rootName/mylib/core.py / rootName/pkg/sub.ts）
+    const asPath = isDotted ? normalized.replace(/\./g, '/') : normalized;
+    const nested = this.probeEntry(`${rootName}/${asPath}`);
+    if (nested) return nested;
+    // 发布产物布局差异兜底：dist/ src/ lib/
     for (const prefix of ['dist', 'src', 'lib']) {
       const alt = this.probeEntry(`${rootName}/${prefix}${rest.length > 0 ? `/${rest.join('/')}` : ''}`);
       if (alt) return alt;
@@ -807,12 +843,12 @@ export class ContextEngine {
     return null;
   }
 
-  /** 键空间内探测：base+扩展名 → base/index.* */
+  /** 键空间内探测：base+扩展名 → base/index.* → base/__init__.py（Python 包入口） */
   private probeEntry(base: string): string | null {
     for (const ext of RESOLVE_EXTS) {
       if (this.filePathSet.has(base + ext)) return base + ext;
     }
-    for (const idx of RESOLVE_INDEX_FILES) {
+    for (const idx of [...RESOLVE_INDEX_FILES, '__init__.py']) {
       const candidate = `${base}/${idx}`;
       if (this.filePathSet.has(candidate)) return candidate;
     }
