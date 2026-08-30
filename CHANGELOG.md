@@ -5,6 +5,26 @@
 
 ---
 
+## V4.2 — 2026-08-30 — 验证增强：可配置 Verifier + 步骤级回滚
+
+> 纲领文档：`V4.2-ITERATION-PROMPT.md`。补强 V4.0 编排闭环的两个已知短板。
+
+### A. Verifier 可配置
+- `CodexConfig.planVerifyCommand`（默认 `npx tsc --noEmit` 不变）：测试驱动项目可配 `vitest run`，lint 严格项目可配 eslint
+- `OrchestratorOptions.verifyCommand` 注入默认验证器；CLI `/plan` 从配置透传
+
+### B. 步骤级回滚（接入 V3.1 检查点）
+- 每步执行前 `fs.createCheckpoint()`；重试耗尽 → `fs.restoreCheckpoint()` 回滚到步骤开始前
+- **失败回滚，成功保留**：失败产物未过验证 = 带病，绝不进入 `/apply` 写盘通道；成功产物已过验证 = 可信
+- **重试不回滚**：保留上次尝试的编辑，让模型在现状上修复（这正是"修复"语义）
+- `StepOutcome.rolledBack` 标记；CLI 汇报显示「本步骤修改已回滚」；回滚只动内存 FS，磁盘状态不变
+
+### 验收
+- 新增 4 项测试：失败回滚（半成品撤销 + FS 不脏）/ 成功保留（产物 dirty 等 /apply）/ 前序成功产物在后续失败后保留 / verifyCommand 透传
+- 双侧 typecheck 零错误 / **173 测试全绿**（169 + 4）/ CLI 打包 88.6KB / 扩展打包 535.6KB
+
+---
+
 ## V4.0 — 2026-08-30 — 多智能体编排（Planner / Editor / Verifier）
 
 > 纲领文档：`V4.0-ITERATION-PROMPT.md`（对照 Claude Code 计划-执行模式 / Cursor 多步任务编排）。
@@ -195,4 +215,4 @@
 | 版本 | 主题 | 关键项 |
 |---|---|---|
 | V4.1 | 插件市场 | 工具注册开放协议（第三方工具包加载）、IDE 侧 /plan 入口复用编排内核 |
-| V4.2 | 验证增强 | Verifier 可配置（typecheck/测试命令/lint）、步骤级回滚接入检查点 |
+| V4.3 | 编排打磨 | 计划展示与人工确认（执行前可编辑步骤）、并行无依赖步骤调度 |

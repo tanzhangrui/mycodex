@@ -131,6 +131,7 @@ export async function runTextRepl(options: TextReplOptions): Promise<void> {
           fs,
           workingDir,
           sandbox,
+          verifyCommand: config.planVerifyCommand,
           callbacks: createCallbacks().callbacks,
           onSummary: (summary) => {
             store = addMessage(store, 'assistant', summary);
@@ -261,12 +262,14 @@ interface PlanCommandOptions {
   fs: InMemoryFileSystem;
   workingDir: string;
   sandbox?: Sandbox;
+  /** V4.2 可配置验证命令（config.planVerifyCommand） */
+  verifyCommand?: string;
   callbacks: AgentCallbacks;
   onSummary: (summary: string) => void;
 }
 
 async function handlePlanCommand(options: PlanCommandOptions): Promise<void> {
-  const { provider, messages, fs, workingDir, sandbox, callbacks, onSummary } = options;
+  const { provider, messages, fs, workingDir, sandbox, verifyCommand, callbacks, onSummary } = options;
 
   console.log('\n[plan] 正在生成执行计划...');
   try {
@@ -277,6 +280,7 @@ async function handlePlanCommand(options: PlanCommandOptions): Promise<void> {
       workingDir,
       callbacks,
       sandbox,
+      verifyCommand,
     });
 
     if (result.mode === 'fallback') {
@@ -293,7 +297,8 @@ async function handlePlanCommand(options: PlanCommandOptions): Promise<void> {
       const icon = outcome.status === 'completed' ? '✓' : '✗';
       console.log(
         `[plan] 步骤 ${i + 1} ${icon} ${outcome.step.description}` +
-          (outcome.attempts > 1 ? `（重试 ${outcome.attempts - 1} 次）` : ''),
+          (outcome.attempts > 1 ? `（重试 ${outcome.attempts - 1} 次）` : '') +
+          (outcome.rolledBack ? '（本步骤修改已回滚）' : ''),
       );
       if (outcome.verifyOutput) {
         const short = outcome.verifyOutput.length > 200 ? outcome.verifyOutput.slice(0, 200) + '...' : outcome.verifyOutput;

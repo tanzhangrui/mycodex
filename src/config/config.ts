@@ -49,6 +49,8 @@ export interface CodexConfig {
   };
   /** 系统提示词（可选覆盖） */
   systemPrompt?: string;
+  /** V4.2 多步计划每步后的验证命令（默认 npx tsc --noEmit；测试驱动项目可配 vitest run 等） */
+  planVerifyCommand?: string;
   /** 插件路径列表 */
   plugins?: string[];
   /** MCP Server 配置列表 */

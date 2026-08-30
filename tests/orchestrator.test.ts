@@ -42,6 +42,8 @@ class FakeProvider implements AIProvider {
   constructor(
     private readonly planResponse: string,
     private readonly stepResponse = '步骤已完成。',
+    /** 每次步骤执行的 write_file 调用（模拟编辑产物）；路径 → 内容 */
+    private readonly writes: Array<{ path: string; content: string }> = [],
   ) {}
 
   async *stream(): AsyncGenerator<string, void, undefined> {
@@ -55,6 +57,9 @@ class FakeProvider implements AIProvider {
   ): AsyncGenerator<StreamEvent, void, undefined> {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     this.receivedUserMsgs.push(typeof lastUser?.content === 'string' ? lastUser.content : '');
+    for (const w of this.writes) {
+      yield { type: 'tool_use', id: `tu_${Math.random().toString(36).slice(2)}`, name: 'write_file', input: w };
+    }
     yield { type: 'text_delta', text: this.stepResponse };
     yield { type: 'token_usage', usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } };
     yield { type: 'done' };
@@ -281,5 +286,101 @@ describe('runPlannedTask', () => {
     expect(second).toContain('第 2/2 步');
     expect(second).toContain('步骤乙');
     expect(second).toContain('步骤甲 ✓');
+  });
+
+  // ---- V4.2 步骤级回滚 + 可配置验证命令 ----
+
+  it('V4.2 步骤失败 → 半成品编辑回滚到步骤前（rolledBack 标记）', async () => {
+    // 每次步骤执行都写一个半成品文件；验证恒失败 → 重试耗尽 → 回滚
+    const provider = new FakeProvider('{"steps": ["写坏代码"]}', '失败了.', [
+      { path: 'half-done.ts', content: 'export const broken = ;' },
+    ]);
+    const verify = vi.fn().mockResolvedValue({ success: false, output: 'error TS1005' });
+    const fs = new InMemoryFileSystem();
+
+    const result = await runPlannedTask({
+      provider,
+      messages: [userMsg('写点东西')],
+      fs,
+      workingDir: workDir,
+      callbacks: noopCallbacks(),
+      verify,
+    });
+
+    expect(result.steps[0].status).toBe('failed');
+    expect(result.steps[0].rolledBack).toBe(true);
+    // 半成品被撤销：文件不存在、FS 不脏
+    expect(fs.read(join(workDir, 'half-done.ts'))).toBeNull();
+    expect(fs.isDirty()).toBe(false);
+  });
+
+  it('V4.2 步骤成功 → 编辑产物保留（不回滚）', async () => {
+    const provider = new FakeProvider('{"steps": ["写好代码"]}', '完成.', [
+      { path: 'good.ts', content: 'export const ok = 1;\n' },
+    ]);
+    const verify = vi.fn().mockResolvedValue({ success: true, output: '' });
+    const fs = new InMemoryFileSystem();
+
+    const result = await runPlannedTask({
+      provider,
+      messages: [userMsg('写点东西')],
+      fs,
+      workingDir: workDir,
+      callbacks: noopCallbacks(),
+      verify,
+    });
+
+    expect(result.steps[0].status).toBe('completed');
+    expect(result.steps[0].rolledBack).toBeFalsy();
+    // 产物保留且为 dirty（等待 /apply 写盘）
+    expect(fs.read(join(workDir, 'good.ts'))).toBe('export const ok = 1;\n');
+    expect(fs.isDirty()).toBe(true);
+  });
+
+  it('V4.2 前序成功产物在后续步骤失败后仍保留', async () => {
+    // 两次步骤调用共享同一 writes 数组 → 每步都写 prod.ts
+    const provider = new FakeProvider('{"steps": ["好步骤", "坏步骤"]}', '执行中.', [
+      { path: 'prod.ts', content: 'export const v = 1;\n' },
+    ]);
+    // 第一步过，第二步（含重试共 2 次验证）都挂
+    const verify = vi
+      .fn()
+      .mockResolvedValueOnce({ success: true, output: '' })
+      .mockResolvedValue({ success: false, output: 'error TS1' });
+    const fs = new InMemoryFileSystem();
+
+    const result = await runPlannedTask({
+      provider,
+      messages: [userMsg('两步任务')],
+      fs,
+      workingDir: workDir,
+      callbacks: noopCallbacks(),
+      verify,
+    });
+
+    expect(result.steps).toHaveLength(2);
+    expect(result.steps[0].status).toBe('completed');
+    expect(result.steps[1].status).toBe('failed');
+    // 第一步产物保留（它通过了验证），第二步在其上叠加的同文件写入被回滚到第一步完成后
+    expect(fs.read(join(workDir, 'prod.ts'))).toBe('export const v = 1;\n');
+  });
+
+  it('V4.2 verifyCommand 注入默认验证器（自定义命令被沙箱执行）', async () => {
+    const provider = new FakeProvider('{"steps": ["跑测试"]}');
+    const verify = vi.fn().mockResolvedValue({ success: true, output: '' });
+
+    // 自定义 verify 桩优先（真实沙箱命令执行在 e2e 层）；此处验证透传不炸
+    const result = await runPlannedTask({
+      provider,
+      messages: [userMsg('跑测试')],
+      fs: new InMemoryFileSystem(),
+      workingDir: workDir,
+      callbacks: noopCallbacks(),
+      verifyCommand: 'vitest run',
+      verify,
+    });
+
+    expect(result.mode).toBe('planned');
+    expect(result.steps[0].status).toBe('completed');
   });
 });

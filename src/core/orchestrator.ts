@@ -34,6 +34,8 @@ export interface StepOutcome {
   attempts: number;
   /** 验证输出（失败时含错误信息，供展示与诊断） */
   verifyOutput?: string;
+  /** V4.2 失败步骤已回滚到步骤开始前 */
+  rolledBack?: boolean;
 }
 
 export interface PlannedTaskResult {
@@ -57,7 +59,9 @@ export interface OrchestratorOptions {
   callbacks: AgentCallbacks;
   signal?: AbortSignal;
   sandbox?: Sandbox;
-  /** 验证器（可注入测试桩）；缺省：有沙箱跑 typecheck，无沙箱跳过（恒过） */
+  /** V4.2 验证命令（缺省 VERIFY_COMMAND；测试驱动项目可配 vitest run 等） */
+  verifyCommand?: string;
+  /** 验证器（可注入测试桩）；缺省：有沙箱跑 verifyCommand，无沙箱跳过（恒过） */
   verify?: (workingDir: string) => Promise<VerifyResult>;
   /** 单步验证失败后的重试次数（默认 1） */
   maxStepRetries?: number;
@@ -83,7 +87,7 @@ export function looksComplex(query: string): boolean {
 export async function runPlannedTask(options: OrchestratorOptions): Promise<PlannedTaskResult> {
   const { provider, messages, fs, workingDir, callbacks, signal, sandbox } = options;
   const maxRetries = options.maxStepRetries ?? 1;
-  const verify = options.verify ?? createDefaultVerify(sandbox);
+  const verify = options.verify ?? createDefaultVerify(sandbox, options.verifyCommand);
 
   const task = extractTask(messages);
 
@@ -114,12 +118,16 @@ export async function runPlannedTask(options: OrchestratorOptions): Promise<Plan
     if (signal?.aborted) break;
     const step = plan.steps[i];
 
+    // V4.2 步骤级检查点：失败回滚到步骤开始前（失败产物未过验证 = 带病，不残留）
+    const stepCheckpoint = fs.createCheckpoint();
+
     const stepMessages = buildStepMessages(messages, plan, i, stepOutcomes);
     let attempt = 0;
     let lastVerify: VerifyResult = { success: false, output: '' };
     let stepFailed = true;
 
     while (attempt <= maxRetries) {
+      // 重试不回滚：保留上次尝试的编辑，让模型在现状上修复（这正是"修复"语义）
       const result = await runAgentLoop(
         provider,
         attempt === 0 ? stepMessages : appendVerifyFeedback(stepMessages, step, lastVerify),
@@ -149,17 +157,24 @@ export async function runPlannedTask(options: OrchestratorOptions): Promise<Plan
       // 验证失败且还有重试额度 → 反馈错误再来一次
     }
 
+    // V4.2 重试耗尽 → 回滚到步骤开始前（失败步骤的半成品不进入 /apply 通道）
+    if (stepFailed) {
+      fs.restoreCheckpoint(stepCheckpoint);
+    }
+
     stepOutcomes.push({
       step: { ...step, status: stepFailed ? 'failed' : 'completed' },
       status: stepFailed ? 'failed' : 'completed',
       attempts: attempt,
       verifyOutput: lastVerify.success ? undefined : lastVerify.output,
+      /** V4.2 失败步骤已回滚 */
+      rolledBack: stepFailed,
     });
 
     // 步骤失败 → 终止后续（后续步骤依赖前序产物，带病执行 = 浪费 token 产出错误结果）
     if (stepFailed) {
       hasError = true;
-      errorMsg = `步骤 ${i + 1} 验证失败（已重试 ${attempt - 1} 次）：${lastVerify.output.slice(0, 200)}`;
+      errorMsg = `步骤 ${i + 1} 验证失败（已重试 ${attempt - 1} 次，已回滚本步骤修改）：${lastVerify.output.slice(0, 200)}`;
       break;
     }
   }
@@ -238,13 +253,17 @@ ${verify.output.slice(0, 4000)}
   ];
 }
 
-/** 默认验证器：有沙箱跑 typecheck；无沙箱跳过（恒过——验证是增强，不是依赖） */
-function createDefaultVerify(sandbox?: Sandbox): (workingDir: string) => Promise<VerifyResult> {
+/** 默认验证器：有沙箱跑 verifyCommand；无沙箱跳过（恒过——验证是增强，不是依赖） */
+function createDefaultVerify(
+  sandbox?: Sandbox,
+  verifyCommand?: string,
+): (workingDir: string) => Promise<VerifyResult> {
+  const command = verifyCommand ?? VERIFY_COMMAND;
   return async () => {
     if (!sandbox) return { success: true, output: '' };
     try {
       const exec = createCommandExecutor(sandbox);
-      const result = await exec(VERIFY_COMMAND);
+      const result = await exec(command);
       const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
       return { success: result.success, output };
     } catch (err) {
