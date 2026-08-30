@@ -22,6 +22,7 @@ import type { Message } from './message-manager.js';
 import type { Sandbox } from '../sandbox/sandbox.js';
 import { createCommandExecutor, createCodeExecutor } from '../sandbox/sandbox.js';
 import { runSubAgents, type SubAgentTask } from './sub-agent.js';
+import { ContextEngine } from '../context/context-engine.js';
 
 // ---- 类型定义 ----
 
@@ -93,17 +94,56 @@ function loadCodexRules(workingDir: string): string {
 }
 
 /**
- * 构建包含项目规则的系统提示词
+ * 构建包含项目规则与相关上下文的系统提示词。
+ * V3.2：注入上下文引擎三路召回（符号定义处 / 关键词窗口 / import 图扩展）的结果，
+ * 让廉价模型无需多轮工具探索即可拿到关键代码。引擎失败静默降级，绝不阻断主循环。
  */
-function buildSystemPrompt(workingDir: string): string {
+function buildSystemPrompt(workingDir: string, userQuery: string): string {
+  const parts: string[] = [TOOL_SYSTEM_PROMPT];
+
   const rules = loadCodexRules(workingDir);
-  if (!rules) return TOOL_SYSTEM_PROMPT;
+  if (rules) {
+    parts.push(`<project_rules>\n${rules}\n</project_rules>`);
+  }
 
-  return `${TOOL_SYSTEM_PROMPT}
+  // V3.2 上下文引擎：自动检索与查询最相关的代码（8K token 预算）
+  const engine = getContextEngine(workingDir);
+  if (engine) {
+    try {
+      const chunks = engine.assembleContext(userQuery, { maxTokens: 8_000 });
+      if (chunks.length > 0) {
+        const ctx = chunks
+          .map((c) => `[${c.path}:${c.startLine}-${c.endLine}]\n\`\`\`\n${c.content}\n\`\`\``)
+          .join('\n\n');
+        parts.push(
+          `<project_context>\n以下是与本次任务最相关的代码片段（由符号索引与依赖图自动检索，仅供参考，以工具读取的实时内容为准）：\n\n${ctx}\n</project_context>`,
+        );
+      }
+    } catch {
+      // 上下文引擎失败不阻断 Agent 主循环
+    }
+  }
 
-<project_rules>
-${rules}
-</project_rules>`;
+  return parts.join('\n\n');
+}
+
+// ---- V3.2 上下文引擎（进程内单例，按 workingDir 缓存） ----
+
+let contextEngine: ContextEngine | null = null;
+let contextEngineDir = '';
+
+function getContextEngine(workingDir: string): ContextEngine | null {
+  try {
+    if (!contextEngine || contextEngineDir !== workingDir) {
+      contextEngine = new ContextEngine();
+      // 扫描是轻量的（零内容读取），可同步完成
+      void contextEngine.index(workingDir);
+      contextEngineDir = workingDir;
+    }
+    return contextEngine;
+  } catch {
+    return null;
+  }
 }
 
 // ---- 累积 Token 用量 ----
@@ -164,7 +204,11 @@ export async function runAgentLoop(
   };
 
   const toolDefs = toolRegistry.getAllDefinitions();
-  const systemPrompt = buildSystemPrompt(workingDir);
+
+  // V3.2：以最后一条用户消息作为上下文检索的查询
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
+  const userQuery = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : '';
+  const systemPrompt = buildSystemPrompt(workingDir, userQuery);
 
   // 创建 AbortController 用于传递 signal 给 provider
   const abortController = new AbortController();
