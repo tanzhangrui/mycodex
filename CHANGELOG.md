@@ -5,6 +5,32 @@
 
 ---
 
+## V5.1 — 2026-08-30 — 多根入口接线 + 插件市场命令
+
+> V5.0 交付了多根核心层原语，本轮把它接到用户手里：CLI 一参数进多根，插件市场一条命令装常驻。
+> 诚实边界：IDE 侧（VS Code 多根文件夹感知）未接——agent-service 传单根 string 完全兼容（类型已放宽）。
+
+### A. CLI `--workspace` 多根接线
+- `codex chat --workspace <目录1>,<目录2>`：逗号分隔多根（首根 = 主根）；根不存在/非目录 fail-fast
+- 类型链路全线放宽 `WorkingDirInput = string | string[]`（agent-loop / orchestrator / text-repl / app.tsx）——单根调用零改动完全兼容
+- 语义分层：上下文引擎**跨根召回**（系统提示词含全部根的相关代码）；工具/沙箱/CODEX.md 规则/验证命令以**主根为基准**（`primaryRootOf`）
+- `InMemoryFileSystem.snapshot` 多根：绝对路径键天然无冲突，两根文件均可读可编辑可 /apply
+
+### B. 插件市场命令（`codex plugin`）
+- `codex plugin list [--index <路径>]`：列出索引插件（默认 `./marketplace.json`）
+- `codex plugin install <名称> [--index <路径>]`：安装 + **写入 config.plugins 常驻**（下次启动自动加载，已在配置则跳过）
+- 真实端到端验证：examples 索引安装 echo-tools → 2 工具加载 → 配置落盘
+
+### C. 修复（冒烟测试发现的两处真实缺陷）
+- **管道模式崩溃**：`registerBuiltinTools` 被入口与 text-repl 双重调用 → "工具 read_file 已注册" 崩溃；改为幂等（`clearTools` 重置标记）
+- **多根首查竞态**：`ContextEngine.index` 多根路径原用动态 `await import`，共享单例 void 调用下首次查询的系统提示词与扫描竞态（召回为空）；改静态导入保证 index 全程同步完成
+
+### 验收
+- 新增 7 项测试：primaryRootOf / 内存 FS 多根快照（跨根可读/主根基准/单根兼容）/ runAgentLoop 多根（跨根召回 + 主根规则注入）/ 单根不回归
+- 双侧 typecheck 零错误 / **223 测试全绿**（216 + 7）/ CLI + 扩展打包成功 / `--workspace` 与 `plugin list/install` 真实 CLI 冒烟通过
+
+---
+
 ## V5.0 — 2026-08-30 — 多仓库工作区（核心层）
 
 > 纲领文档：`V4.4-V5.0-ITERATION-PROMPT.md`。核心命题：单 workingDir 假设贯穿引擎/agent-loop/IDE——monorepo 多仓场景（前端仓 + 服务仓 + 共享库仓）下检索只见一仓。

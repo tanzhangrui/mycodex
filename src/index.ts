@@ -26,11 +26,11 @@
 import { config as loadDotenv } from 'dotenv';
 loadDotenv(); // 必须在所有其他 import 之前加载 .env
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { render } from 'ink';
 import React from 'react';
-import { initConfig, loadConfig, getConfigDir, getProviderDisplayName } from './config/config.js';
+import { initConfig, loadConfig, saveConfig, getConfigDir, getProviderDisplayName } from './config/config.js';
 import { loadMessages, saveMessages } from './core/message-manager.js';
 import { createProvider } from './utils/ai-client.js';
 import { InMemoryFileSystem } from './core/in-memory-fs.js';
@@ -39,6 +39,7 @@ import { createSandbox } from './sandbox/sandbox.js';
 import { createLogger } from './utils/logger.js';
 import { toolRegistry } from './tools/registry.js';
 import { registerBuiltinTools } from './tools/builtin.js';
+import { loadMarketplaceIndex, findEntry, installPlugin } from './tools/marketplace.js';
 import { checkForUpdates, getUpdateMessage } from './utils/auto-updater.js';
 import { ChatApp } from './cli/app.jsx';
 import { runTextRepl } from './cli/text-repl.js';
@@ -95,8 +96,12 @@ Codex — 顶级 CLI AI 编程工具 v${VERSION}
   codex chat      启动对话 REPL（支持工具调用）
   codex config    配置 API Key 和模型参数
   codex update    检查更新
+  codex plugin    插件市场（list / install）
   codex --help    显示此帮助
   codex --version 显示版本号
+
+多仓库工作区:
+  codex chat --workspace <目录1>,<目录2>   多根模式（跨仓检索，首根为主根）
 
 功能:
   - AI 对话（流式响应）+ 并行工具执行
@@ -134,6 +139,8 @@ async function handleChat(): Promise<void> {
   const mcpCommand = mcpIndex !== -1 ? args[mcpIndex + 1] : undefined;
   const resumeIndex = args.indexOf('--resume');
   const forceResume = resumeIndex !== -1;
+  const workspaceIndex = args.indexOf('--workspace');
+  const workspaceArg = workspaceIndex !== -1 ? args[workspaceIndex + 1] : undefined;
 
   // V1.5: 会话崩溃恢复检测
   if (hasCrashedSession() && store.messages.length > 0 && !forceResume) {
@@ -169,13 +176,33 @@ async function handleChat(): Promise<void> {
   }).catch(() => {});
   registerBuiltinTools();
 
-  // 初始化内存文件系统
-  const workingDir = process.cwd();
+  // V5.1 工作目录：--workspace a,b 多根（首根为主根）；缺省 cwd 单根
+  let workingDir: string | string[] = process.cwd();
+  if (workspaceArg) {
+    const roots = workspaceArg
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => resolve(s));
+    if (roots.length === 0) {
+      console.error('错误: --workspace 参数为空（格式: --workspace <目录1>,<目录2>）');
+      process.exit(1);
+    }
+    const invalid = roots.filter((r) => !existsSync(r) || !statSync(r).isDirectory());
+    if (invalid.length > 0) {
+      console.error(`错误: 以下工作区根不存在或不是目录:\n  ${invalid.join('\n  ')}`);
+      process.exit(1);
+    }
+    workingDir = roots;
+    console.log(`[工作区] 多根模式（${roots.length} 个根，主根: ${roots[0]}）`);
+  }
+
+  // 初始化内存文件系统（多根快照：绝对路径键，跨根无冲突）
   const fs = new InMemoryFileSystem();
   await fs.snapshot(workingDir);
 
-  // 初始化安全沙箱
-  const sandbox = createSandbox(workingDir);
+  // 初始化安全沙箱（以主根为 cwd）
+  const sandbox = createSandbox(Array.isArray(workingDir) ? workingDir[0] : workingDir);
 
   // 加载 --mcp CLI 参数指定的 MCP Server
   if (mcpCommand) {
@@ -322,6 +349,84 @@ function handleHelp(): void {
   console.log(HELP_TEXT);
 }
 
+// ---- V5.1 插件市场命令 ----
+
+/** 默认市场索引路径：当前目录 marketplace.json */
+const DEFAULT_MARKETPLACE = 'marketplace.json';
+
+async function handlePlugin(args: string[]): Promise<void> {
+  const sub = args[0];
+  const rest = args.slice(1);
+
+  // 解析 --index <path>（默认 ./marketplace.json）
+  const idxFlag = rest.indexOf('--index');
+  const indexArg = idxFlag !== -1 ? rest[idxFlag + 1] : undefined;
+  const indexFile = indexArg ?? DEFAULT_MARKETPLACE;
+
+  if (sub === 'list') {
+    const loaded = loadMarketplaceIndex(indexFile);
+    if (!loaded) {
+      console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
+      process.exit(1);
+    }
+    console.log(`市场索引: ${indexFile}（${loaded.index.plugins.length} 个插件）`);
+    console.log('');
+    for (const p of loaded.index.plugins) {
+      const desc = p.description ? ` — ${p.description}` : '';
+      console.log(`  ${p.name}@${p.version}${desc}`);
+      console.log(`    源: ${p.source.path}`);
+    }
+    return;
+  }
+
+  if (sub === 'install') {
+    // 名称 = rest 中去掉 --index 及其值后的首个参数
+    const positional = rest.filter((a, i) => a !== '--index' && rest[i - 1] !== '--index');
+    const name = positional[0];
+    if (!name) {
+      console.error('用法: codex plugin install <名称> [--index <索引路径>]');
+      process.exit(1);
+    }
+
+    const loaded = loadMarketplaceIndex(indexFile);
+    if (!loaded) {
+      console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
+      process.exit(1);
+    }
+
+    const entry = findEntry(loaded, name);
+    if (!entry) {
+      console.error(`错误: 索引中未找到插件 "${name}"`);
+      console.error(`可用插件: ${loaded.index.plugins.map((p) => p.name).join(', ') || '（无）'}`);
+      process.exit(1);
+    }
+
+    registerBuiltinTools();
+    const result = await installPlugin(loaded, entry, toolRegistry);
+    if (!result.success) {
+      console.error(`安装失败 (${result.name}): ${result.detail}`);
+      process.exit(1);
+    }
+
+    console.log(`✔ ${result.name}: ${result.detail}`);
+    console.log(`  路径: ${result.pluginPath}`);
+
+    // 常驻：写入 config.plugins（下次启动自动加载）；已在配置中则跳过
+    const config = loadConfig();
+    if (result.pluginPath && !(config.plugins ?? []).includes(result.pluginPath)) {
+      config.plugins = [...(config.plugins ?? []), result.pluginPath];
+      saveConfig(config);
+      console.log('  已写入配置（下次启动自动加载）');
+    }
+    return;
+  }
+
+  console.error('用法:');
+  console.error('  codex plugin list [--index <索引路径>]           列出市场索引中的插件');
+  console.error('  codex plugin install <名称> [--index <索引路径>]  安装插件并写入配置常驻');
+  process.exit(sub ? 1 : 0);
+}
+
 async function handleUpdate(): Promise<void> {
   console.log('正在检查更新...');
   const info = await checkForUpdates(VERSION);
@@ -354,6 +459,9 @@ async function main(): Promise<void> {
       break;
     case 'update':
       await handleUpdate();
+      break;
+    case 'plugin':
+      await handlePlugin(args.slice(1));
       break;
     case '--help':
     case '-h':

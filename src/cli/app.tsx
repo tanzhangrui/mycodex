@@ -14,7 +14,7 @@ import type { Message, MessageStore } from '../core/message-manager.js';
 import { saveSessionToFile } from '../core/message-manager.js';
 import type { AIProvider } from '../utils/ai-client.js';
 import { InMemoryFileSystem } from '../core/in-memory-fs.js';
-import { runAgentLoop, type AgentCallbacks } from '../core/agent-loop.js';
+import { runAgentLoop, type AgentCallbacks, type WorkingDirInput } from '../core/agent-loop.js';
 import { registerBuiltinTools } from '../tools/builtin.js';
 import type { Sandbox } from '../sandbox/sandbox.js';
 import type { CodexConfig } from '../config/config.js';
@@ -28,7 +28,8 @@ export interface ChatAppProps {
   provider: AIProvider;
   config: CodexConfig;
   fs: InMemoryFileSystem;
-  workingDir: string;
+  /** V5.1 工作目录：单根 string 或多根 string[] */
+  workingDir: WorkingDirInput;
   sandbox?: Sandbox;
   forceProvider?: string;
   onSave: (store: MessageStore) => void;

@@ -9,7 +9,7 @@ import type { MessageStore } from '../core/message-manager.js';
 import { addMessage, saveSessionToFile } from '../core/message-manager.js';
 import type { AIProvider } from '../utils/ai-client.js';
 import { InMemoryFileSystem } from '../core/in-memory-fs.js';
-import { runAgentLoop, type AgentCallbacks } from '../core/agent-loop.js';
+import { runAgentLoop, type AgentCallbacks, type WorkingDirInput } from '../core/agent-loop.js';
 import { runPlannedTask } from '../core/orchestrator.js';
 import { registerBuiltinTools } from '../tools/builtin.js';
 import type { Sandbox } from '../sandbox/sandbox.js';
@@ -22,7 +22,8 @@ export interface TextReplOptions {
   provider: AIProvider;
   config: CodexConfig;
   fs: InMemoryFileSystem;
-  workingDir: string;
+  /** V5.1 工作目录：单根 string 或多根 string[] */
+  workingDir: WorkingDirInput;
   sandbox?: Sandbox;
   forceProvider?: string;
   onSave: (store: MessageStore) => void;
@@ -260,7 +261,7 @@ interface PlanCommandOptions {
   provider: AIProvider;
   messages: MessageStore['messages'];
   fs: InMemoryFileSystem;
-  workingDir: string;
+  workingDir: WorkingDirInput;
   sandbox?: Sandbox;
   /** V4.2 可配置验证命令（config.planVerifyCommand） */
   verifyCommand?: string;

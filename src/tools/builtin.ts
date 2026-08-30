@@ -332,7 +332,12 @@ const runScriptTool: RegisteredTool = {
 
 // ---- 注册所有内置工具 ----
 
+/** 幂等标记：入口（handleChat）与 text-repl 各调一次，重复注册直接跳过 */
+let builtinRegistered = false;
+
 export function registerBuiltinTools(): void {
+  if (builtinRegistered) return;
+  builtinRegistered = true;
   toolRegistry.register(readFileTool);
   toolRegistry.register(writeFileTool);
   toolRegistry.register(editFileTool);
@@ -347,4 +352,5 @@ export function registerBuiltinTools(): void {
  */
 export function clearTools(): void {
   toolRegistry.clear();
+  builtinRegistered = false; // 测试重置后允许重新注册
 }

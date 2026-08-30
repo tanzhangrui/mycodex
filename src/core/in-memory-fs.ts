@@ -78,16 +78,20 @@ export class InMemoryFileSystem {
   private workingDir: string = '';
 
   /**
-   * 快照工作目录
+   * 快照工作目录。V5.1：支持多根（string[]）——键为绝对路径天然无冲突，
+   * 相对路径解析基准（resolvePath）取首根（主根语义）。
    */
-  async snapshot(workingDir: string): Promise<void> {
-    this.workingDir = resolve(workingDir);
+  async snapshot(workingDir: string | string[]): Promise<void> {
+    this.workingDir = resolve(Array.isArray(workingDir) ? workingDir[0] : workingDir);
     this.files.clear();
     this.originalFiles.clear();
     this.dirtyFiles.clear();
     this.deletedFiles.clear();
 
-    this.scanDirectory(this.workingDir);
+    const roots = Array.isArray(workingDir) ? workingDir : [workingDir];
+    for (const root of roots) {
+      this.scanDirectory(resolve(root));
+    }
 
     // 复制到原始文件记录
     for (const [path, content] of this.files) {

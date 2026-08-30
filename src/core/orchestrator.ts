@@ -12,7 +12,7 @@
 import type { AIProvider } from '../utils/ai-client.js';
 import type { InMemoryFileSystem } from './in-memory-fs.js';
 import type { Message } from './message-manager.js';
-import { runAgentLoop, type AgentCallbacks, type AgentLoopResult, type TokenUsage } from './agent-loop.js';
+import { runAgentLoop, primaryRootOf, type AgentCallbacks, type AgentLoopResult, type TokenUsage, type WorkingDirInput } from './agent-loop.js';
 import { createTaskPlan } from './planner.js';
 import type { ExecutionPlan, PlanStep } from './sub-agent.js';
 import type { Sandbox } from '../sandbox/sandbox.js';
@@ -55,7 +55,8 @@ export interface OrchestratorOptions {
   /** 基础消息历史（含最后一条用户任务） */
   messages: Message[];
   fs: InMemoryFileSystem;
-  workingDir: string;
+  /** V5.1 工作目录：单根 string 或多根 string[]（编辑循环跨根召回；验证/沙箱以主根为基准） */
+  workingDir: WorkingDirInput;
   callbacks: AgentCallbacks;
   signal?: AbortSignal;
   sandbox?: Sandbox;
@@ -164,7 +165,7 @@ export async function runPlannedTask(options: OrchestratorOptions): Promise<Plan
       }
 
       attempt++;
-      lastVerify = await verify(workingDir);
+      lastVerify = await verify(primaryRootOf(workingDir));
       if (lastVerify.success) {
         stepFailed = false;
         break;

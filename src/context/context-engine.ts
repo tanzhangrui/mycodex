@@ -22,6 +22,7 @@ import { writeFile } from 'node:fs/promises';
 import { join, relative, resolve, dirname, normalize } from 'node:path';
 import { getConfigDir } from '../config/config.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
+import { WorkspaceResolver, type WorkspaceRoot } from '../core/workspace.js';
 
 // ---- 类型 ----
 
@@ -352,7 +353,7 @@ class LRUCache<K, V> {
 export class ContextEngine {
   private workingDir: string = '';
   /** V5.0 多根工作区（null = 单根模式，键空间无前缀，完全向后兼容） */
-  private multiRoots: import('../core/workspace.js').WorkspaceRoot[] | null = null;
+  private multiRoots: WorkspaceRoot[] | null = null;
   /** 持久化指纹键：单根 = workingDir（兼容旧缓存）；多根 = 全部根路径拼接（缓存隔离） */
   private persistKey: string = '';
   private fileIndex: FileIndexEntry[] = [];
@@ -385,7 +386,8 @@ export class ContextEngine {
    */
   async index(workingDir: string | string[]): Promise<void> {
     if (Array.isArray(workingDir) && workingDir.length > 1) {
-      const { WorkspaceResolver } = await import('../core/workspace.js');
+      // 静态导入（非动态 import）：保证 index() 全程同步完成——
+      // 共享单例是 void 调用，首次查询的系统提示词不能与扫描竞态
       const resolver = new WorkspaceResolver(workingDir);
       this.multiRoots = [...resolver.rootList];
       this.workingDir = resolver.primaryRoot;

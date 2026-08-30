@@ -13,7 +13,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { AIProvider } from '../utils/ai-client.js';
 import { TOOL_SYSTEM_PROMPT } from '../utils/ai-client.js';
 import { toolRegistry, type ToolContext } from '../tools/registry.js';
@@ -25,6 +25,17 @@ import { runSubAgents, type SubAgentTask } from './sub-agent.js';
 import { getSharedContextEngine } from '../context/context-engine.js';
 
 // ---- 类型定义 ----
+
+/**
+ * V5.1 工作目录统一类型：单根（string，旧行为）或多根工作区（string[]，首根为主根）。
+ * 多根时上下文引擎跨根召回；工具/沙箱/验证以主根为基准。
+ */
+export type WorkingDirInput = string | string[];
+
+/** 从 WorkingDirInput 推导主根绝对路径（工具相对路径基准 / 沙箱 cwd / 规则文件位置） */
+export function primaryRootOf(workingDir: WorkingDirInput): string {
+  return Array.isArray(workingDir) ? resolve(workingDir[0]) : workingDir;
+}
 
 export interface TokenUsage {
   promptTokens: number;
@@ -97,12 +108,13 @@ function loadCodexRules(workingDir: string): string {
  * 构建包含项目规则与相关上下文的系统提示词。
  * V3.2：注入上下文引擎召回（符号定义处 / 关键词窗口 / import 图扩展）的结果，
  * V3.4：召回升级为四路（新增 n-gram token 覆盖率语义召回），并先做增量刷新。
+ * V5.1：workingDir 支持多根（string[]）——引擎跨根召回，规则文件取主根。
  * 引擎失败静默降级，绝不阻断主循环。
  */
-function buildSystemPrompt(workingDir: string, userQuery: string): string {
+function buildSystemPrompt(workingDir: WorkingDirInput, userQuery: string): string {
   const parts: string[] = [TOOL_SYSTEM_PROMPT];
 
-  const rules = loadCodexRules(workingDir);
+  const rules = loadCodexRules(primaryRootOf(workingDir));
   if (rules) {
     parts.push(`<project_rules>\n${rules}\n</project_rules>`);
   }
@@ -154,7 +166,7 @@ export function resetSessionTokenUsage(): void {
  * @param provider   AI Provider 实例
  * @param messages   消息历史
  * @param fs         内存文件系统
- * @param workingDir 工作目录
+ * @param workingDir 工作目录（V5.1：单根 string 或多根 string[]，工具以主根为基准）
  * @param callbacks  回调钩子
  * @param signal     可选的 AbortSignal 用于取消
  */
@@ -162,7 +174,7 @@ export async function runAgentLoop(
   provider: AIProvider,
   messages: Message[],
   fs: InMemoryFileSystem,
-  workingDir: string,
+  workingDir: WorkingDirInput,
   callbacks: AgentCallbacks,
   signal?: AbortSignal,
   sandbox?: Sandbox,
@@ -175,9 +187,9 @@ export async function runAgentLoop(
 
   const conversationMessages: Message[] = [...messages];
 
-  // 构建工具上下文
+  // 构建工具上下文（多根时工具相对路径以主根为基准）
   const toolContext: ToolContext = {
-    workingDir,
+    workingDir: primaryRootOf(workingDir),
     readFile: (path) => fs.read(path),
     writeFile: (path, content) => fs.write(path, content),
     listFiles: (dir, depth) => fs.list(dir, depth),
