@@ -5,6 +5,48 @@
 
 ---
 
+## V5.10 — 2026-08-30 — 市场关键词搜索
+
+> 索引大了之后 `plugin list` 全量翻屏不可用——需要 `search`。
+
+### A. `searchEntries`（marketplace.ts）
+- 匹配域：name + description，大小写不敏感子串匹配；多关键词（空白分隔）AND 语义（全命中才返回）
+- 相关性排序：name 精确（4 分）> name 前缀（3 分）> name 包含（2 分）> 仅 description 命中（1 分）
+- 空查询 / 纯空白 → 空结果（不等于全量列表）
+
+### B. CLI `codex plugin search <关键词> [--index <路径>]`
+- 输出命中数占比（`2/15`）+ name@version + 描述 + 双源标注（与 list 一致的显示格式）
+
+### 验收
+- 新增 6 项测试：子串双域命中 / 相关性排序 / 精确名最前 / 多关键词 AND / 空查询防护 / 无命中
+- typecheck 零错误 / **283 测试全绿**（277 + 6）
+
+---
+
+## V5.9 — 2026-08-30 — 版本感知更新（semver 对比跳过无效升级）
+
+> V5.8 的 update 无条件走卸旧装新——已是最新时白下载白卸载；CLI 也不知道"装的是什么版本"。
+
+### A. `compareVersions`（零依赖轻量 semver）
+- 按 '.' 分段数值比较（`2.0.0 < 10.0.0`，非字符串比较）；缺失段按 0（`1.0 == 1.0.0`）
+- 预发布语义：`1.0.0-beta < 1.0.0`；预发布间按字符串比较（`beta.1 < beta.2`）
+- `v`/`V` 前缀容错；非数字段降级字符串比较（大小写不敏感）
+
+### B. `updatePlugin` 版本感知
+- 新增 `currentVersion` 参数：已装 >= 索引版本 → `upToDate: true` 直接返回——零卸载零下载零配置变更
+- 索引滞后（已装比索引新）同样跳过并明示；已装更旧才走 V5.8 卸旧装新流
+- 无 `currentVersion` → 保持 V5.8 行为完全不变（向后兼容）
+
+### C. CLI
+- `codex plugin update`：加载旧版后从 `registry.loadedPluginIds` 读取真实版本号传入（版本号来自插件自身声明，非路径猜测）；upToDate 零变更返回
+- 新增 `codex plugin outdated [--index <路径>]`：逐插件对比已装/索引版本，可更新项给出 update 命令提示
+
+### 验收
+- 新增 7 项测试：compareVersions 数值/预发布/前缀容错 + updatePlugin 已装等版跳过（零 registry 触碰）/ 索引滞后跳过 / 更旧正常升级 / 无版本参数回归
+- typecheck 零错误 / **277 测试全绿**（270 + 7）/ V5.8 既有 update 测试零改动通过
+
+---
+
 ## V5.8 — 2026-08-30 — 插件更新流（卸旧装新）
 
 > 市场协议至此补齐生命周期最后一环：install（V4.4）→ 远程源（V5.5）→ **update** → remove。

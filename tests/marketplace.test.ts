@@ -16,6 +16,8 @@ import {
   findEntry,
   installPlugin,
   updatePlugin,
+  searchEntries,
+  compareVersions,
   type PluginLoader,
   type PluginUpdater,
   type UrlFetcher,
@@ -519,5 +521,139 @@ describe('updatePlugin', () => {
     } finally {
       rmSync(configDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---- V5.9 版本感知更新 ----
+
+describe('compareVersions', () => {
+  it('基本数值比较：主/次/修订级', () => {
+    expect(compareVersions('1.0.0', '1.0.0')).toBe(0);
+    expect(compareVersions('1.1.0', '1.0.9')).toBeGreaterThan(0);
+    expect(compareVersions('2.0.0', '10.0.0')).toBeLessThan(0); // 数值比较非字符串
+    expect(compareVersions('1.0', '1.0.0')).toBe(0); // 缺失段按 0
+  });
+
+  it('预发布低于正式版：1.0.0-beta < 1.0.0', () => {
+    expect(compareVersions('1.0.0-beta', '1.0.0')).toBeLessThan(0);
+    expect(compareVersions('1.0.0', '1.0.0-beta')).toBeGreaterThan(0);
+    expect(compareVersions('1.0.0-beta.1', '1.0.0-beta.2')).toBeLessThan(0);
+  });
+
+  it('v 前缀与大小写容错', () => {
+    expect(compareVersions('v1.2.3', '1.2.3')).toBe(0);
+    expect(compareVersions('V2.0.0', 'v1.9.9')).toBeGreaterThan(0);
+  });
+});
+
+describe('updatePlugin 版本感知（V5.9）', () => {
+  const loaded = (() => {
+    const idx = parseMarketplaceIndex(VALID_INDEX)!;
+    return { index: idx, baseDir: 'C:\\base' };
+  })();
+
+  function stubRegistry(): PluginUpdater & { calls: string[] } {
+    const stub = {
+      calls: [] as string[],
+      async loadPlugin(p: string): Promise<number> {
+        stub.calls.push(`load:${p}`);
+        return 1;
+      },
+      unloadPlugin(id: string): number {
+        stub.calls.push(`unload:${id}`);
+        return 1;
+      },
+    };
+    return stub;
+  }
+
+  it('已装版本 = 索引版本 → 跳过（零卸载零安装，upToDate 标记）', async () => {
+    const reg = stubRegistry();
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, ['C:\\old\\p.mjs'], undefined, '1.0.0');
+    expect(result.success).toBe(true);
+    expect(result.upToDate).toBe(true);
+    expect(result.detail).toContain('已是最新版本 1.0.0');
+    expect(result.removedPaths).toEqual([]);
+    expect(result.pluginPath).toBeUndefined();
+    expect(reg.calls).toHaveLength(0); // 未触碰 registry
+  });
+
+  it('已装版本 > 索引版本（索引滞后）→ 跳过并提示', async () => {
+    const reg = stubRegistry();
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, ['C:\\old\\p.mjs'], undefined, '2.0.0');
+    expect(result.upToDate).toBe(true);
+    expect(result.detail).toContain('比索引 1.0.0 更新');
+    expect(reg.calls).toHaveLength(0);
+  });
+
+  it('已装版本 < 索引版本 → 正常升级（走卸旧装新流）', async () => {
+    const reg = stubRegistry();
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, ['C:\\old\\p.mjs'], undefined, '0.9.0');
+    expect(result.success).toBe(true);
+    expect(result.upToDate).toBeUndefined();
+    expect(result.pluginPath).toBe(join('C:\\base', 'plugins', 'echo-tools.mjs'));
+    expect(reg.calls).toHaveLength(2); // unload + load
+  });
+
+  it('无 currentVersion → 保持 V5.8 行为（总是升级）', async () => {
+    const reg = stubRegistry();
+    const result = await updatePlugin(loaded, loaded.index.plugins[0], reg, ['C:\\old\\p.mjs']);
+    expect(result.upToDate).toBeUndefined();
+    expect(reg.calls).toHaveLength(2);
+  });
+});
+
+// ---- V5.10 市场关键词搜索 ----
+
+describe('searchEntries', () => {
+  const loaded = (() => {
+    const idx = parseMarketplaceIndex(
+      JSON.stringify({
+        version: 1,
+        plugins: [
+          { name: 'echo-tools', version: '1.0.0', description: '回显与时间戳示例工具', source: { kind: 'file', path: 'a.mjs' } },
+          { name: 'echo-advanced', version: '2.0.0', description: '高级回显', source: { kind: 'file', path: 'b.mjs' } },
+          { name: 'lint-helper', version: '0.2.1', description: 'echo 风格的 lint 辅助', source: { kind: 'file', path: 'c.mjs' } },
+          { name: 'time-utils', version: '1.1.0', source: { kind: 'file', path: 'd.mjs' } },
+        ],
+      }),
+    )!;
+    return { index: idx };
+  })();
+
+  it('子串命中 name 与 description（大小写不敏感）', () => {
+    const hits = searchEntries(loaded, 'ECHO');
+    expect(hits.map((h) => h.name)).toContain('echo-tools');
+    expect(hits.map((h) => h.name)).toContain('lint-helper'); // 命中 description
+    expect(hits.some((h) => h.name === 'time-utils')).toBe(false);
+  });
+
+  it('相关性排序：name 前缀 > name 包含 > 仅 description 命中', () => {
+    const hits = searchEntries(loaded, 'echo');
+    expect(hits[0].name).toBe('echo-tools'); // 前缀（3 分）高于 advanced 的包含（2 分）？二者均前缀——精确比较
+    expect(hits.map((h) => h.name)).not.toContain('time-utils');
+  });
+
+  it('精确名命中排最前', () => {
+    const hits = searchEntries(loaded, 'echo-tools');
+    expect(hits).toHaveLength(1); // 仅 echo-tools 精确命中（lint-helper 描述无该子串）
+    expect(hits[0].name).toBe('echo-tools');
+  });
+
+  it('多关键词 AND 语义：全命中才返回', () => {
+    // lint-helper：name 含 lint + description 含 echo → 双词全中；
+    // echo-tools：echo 命中但 lint 双域皆无 → 排除
+    const hits = searchEntries(loaded, 'echo lint');
+    expect(hits.map((h) => h.name)).toEqual(['lint-helper']);
+    expect(searchEntries(loaded, 'echo 回显').map((h) => h.name)).toContain('echo-tools');
+  });
+
+  it('空查询 / 纯空白 → 空（不等于全量列表）', () => {
+    expect(searchEntries(loaded, '')).toEqual([]);
+    expect(searchEntries(loaded, '   ')).toEqual([]);
+  });
+
+  it('无命中 → 空数组', () => {
+    expect(searchEntries(loaded, 'zzz不存在')).toEqual([]);
   });
 });

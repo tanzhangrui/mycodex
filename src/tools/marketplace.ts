@@ -2,6 +2,7 @@
  * V4.4 — 插件市场索引协议（v1）
  * V5.5 — 远程源（url）安全下载
  * V5.8 — 插件更新（卸旧装新版本升级流）
+ * V5.9 — 版本感知更新（semver 对比跳过无效升级）+ V5.10 关键词搜索
  * ==========================================
  *
  * 索引是静态 JSON，可托管在任意位置（GitHub raw / 内网文件服务器 / 本地）。
@@ -61,6 +62,42 @@ export interface PluginUpdater {
   unloadPlugin: (pluginId: string) => number;
 }
 
+/**
+ * V5.9 轻量 semver 比较（零依赖）。
+ * 规则：按 '.' 分段数值比较；预发布后缀（`1.0.0-beta.1`）低于同号正式版；
+ * 段数不同缺失段按 0；非数字段按字符串比较（大小写不敏感）。
+ * @returns 正数 = a 更新；0 = 相等；负数 = b 更新
+ */
+export function compareVersions(a: string, b: string): number {
+  const parse = (v: string) => {
+    // 分离预发布后缀：`1.0.0-beta.1` → [1,0,0] + ['-beta.1']
+    const m = v.trim().match(/^v?([\dA-Za-z.\-]+)$/i);
+    const body = m ? m[1] : v.trim();
+    const dash = body.indexOf('-');
+    const main = (dash === -1 ? body : body.slice(0, dash)).split('.');
+    const pre = dash === -1 ? '' : body.slice(dash + 1);
+    return { main, pre };
+  };
+  const va = parse(a);
+  const vb = parse(b);
+  const len = Math.max(va.main.length, vb.main.length);
+  for (let i = 0; i < len; i++) {
+    const sa = va.main[i] ?? '0';
+    const sb = vb.main[i] ?? '0';
+    const na = /^\d+$/.test(sa) ? Number(sa) : null;
+    const nb = /^\d+$/.test(sb) ? Number(sb) : null;
+    let cmp: number;
+    if (na !== null && nb !== null) cmp = na - nb;
+    else cmp = sa.toLowerCase().localeCompare(sb.toLowerCase());
+    if (cmp !== 0) return cmp;
+  }
+  // 主版本相同：无预发布 > 有预发布；预发布按字符串比较
+  if (va.pre === vb.pre) return 0;
+  if (va.pre === '') return 1;
+  if (vb.pre === '') return -1;
+  return va.pre.toLowerCase().localeCompare(vb.pre.toLowerCase());
+}
+
 export interface UpdateResult {
   name: string;
   success: boolean;
@@ -69,6 +106,8 @@ export interface UpdateResult {
   pluginPath?: string;
   /** 成功后应从 config.plugins 移除的旧路径（与新路径相同则不含） */
   removedPaths: string[];
+  /** V5.9：已是最新版本而跳过（无需任何变更） */
+  upToDate?: boolean;
 }
 
 /** 单索引文件条目上限（防恶意巨型索引） */
@@ -182,6 +221,33 @@ export function loadMarketplaceIndex(indexFilePath: string): {
 }
 
 /**
+ * V5.10 市场关键词搜索。
+ * 匹配域：name + description；大小写不敏感；多关键词（空白分隔）全部命中才算匹配（AND）。
+ * 排序（相关性降序）：name 精确 > name 前缀 > name 包含 > 仅 description 命中。
+ * 关键词数超过匹配域词数的场景自然由子串匹配覆盖（无分词依赖）。
+ */
+export function searchEntries(loaded: { index: MarketplaceIndex }, query: string): MarketplaceEntry[] {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
+
+  const scored: Array<{ entry: MarketplaceEntry; score: number }> = [];
+  for (const entry of loaded.index.plugins) {
+    const name = entry.name.toLowerCase();
+    const desc = (entry.description ?? '').toLowerCase();
+    const hit = terms.every((t) => name.includes(t) || desc.includes(t));
+    if (!hit) continue;
+    const score = terms.reduce((s, t) => {
+      if (name === t) return s + 4; // 精确名命中
+      if (name.startsWith(t)) return s + 3; // 前缀
+      if (name.includes(t)) return s + 2; // 名包含
+      return s + 1; // 仅描述命中
+    }, 0);
+    scored.push({ entry, score });
+  }
+  return scored.sort((a, b) => b.score - a.score).map((s) => s.entry);
+}
+
+/**
  * 按名查找条目（精确匹配）。
  */
 export function findEntry(loaded: { index: MarketplaceIndex }, name: string): MarketplaceEntry | null {
@@ -252,6 +318,7 @@ async function defaultFetch(url: string): Promise<ArrayBuffer> {
  * 旧版配置原样保留（下次启动仍加载旧版，升级失败不留半成品）。
  *
  * @param currentPaths 旧版在 config.plugins 中的路径（与新路径相同 → 原地刷新）
+ * @param currentVersion V5.9 已装版本号——大于等于索引版本时直接跳过（零下载零变更）
  */
 export async function updatePlugin(
   loaded: { index: MarketplaceIndex; baseDir: string },
@@ -259,7 +326,22 @@ export async function updatePlugin(
   registry: PluginUpdater,
   currentPaths: string[],
   fetcher: UrlFetcher = defaultFetch,
+  currentVersion?: string,
 ): Promise<UpdateResult> {
+  // V5.9 版本感知：已装版本 >= 索引版本 → 已是最新，跳过下载与卸载
+  if (currentVersion && compareVersions(currentVersion, entry.version) >= 0) {
+    return {
+      name: entry.name,
+      success: true,
+      upToDate: true,
+      detail:
+        compareVersions(currentVersion, entry.version) === 0
+          ? `已是最新版本 ${entry.version}`
+          : `已装 ${currentVersion} 比索引 ${entry.version} 更新，无需更新`,
+      removedPaths: [],
+    };
+  }
+
   // 先卸旧（按名）：本进程未加载时返回 -1，无副作用
   const unloadedTools = registry.unloadPlugin(entry.name);
 

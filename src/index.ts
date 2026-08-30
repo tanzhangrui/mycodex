@@ -39,7 +39,14 @@ import { createSandbox } from './sandbox/sandbox.js';
 import { createLogger } from './utils/logger.js';
 import { toolRegistry } from './tools/registry.js';
 import { registerBuiltinTools } from './tools/builtin.js';
-import { loadMarketplaceIndex, findEntry, installPlugin, updatePlugin } from './tools/marketplace.js';
+import {
+  loadMarketplaceIndex,
+  findEntry,
+  installPlugin,
+  updatePlugin,
+  searchEntries,
+  compareVersions,
+} from './tools/marketplace.js';
 import { checkForUpdates, getUpdateMessage } from './utils/auto-updater.js';
 import { ChatApp } from './cli/app.jsx';
 import { runTextRepl } from './cli/text-repl.js';
@@ -96,7 +103,7 @@ Codex — 顶级 CLI AI 编程工具 v${VERSION}
   codex chat      启动对话 REPL（支持工具调用）
   codex config    配置 API Key 和模型参数
   codex update    检查更新
-  codex plugin    插件市场（list / install / update / remove）
+  codex plugin    插件市场（list / search / install / update / outdated / remove）
   codex --help    显示此帮助
   codex --version 显示版本号
 
@@ -430,6 +437,75 @@ async function handlePlugin(args: string[]): Promise<void> {
     return;
   }
 
+  if (sub === 'outdated') {
+    const config = loadConfig();
+    const pluginPaths = config.plugins ?? [];
+    if (pluginPaths.length === 0) {
+      console.log('当前配置中没有常驻插件。');
+      return;
+    }
+
+    const loaded = loadMarketplaceIndex(indexFile);
+    if (!loaded) {
+      console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
+      process.exit(1);
+    }
+
+    // 加载全部已装插件以读取真实版本号（name@version）
+    registerBuiltinTools();
+    await toolRegistry.loadPlugins(pluginPaths);
+
+    let outdatedCount = 0;
+    for (const id of toolRegistry.loadedPluginIds) {
+      const [pname, pver] = [id.split('@')[0], id.split('@').slice(1).join('@')];
+      const entry = findEntry(loaded, pname);
+      if (!entry) {
+        console.log(`  ${id} — 索引中无此插件（无更新来源）`);
+        continue;
+      }
+      const cmp = compareVersions(pver, entry.version);
+      if (cmp < 0) {
+        outdatedCount++;
+        console.log(`  ${pname}: ${pver} → ${entry.version}（可更新，codex plugin update ${pname}）`);
+      } else if (cmp === 0) {
+        console.log(`  ${pname}: ${pver}（最新）`);
+      } else {
+        console.log(`  ${pname}: ${pver}（比索引 ${entry.version} 更新）`);
+      }
+    }
+    if (outdatedCount === 0) console.log('全部插件均为最新。');
+    return;
+  }
+
+  if (sub === 'search') {
+    const positional = rest.filter((a, i) => a !== '--index' && rest[i - 1] !== '--index');
+    const query = positional.join(' ');
+    if (!query.trim()) {
+      console.error('用法: codex plugin search <关键词> [--index <索引路径>]');
+      process.exit(1);
+    }
+
+    const loaded = loadMarketplaceIndex(indexFile);
+    if (!loaded) {
+      console.error(`错误: 无法加载市场索引 ${indexFile}（文件不存在或格式非法）`);
+      process.exit(1);
+    }
+
+    const results = searchEntries(loaded, query);
+    if (results.length === 0) {
+      console.log(`未找到匹配 "${query}" 的插件（共检索 ${loaded.index.plugins.length} 个）。`);
+      return;
+    }
+    console.log(`匹配 "${query}" 的插件（${results.length}/${loaded.index.plugins.length}）：`);
+    console.log('');
+    for (const p of results) {
+      const desc = p.description ? ` — ${p.description}` : '';
+      console.log(`  ${p.name}@${p.version}${desc}`);
+      console.log(p.source.kind === 'url' ? `    源: ${p.source.url}（sha256 pin）` : `    源: ${p.source.path}`);
+    }
+    return;
+  }
+
   if (sub === 'update') {
     const positional = rest.filter((a, i) => a !== '--index' && rest[i - 1] !== '--index');
     const name = positional[0];
@@ -464,10 +540,19 @@ async function handlePlugin(args: string[]): Promise<void> {
     registerBuiltinTools();
     // 先加载旧版，让运行时状态与真实启动一致（卸旧才有对象）
     await toolRegistry.loadPlugins(currentPaths);
-    const result = await updatePlugin(loaded, entry, toolRegistry, currentPaths);
+    // V5.9 版本感知：从已加载插件读取当前版本（name@version）
+    const loadedId = toolRegistry.loadedPluginIds.find((id) => id.split('@')[0] === name);
+    const currentVersion = loadedId?.split('@').slice(1).join('@');
+    const result = await updatePlugin(loaded, entry, toolRegistry, currentPaths, undefined, currentVersion);
     if (!result.success) {
       console.error(`更新失败 (${result.name}): ${result.detail}`);
       process.exit(1);
+    }
+
+    // V5.9 已是最新：零变更直接返回
+    if (result.upToDate) {
+      console.log(`✔ ${result.name}: ${result.detail}`);
+      return;
     }
 
     console.log(`✔ ${result.name}: ${result.detail}`);
@@ -528,8 +613,10 @@ async function handlePlugin(args: string[]): Promise<void> {
 
   console.error('用法:');
   console.error('  codex plugin list [--index <索引路径>]           列出市场索引中的插件');
+  console.error('  codex plugin search <关键词> [--index <索引路径>] 按关键词搜索插件');
   console.error('  codex plugin install <名称> [--index <索引路径>]  安装插件并写入配置常驻');
-  console.error('  codex plugin update <名称> [--index <索引路径>]  升级插件（卸旧装新，失败不动旧版）');
+  console.error('  codex plugin update <名称> [--index <索引路径>]  升级插件（已是最新则跳过）');
+  console.error('  codex plugin outdated [--index <索引路径>]       检查已装插件的可更新项');
   console.error('  codex plugin remove <名称>                       移除常驻插件（配置 + 运行时）');
   process.exit(sub ? 1 : 0);
 }
