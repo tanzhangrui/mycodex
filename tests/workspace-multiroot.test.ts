@@ -671,4 +671,39 @@ describe('ContextEngine cwd 邻近加权（V5.13）', () => {
     expect(chunks[0].path).toBe('b/helper.ts');
     rmSync(solo, { recursive: true, force: true });
   });
+
+  // ---- V5.15 absToKey（绝对路径 → 键空间）----
+
+  it('absToKey 多根：根内路径 → rootName/rel；根本身 → rootName', () => {
+    expect(e.absToKey(join(parent, 'app-web', 'src', 'user-service.ts'))).toBe('app-web/src/user-service.ts');
+    expect(e.absToKey(join(parent, 'app-api'))).toBe('app-api');
+  });
+
+  it('absToKey 越界（工作区外绝对路径）→ null', () => {
+    expect(e.absToKey(join(tmpdir(), 'codex-outside-nowhere'))).toBeNull();
+  });
+
+  it('absToKey 嵌套根最长优先：a/b 归 b 根（非 a 根子树）', async () => {
+    const nest = mkdtempSync(join(tmpdir(), 'codex-ws-nest-'));
+    mkdirSync(join(nest, 'outer', 'inner'), { recursive: true });
+    writeFileSync(join(nest, 'outer', 'o.ts'), 'export const o = 1;\n');
+    writeFileSync(join(nest, 'outer', 'inner', 'i.ts'), 'export const i = 1;\n');
+    const es = new ContextEngine();
+    await es.index([join(nest, 'outer'), join(nest, 'outer', 'inner')]);
+    expect(es.absToKey(join(nest, 'outer', 'inner', 'i.ts'))).toBe('inner/i.ts');
+    expect(es.absToKey(join(nest, 'outer', 'o.ts'))).toBe('outer/o.ts');
+    rmSync(nest, { recursive: true, force: true });
+  });
+
+  it('absToKey 单根：工作区内相对化，根本身 → 空串，越界 → null', async () => {
+    const solo = mkdtempSync(join(tmpdir(), 'codex-ws-abskey-solo-'));
+    mkdirSync(join(solo, 'src'), { recursive: true });
+    writeFileSync(join(solo, 'src', 'x.ts'), 'export const x = 1;\n');
+    const es = new ContextEngine();
+    await es.index(solo);
+    expect(es.absToKey(join(solo, 'src', 'x.ts'))).toBe('src/x.ts');
+    expect(es.absToKey(solo)).toBe('');
+    expect(es.absToKey(join(tmpdir(), 'codex-nowhere-xyz'))).toBeNull();
+    rmSync(solo, { recursive: true, force: true });
+  });
 });

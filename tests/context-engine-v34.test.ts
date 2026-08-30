@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, basename } from 'node:path';
 import {
   ContextEngine,
   tokenizeForEmbedding,
@@ -254,6 +254,173 @@ describe('索引持久化', () => {
     // 还原
     writeFileSync(target, original);
     utimesSync(target, new Date(), new Date());
+  });
+});
+
+// ---- V5.16 持久化格式 v2 ----
+
+describe('V5.16 持久化格式 v2（imports 种子 + 多根/别名元数据）', () => {
+  /** 按 persistKey 找到对应的缓存文件并解析（找不到返回 null） */
+  function readCacheFor(persistKey: string): Record<string, unknown> | null {
+    const dir = join(configDir, 'cache', 'context');
+    if (!existsSync(dir)) return null;
+    for (const f of readdirSync(dir)) {
+      try {
+        const data = JSON.parse(readFileSync(join(dir, f), 'utf-8')) as Record<string, unknown>;
+        if (data.workingDir === persistKey) return data;
+      } catch {
+        // 非法 JSON 跳过
+      }
+    }
+    return null;
+  }
+
+  it('imports 落盘 + 跨实例种子复用：索引后改盘上内容，种子仍返回解析结果（免读盘）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v516-seed-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'a.ts'), `import { b } from './b';\nexport const a = b;\n`);
+    writeFileSync(join(r, 'src', 'b.ts'), `export const b = 1;\n`);
+
+    const first = new ContextEngine();
+    await first.index(r);
+    expect(first.parseImports('src/a.ts')).toEqual(['src/b.ts']);
+    first.resolveQuerySymbols('seedMarker'); // 触发 buildSymbolIndex → 排队落盘（含 imports；单字符 token 会被过滤）
+    await first.flushIndexCache();
+
+    const cache = readCacheFor(resolve(r));
+    expect(cache).not.toBeNull();
+    expect(cache!.version).toBe(2);
+    expect(Array.isArray(cache!.roots)).toBe(true);
+    expect(typeof cache!.structureHash).toBe('string');
+    const aEntry = (cache!.files as Array<{ path: string; imports: string[] }>).find((f) => f.path === 'src/a.ts');
+    expect(aEntry?.imports).toEqual(['src/b.ts']);
+
+    // 新实例：加载种子后，把盘上 a.ts 改成无 import——种子不读盘，结果不变
+    const second = new ContextEngine();
+    await second.index(r);
+    writeFileSync(join(r, 'src', 'a.ts'), `export const a = 'no imports now';\n`);
+    expect(second.parseImports('src/a.ts')).toEqual(['src/b.ts']);
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('结构指纹门控：新增文件后陈旧 imports 种子被弃用（重解析发现新目标）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v516-gate-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    // helper.ts 尚不存在 → 此时 a.ts 的 import 解析为空
+    writeFileSync(join(r, 'src', 'a.ts'), `import { helper } from './helper';\nexport const a = helper;\n`);
+
+    const first = new ContextEngine();
+    await first.index(r);
+    expect(first.parseImports('src/a.ts')).toEqual([]);
+    first.resolveQuerySymbols('gateMarker'); // 触发落盘（imports: [] 也持久化；单字符 token 会被过滤）
+    await first.flushIndexCache();
+
+    // 新增 helper.ts：路径集变化 → 结构指纹失配 → 空种子被弃用，重新读盘解析
+    writeFileSync(join(r, 'src', 'helper.ts'), `export const helper = 1;\n`);
+    const second = new ContextEngine();
+    await second.index(r);
+    expect(second.parseImports('src/a.ts')).toEqual(['src/helper.ts']);
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('别名清单变化 → 结构指纹失配：imports 种子弃用（重解析走新别名）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v516-alias-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'package.json'), JSON.stringify({ name: 'v516-app', version: '0.0.0' }));
+    writeFileSync(join(r, 'src', 'a.ts'), `import { x } from 'v516-lib';\nexport const a = x;\n`);
+    mkdirSync(join(r, 'node_modules'), { recursive: true }); // 不入索引，仅为语义真实
+
+    const first = new ContextEngine();
+    await first.index(r);
+    expect(first.parseImports('src/a.ts')).toEqual([]); // 无 v516-lib 根 → 不解析
+    first.resolveQuerySymbols('aliasMarker');
+    await first.flushIndexCache();
+
+    // 单根添加 package.json 别名不会生效（别名仅多根）——改用 tsconfig paths 触发清单变化
+    writeFileSync(
+      join(r, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { 'v516-lib': ['src/lib.ts'] } } }),
+    );
+    writeFileSync(join(r, 'src', 'lib.ts'), `export const x = 1;\n`);
+
+    const second = new ContextEngine();
+    await second.index(r);
+    // tsconfig 新增（清单指纹变化）+ 新文件（路径集变化）→ 种子弃用，走 paths 别名解析
+    expect(second.parseImports('src/a.ts')).toEqual(['src/lib.ts']);
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('v1 缓存向后兼容：旧格式仍加载符号种子', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v516-v1-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 's.ts'), `export function realFn(): void {}\n`);
+
+    const first = new ContextEngine();
+    await first.index(r);
+    first.resolveQuerySymbols('realFn');
+    await first.flushIndexCache();
+
+    // 手工降级缓存为 v1 格式（去 roots/manifests/structureHash/imports），并注入幽灵符号
+    const dir = join(configDir, 'cache', 'context');
+    const target = readdirSync(dir).find((f) => {
+      try {
+        return JSON.parse(readFileSync(join(dir, f), 'utf-8')).workingDir === resolve(r);
+      } catch {
+        return false;
+      }
+    })!;
+    const v2 = JSON.parse(readFileSync(join(dir, target), 'utf-8')) as {
+      files: Array<{ path: string; size: number; mtime: number; symbols: Array<{ name: string; kind: string; line: number }> }>;
+    };
+    const ghostEntry = v2.files.find((f) => f.path === 'src/s.ts')!;
+    ghostEntry.symbols.push({ name: 'GhostSymbol', kind: 'function', line: 99 });
+    const v1 = {
+      version: 1,
+      workingDir: resolve(r),
+      files: v2.files.map((f) => ({ path: f.path, size: f.size, mtime: f.mtime, symbols: f.symbols })),
+    };
+    writeFileSync(join(dir, target), JSON.stringify(v1), 'utf-8');
+
+    // v1 缓存被接受：幽灵符号可见（证明种子来自持久化而非读盘）
+    const second = new ContextEngine();
+    await second.index(r);
+    const hits = second.resolveQuerySymbols('GhostSymbol');
+    expect(hits.some((s) => s.name === 'GhostSymbol')).toBe(true);
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('多根元数据落盘：roots 双根 + 跨根键空间 imports 种子复用', async () => {
+    const rA = mkdtempSync(join(tmpdir(), 'codex-v516-mr-a-'));
+    const rB = mkdtempSync(join(tmpdir(), 'codex-v516-mr-b-'));
+    mkdirSync(join(rA, 'src'), { recursive: true });
+    mkdirSync(join(rB, 'src'), { recursive: true });
+    writeFileSync(join(rA, 'src', 'a.ts'), `import { b } from './b';\nexport const a = b;\n`);
+    writeFileSync(join(rA, 'src', 'b.ts'), `export const b = 1;\n`);
+    writeFileSync(join(rB, 'src', 'c.ts'), `export const c = 2;\n`);
+
+    const nameA = basename(rA); // WorkspaceResolver 根名 = 目录 basename（无冲突不去重）
+    const first = new ContextEngine();
+    await first.index([rA, rB]);
+    expect(first.parseImports(`${nameA}/src/a.ts`)).toEqual([`${nameA}/src/b.ts`]);
+    const cache0 = readCacheFor([resolve(rA), resolve(rB)].join('|'));
+    expect(cache0).toBeNull(); // 尚未落盘
+    first.resolveQuerySymbols('multiRootMarker');
+    await first.flushIndexCache();
+
+    const cache = readCacheFor([resolve(rA), resolve(rB)].join('|'));
+    expect(cache).not.toBeNull();
+    const roots = cache!.roots as Array<{ name: string; abs: string }>;
+    expect(roots).toHaveLength(2);
+    expect(roots.map((x) => x.abs)).toContain(resolve(rA));
+    expect(roots.map((x) => x.abs)).toContain(resolve(rB));
+    expect(roots.find((x) => x.abs === resolve(rA))!.name).toBe(nameA);
+
+    // 跨实例：统一键空间（rootName/rel）的 imports 种子复用
+    const second = new ContextEngine();
+    await second.index([rA, rB]);
+    expect(second.parseImports(`${nameA}/src/a.ts`)).toEqual([`${nameA}/src/b.ts`]);
+    rmSync(rA, { recursive: true, force: true });
+    rmSync(rB, { recursive: true, force: true });
   });
 });
 

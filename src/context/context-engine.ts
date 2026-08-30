@@ -19,7 +19,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
-import { join, relative, resolve, dirname, normalize } from 'node:path';
+import { join, relative, resolve, dirname, normalize, sep } from 'node:path';
 import { getConfigDir } from '../config/config.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
 import { WorkspaceResolver, type WorkspaceRoot } from '../core/workspace.js';
@@ -119,6 +119,8 @@ const SEMANTIC_TOP_K = 5;
 const MAX_PERSIST_FILES = 1500;
 /** 单文件持久化符号数上限 */
 const MAX_PERSIST_SYMBOLS_PER_FILE = 200;
+/** V5.16 单文件持久化 import 数上限 */
+const MAX_PERSIST_IMPORTS_PER_FILE = 100;
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py']);
 
@@ -418,6 +420,11 @@ class LRUCache<K, V> {
   delete(key: K): void {
     this.map.delete(key);
   }
+
+  /** V5.16 持久化序列化用：遍历当前缓存条目 */
+  entries(): IterableIterator<[K, V]> {
+    return this.map.entries();
+  }
 }
 
 // ---- 上下文引擎 ----
@@ -442,6 +449,12 @@ export class ContextEngine {
   private tokenCache = new LRUCache<string, Set<string>>(LRU_SIZE);
   /** V3.4 持久化符号种子（path → 符号列表，指纹校验通过后加载；refresh 时按文件失效） */
   private persistedSymbols = new Map<string, SymbolEntry[]>();
+  /**
+   * V5.16 持久化 import 种子（path → 已解析的仓库内键路径列表）。
+   * 双门控加载：单文件 size+mtime 指纹 + 工作区结构指纹（路径集 + 别名清单指纹）——
+   * imports 的解析结果依赖"当时"的文件集与别名表，任一变化即整体弃用（宁重读勿陈旧）。
+   */
+  private persistedImports = new Map<string, string[]>();
   /** 全局符号索引（name 小写 → 符号列表），惰性构建 */
   private symbolIndex: Map<string, SymbolEntry[]> | null = null;
   private memoryStore: MemoryEntry[] = [];
@@ -483,6 +496,7 @@ export class ContextEngine {
     this.symbolCache = new LRUCache<string, SymbolEntry[]>(LRU_SIZE);
     this.tokenCache = new LRUCache<string, Set<string>>(LRU_SIZE);
     this.persistedSymbols = new Map();
+    this.persistedImports = new Map();
     this.symbolIndex = null;
 
     const files: FileIndexEntry[] = [];
@@ -632,6 +646,7 @@ export class ContextEngine {
     this.symbolCache.delete(relPath);
     this.tokenCache.delete(relPath);
     this.persistedSymbols.delete(relPath);
+    this.persistedImports.delete(relPath);
   }
 
   private applyFileList(files: FileIndexEntry[]): void {
@@ -712,6 +727,33 @@ export class ContextEngine {
       }
     }
     return join(this.workingDir, key);
+  }
+
+  /**
+   * V5.15 绝对路径 → 统一键（keyToAbs 的逆映射）。
+   * 多根：按根前缀匹配（最长根优先防嵌套根误配）→ `rootName/rel`；
+   * 单根：相对 workingDir；越界（不在任何根下）返回 null。
+   * agent-loop 用它把会话实际 cwd 转成键空间路径传给 assembleContext。
+   */
+  absToKey(absPath: string): string | null {
+    const abs = resolve(absPath);
+    if (this.multiRoots) {
+      // 最长根优先：嵌套根（a 与 a/b）时更具体的根胜出
+      const sorted = [...this.multiRoots].sort((x, y) => y.abs.length - x.abs.length);
+      for (const root of sorted) {
+        if (abs === root.abs) return root.name;
+        if (abs.startsWith(root.abs + sep)) {
+          const rest = abs.slice(root.abs.length + 1).replace(/\\/g, '/');
+          return `${root.name}/${rest}`;
+        }
+      }
+      return null;
+    }
+    if (abs === this.workingDir) return '';
+    if (abs.startsWith(this.workingDir + sep)) {
+      return abs.slice(this.workingDir.length + 1).replace(/\\/g, '/');
+    }
+    return null;
   }
 
   /**
@@ -866,6 +908,13 @@ export class ContextEngine {
     const key = normalizeRelPath(relPath);
     const cached = this.importCache.get(key);
     if (cached !== undefined) return cached;
+
+    // V5.16：持久化种子（单文件指纹 + 结构指纹双门控已过，免读盘）
+    const persisted = this.persistedImports.get(key);
+    if (persisted) {
+      this.importCache.set(key, persisted);
+      return persisted;
+    }
 
     const lang = this.langOf(key);
     if (!lang) return [];
@@ -1400,11 +1449,47 @@ export class ContextEngine {
     }
   }
 
-  // ---- V3.4 索引持久化 ----
+  // ---- V3.4 索引持久化（V5.16 格式 v2） ----
 
-  /** 持久化文件条目（符号省略 file 字段，回载时回填） */
+  /**
+   * V5.16 别名清单指纹：各根的 package.json / pyproject.toml / tsconfig.json
+   * （别名表的全部来源）的 size+mtime。清单变化 → 别名表变化 → imports 种子弃用。
+   */
+  private manifestFingerprints(): Array<{ path: string; size: number; mtime: number }> {
+    const roots = this.multiRoots
+      ? this.multiRoots.map((r) => ({ name: r.name, abs: r.abs }))
+      : [{ name: '', abs: this.workingDir }];
+    const fps: Array<{ path: string; size: number; mtime: number }> = [];
+    for (const root of roots) {
+      for (const manifest of ['package.json', 'pyproject.toml', 'tsconfig.json']) {
+        try {
+          const st = statSync(join(root.abs, manifest));
+          fps.push({ path: `${root.name}/${manifest}`, size: st.size, mtime: st.mtimeMs });
+        } catch {
+          // 清单不存在 → 无指纹条目（存在性本身也是指纹的一部分：缺席与在场不同）
+        }
+      }
+    }
+    return fps.sort((a, b) => (a.path < b.path ? -1 : 1));
+  }
+
+  /**
+   * V5.16 工作区结构指纹：全部键空间路径（排序后）+ 别名清单指纹的哈希。
+   * imports 解析结果依赖解析时刻的文件集与别名表——任一变化此指纹即变，
+   * 回载时用于整体门控 persistedImports（符号种子不受影响：只依赖自身内容）。
+   */
+  private structureFingerprint(): string {
+    const paths = this.fileIndex.map((e) => e.path).sort();
+    const manifests = this.manifestFingerprints().map((m) => `${m.path}:${m.size}:${m.mtime}`);
+    return fnv1a(paths.join('|') + '##' + manifests.join('|')).toString(36);
+  }
+
+  /** 持久化文件条目（符号/import 省略冗余字段，回载时回填） */
   private serializeIndex(): string {
-    const byFile = new Map<string, { size: number; mtime: number; symbols: SymbolEntry[] }>();
+    const byFile = new Map<
+      string,
+      { size: number; mtime: number; symbols: SymbolEntry[]; imports: string[] }
+    >();
     const entryByPath = new Map(this.fileIndex.map((e) => [e.path, e]));
 
     if (this.symbolIndex) {
@@ -1414,7 +1499,7 @@ export class ContextEngine {
           if (!entry) continue;
           let slot = byFile.get(sym.file);
           if (!slot) {
-            slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [] };
+            slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [] };
             byFile.set(sym.file, slot);
           }
           if (slot.symbols.length < MAX_PERSIST_SYMBOLS_PER_FILE) {
@@ -1424,15 +1509,42 @@ export class ContextEngine {
       }
     }
 
+    // V5.16 imports：本次会话解析结果（LRU）∪ 历史种子（仍存活于当前文件索引的）。
+    // 空数组也持久化——区分"无仓库内 import"与"未解析"，前者回载免读盘。
+    const importSources: Array<[string, string[]]> = [
+      ...this.importCache.entries(),
+      ...this.persistedImports.entries(),
+    ];
+    const importSeen = new Set<string>();
+    for (const [path, imports] of importSources) {
+      const entry = entryByPath.get(path);
+      if (!entry || importSeen.has(path)) continue;
+      importSeen.add(path);
+      let slot = byFile.get(path);
+      if (!slot) {
+        slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [] };
+        byFile.set(path, slot);
+      }
+      slot.imports = imports.slice(0, MAX_PERSIST_IMPORTS_PER_FILE);
+    }
+
+    const roots = this.multiRoots
+      ? this.multiRoots.map((r) => ({ name: r.name, abs: r.abs }))
+      : [{ name: '', abs: this.workingDir }];
     const payload = {
-      version: 1 as const,
+      version: 2 as const,
       workingDir: this.persistKey,
       savedAt: new Date().toISOString(),
+      // V5.16 多根/别名元数据：根清单 + 别名清单指纹 + 结构指纹（imports 种子门控）
+      roots,
+      manifests: this.manifestFingerprints(),
+      structureHash: this.structureFingerprint(),
       files: [...byFile.entries()].slice(0, MAX_PERSIST_FILES).map(([path, s]) => ({
         path,
         size: s.size,
         mtime: s.mtime,
         symbols: s.symbols.map((sym) => ({ name: sym.name, kind: sym.kind, line: sym.line })),
+        imports: s.imports,
       })),
     };
     return JSON.stringify(payload);
@@ -1444,7 +1556,14 @@ export class ContextEngine {
     return join(getConfigDir(), 'cache', 'context', `${h}.json`);
   }
 
-  /** 加载持久化符号缓存：逐文件校验 size+mtime 指纹，不匹配即弃 */
+  /**
+   * 加载持久化符号/import 缓存。
+   * - 符号种子（v1/v2 通用）：逐文件校验 size+mtime 指纹，不匹配即弃。
+   * - import 种子（仅 v2）：额外要求工作区结构指纹一致（路径集 + 别名清单
+   *   未变）——imports 依赖解析时刻的文件集与别名表，结构变化即整体弃用
+   *   （宁重读勿陈旧：新增文件可能让原本未解析的 import 变为可解析）。
+   * - v1 缓存仍可加载（无 imports 字段，行为与旧版一致）；损坏/不可读整体弃用。
+   */
   private loadPersistedIndex(): void {
     const cacheFile = this.cacheFilePath();
     if (!cacheFile) return;
@@ -1455,21 +1574,37 @@ export class ContextEngine {
       const data = JSON.parse(raw) as {
         version: number;
         workingDir: string;
-        files: Array<{ path: string; size: number; mtime: number; symbols: Array<{ name: string; kind: SymbolKind; line: number }> }>;
+        structureHash?: string;
+        files: Array<{
+          path: string;
+          size: number;
+          mtime: number;
+          symbols: Array<{ name: string; kind: SymbolKind; line: number }>;
+          imports?: unknown;
+        }>;
       };
-      if (data.version !== 1 || data.workingDir !== this.persistKey) return;
+      if ((data.version !== 1 && data.version !== 2) || data.workingDir !== this.persistKey) return;
+
+      // V5.16 imports 种子门控：结构指纹一致才启用（v1 无此字段 → 恒不启用）
+      const structureOk =
+        data.version === 2 && typeof data.structureHash === 'string'
+          ? data.structureHash === this.structureFingerprint()
+          : false;
 
       const current = new Map(this.fileIndex.map((e) => [e.path, e]));
       for (const f of data.files ?? []) {
         const entry = current.get(f.path);
         // 双指纹校验：size 与 mtime 都必须一致
         if (!entry || entry.size !== f.size || entry.modifiedAt.getTime() !== f.mtime) continue;
-        if (!Array.isArray(f.symbols) || f.symbols.length === 0) continue;
-
-        this.persistedSymbols.set(
-          f.path,
-          f.symbols.map((s) => ({ name: s.name, kind: s.kind, file: f.path, line: s.line })),
-        );
+        if (Array.isArray(f.symbols) && f.symbols.length > 0) {
+          this.persistedSymbols.set(
+            f.path,
+            f.symbols.map((s) => ({ name: s.name, kind: s.kind, file: f.path, line: s.line })),
+          );
+        }
+        if (structureOk && Array.isArray(f.imports)) {
+          this.persistedImports.set(f.path, f.imports.filter((p) => typeof p === 'string'));
+        }
       }
     } catch {
       // 损坏/不可读 → 整体弃用，静默重建

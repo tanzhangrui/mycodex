@@ -109,9 +109,10 @@ function loadCodexRules(workingDir: string): string {
  * V3.2：注入上下文引擎召回（符号定义处 / 关键词窗口 / import 图扩展）的结果，
  * V3.4：召回升级为四路（新增 n-gram token 覆盖率语义召回），并先做增量刷新。
  * V5.1：workingDir 支持多根（string[]）——引擎跨根召回，规则文件取主根。
+ * V5.15：cwd 传入 assembleContext——召回按用户当前所在目录邻近加权排序。
  * 引擎失败静默降级，绝不阻断主循环。
  */
-function buildSystemPrompt(workingDir: WorkingDirInput, userQuery: string): string {
+function buildSystemPrompt(workingDir: WorkingDirInput, userQuery: string, sessionCwd?: string): string {
   const parts: string[] = [TOOL_SYSTEM_PROMPT];
 
   const rules = loadCodexRules(primaryRootOf(workingDir));
@@ -125,7 +126,13 @@ function buildSystemPrompt(workingDir: WorkingDirInput, userQuery: string): stri
     try {
       // V3.4 增量刷新：Agent 上一轮编辑过的文件本轮即生效（stat-only，便宜）
       engine.refresh();
-      const chunks = engine.assembleContext(userQuery, { maxTokens: 8_000 });
+      // V5.15 会话 cwd → 键空间路径（越界/未提供 → 不加权，行为与旧版一致）
+      let cwdKey: string | undefined;
+      if (sessionCwd) {
+        const key = engine.absToKey(sessionCwd);
+        if (key) cwdKey = key || undefined; // 单根根目录本身（''）不加权
+      }
+      const chunks = engine.assembleContext(userQuery, { maxTokens: 8_000, cwd: cwdKey });
       if (chunks.length > 0) {
         const ctx = chunks
           .map((c) => `[${c.path}:${c.startLine}-${c.endLine}]\n\`\`\`\n${c.content}\n\`\`\``)
@@ -204,7 +211,7 @@ export async function runAgentLoop(
   // V3.2：以最后一条用户消息作为上下文检索的查询
   const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
   const userQuery = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content : '';
-  const systemPrompt = buildSystemPrompt(workingDir, userQuery);
+  const systemPrompt = buildSystemPrompt(workingDir, userQuery, process.cwd());
 
   // 创建 AbortController 用于传递 signal 给 provider
   const abortController = new AbortController();
