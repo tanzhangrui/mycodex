@@ -5,6 +5,28 @@
 
 ---
 
+## V5.3 — 2026-08-30 — 跨根 import：包名别名互引
+
+> V5.0 统一键空间解决了"检索看不见另一仓"；本轮解决"import 图看不见另一仓"——
+> `import { X } from '@acme/shared-lib'` 这类 monorepo 裸说明符此前直接丢弃，BFS 扩展断在根边界。
+
+### A. 包名别名（`buildPackageAliases`）
+- 多根索引时读各根 `package.json` 的 `name` → `包名 → 根名` 映射（scoped/plain 均支持）
+- 无 package.json / name 缺失 / JSON 损坏 → 该根无别名（静默跳过）；单根模式别名表恒空，行为与旧版完全一致
+
+### B. 裸说明符跨根解析（`resolvePackageImport`）
+- 多根 + 别名表非空时 `extractImportSpecifiers` 收集裸说明符（单根/无别名不收集，零回归）
+- 解析形态：`@scope/pkg` / `@scope/pkg/sub` / `pkg` / `pkg/sub` → 目标根键空间内探测（扩展名 → index 文件）
+- 源码/发布产物布局兜底：`dist/` `src/` `lib/` 前缀（共享库入口在 `src/index.ts` 的常见 monorepo 布局直接命中）
+- 外部依赖（`lodash` 等）与 `node:` 内建直接放弃——不会误拼 `dirname/pkg` 假路径
+- 效果：`getRelatedFiles` / `assembleContext` 的 import 图 BFS 天然跨根（统一键空间零改动）
+
+### 验收
+- 新增 7 项测试：包名入口互引 / 子路径互引 / 混合场景（同根相对不受影响）/ BFS 跨根扩展 / 外部依赖不入图 / 无别名多根不收集 / 单根不回归（含自身包名）
+- 双侧 typecheck 零错误 / **235 测试全绿**（228 + 7）
+
+---
+
 ## V5.2 — 2026-08-30 — IDE 多根感知 + 插件卸载
 
 > V5.1 的两个收尾：IDE 侧接上多根（VS Code 多根文件夹零配置生效）；插件生命周期闭环（装 → 常驻 → 卸）。

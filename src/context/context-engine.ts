@@ -195,7 +195,7 @@ const PY_IMPORT_RES: RegExp[] = [
 /**
  * 从源码提取相对 import 说明符（未解析）
  */
-function extractImportSpecifiers(content: string, lang: 'ts' | 'py'): string[] {
+function extractImportSpecifiers(content: string, lang: 'ts' | 'py', includeBare = false): string[] {
   const specs: string[] = [];
   const res = lang === 'py' ? PY_IMPORT_RES : TS_IMPORT_RES;
   for (const re of res) {
@@ -204,8 +204,10 @@ function extractImportSpecifiers(content: string, lang: 'ts' | 'py'): string[] {
     while ((m = re.exec(content)) !== null) {
       const spec = m[1];
       if (lang === 'ts') {
-        // TS/JS：仅相对说明符（./ 或 ../）
+        // TS/JS：相对说明符（./ 或 ../）恒收集；
+        // 裸说明符（包名）仅在多根别名模式下收集（跨根互引解析用）
         if (spec.startsWith('./') || spec.startsWith('../')) specs.push(spec);
+        else if (includeBare && !spec.startsWith('.')) specs.push(spec);
       } else {
         // Python：`from .mod import x` / `from ..pkg import y`
         if (spec.startsWith('.')) specs.push(spec);
@@ -354,6 +356,8 @@ export class ContextEngine {
   private workingDir: string = '';
   /** V5.0 多根工作区（null = 单根模式，键空间无前缀，完全向后兼容） */
   private multiRoots: WorkspaceRoot[] | null = null;
+  /** V5.3 跨根包名互引：根 package.json name → 根名（多根模式构建；单根恒空） */
+  private packageAliases = new Map<string, string>();
   /** 持久化指纹键：单根 = workingDir（兼容旧缓存）；多根 = 全部根路径拼接（缓存隔离） */
   private persistKey: string = '';
   private fileIndex: FileIndexEntry[] = [];
@@ -392,10 +396,12 @@ export class ContextEngine {
       this.multiRoots = [...resolver.rootList];
       this.workingDir = resolver.primaryRoot;
       this.persistKey = this.multiRoots.map((r) => r.abs).join('|');
+      this.buildPackageAliases();
     } else {
       this.multiRoots = null;
       this.workingDir = resolve(Array.isArray(workingDir) ? workingDir[0] : workingDir);
       this.persistKey = this.workingDir;
+      this.packageAliases = new Map(); // 单根：别名模式关闭，行为与旧版完全一致
     }
 
     this.fileCache = new LRUCache<string, string>(LRU_SIZE);
@@ -425,6 +431,26 @@ export class ContextEngine {
       }
     } else {
       this.scanDirectory(this.workingDir, 0, out, this.workingDir, '');
+    }
+  }
+
+  /**
+   * V5.3 跨根包名互引：读各根 package.json 的 name → 包名别名映射。
+   * monorepo 场景（backend import '@acme/shared-lib'）经此映射进入目标根的键空间。
+   * 无 package.json / name 缺失 / JSON 损坏 → 该根无别名（静默跳过）。
+   */
+  private buildPackageAliases(): void {
+    this.packageAliases = new Map();
+    if (!this.multiRoots) return;
+    for (const root of this.multiRoots) {
+      try {
+        const pkg = JSON.parse(readFileSync(join(root.abs, 'package.json'), 'utf-8')) as { name?: unknown };
+        if (typeof pkg.name === 'string' && pkg.name.trim().length > 0) {
+          this.packageAliases.set(pkg.name.trim(), root.name);
+        }
+      } catch {
+        // 无 package.json 或损坏 → 跳过
+      }
     }
   }
 
@@ -707,7 +733,9 @@ export class ContextEngine {
     if (!content) return [];
 
     const resolved: string[] = [];
-    for (const spec of extractImportSpecifiers(content, lang)) {
+    // 多根模式 + 存在包名别名 → 同时收集裸说明符（跨根互引解析用）
+    const includeBare = this.multiRoots !== null && this.packageAliases.size > 0;
+    for (const spec of extractImportSpecifiers(content, lang, includeBare)) {
       const target = this.resolveImport(key, spec, lang);
       if (target && target !== key) resolved.push(target);
     }
@@ -720,6 +748,13 @@ export class ContextEngine {
    * 将相对 import 说明符解析为索引内的 relPath（扩展名/索引文件探测）
    */
   private resolveImport(fromFile: string, spec: string, lang: 'ts' | 'py'): string | null {
+    // V5.3 跨根包名互引：裸说明符（非 ./ ../ 开头）走包名别名解析。
+    // 未命中别名的外部包（node:fs / react / lodash 等）不属于工作区 → 直接放弃，
+    // 与旧版"裸说明符不收集"行为等价（不会误拼出 dirname/pkg 假路径）。
+    if (!spec.startsWith('.') && this.packageAliases.size > 0) {
+      return this.resolvePackageImport(spec);
+    }
+
     const base = normalize(join(dirname(fromFile), spec)).replace(/\\/g, '/');
 
     for (const ext of RESOLVE_EXTS) {
@@ -731,6 +766,55 @@ export class ContextEngine {
         const candidate = `${base}/${idx}`;
         if (this.filePathSet.has(candidate)) return candidate;
       }
+    }
+    return null;
+  }
+
+  /**
+   * V5.3 裸说明符 → 跨根键解析。
+   * 形态：`@scope/pkg` / `@scope/pkg/sub` / `pkg` / `pkg/sub`。
+   * 包名（含 scope）命中别名 → 目标根键空间内探测：
+   *   - 无子路径：根 index 入口（顶层 / dist / src / lib 布局）
+   *   - 有子路径：`root/sub`（+扩展名/index）→ dist/src/lib 前缀兜底
+   */
+  private resolvePackageImport(spec: string): string | null {
+    const normalized = spec.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!normalized || normalized.startsWith('node:')) return null;
+
+    const segs = normalized.split('/');
+    let pkg: string;
+    let rest: string[];
+    if (segs[0].startsWith('@')) {
+      if (segs.length < 2) return null; // 裸 '@scope' 不是合法包名
+      pkg = `${segs[0]}/${segs[1]}`;
+      rest = segs.slice(2);
+    } else {
+      pkg = segs[0];
+      rest = segs.slice(1);
+    }
+
+    const rootName = this.packageAliases.get(pkg);
+    if (!rootName) return null;
+
+    const base = rest.length === 0 ? rootName : `${rootName}/${rest.join('/')}`;
+    const direct = this.probeEntry(base);
+    if (direct) return direct;
+    // 源码/发布产物布局差异兜底：dist/ src/ lib/
+    for (const prefix of ['dist', 'src', 'lib']) {
+      const alt = this.probeEntry(`${rootName}/${prefix}${rest.length > 0 ? `/${rest.join('/')}` : ''}`);
+      if (alt) return alt;
+    }
+    return null;
+  }
+
+  /** 键空间内探测：base+扩展名 → base/index.* */
+  private probeEntry(base: string): string | null {
+    for (const ext of RESOLVE_EXTS) {
+      if (this.filePathSet.has(base + ext)) return base + ext;
+    }
+    for (const idx of RESOLVE_INDEX_FILES) {
+      const candidate = `${base}/${idx}`;
+      if (this.filePathSet.has(candidate)) return candidate;
     }
     return null;
   }

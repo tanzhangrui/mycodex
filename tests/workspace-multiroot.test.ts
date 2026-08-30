@@ -2,7 +2,8 @@
  * V5.0 多仓库工作区测试
  * 覆盖：WorkspaceResolver（多根注册/根名去重/双向映射/越界拒绝/输入解析）+
  * ContextEngine 多根（统一键空间 rootName/rel、跨根检索、跨根读内容、
- * import 图同根解析、refresh 增量、单根兼容、共享单例多根缓存）
+ * import 图同根解析、refresh 增量、单根兼容、共享单例多根缓存）+
+ * V5.3 跨根包名互引（根 package.json name → 裸说明符跨根解析）
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
@@ -236,5 +237,112 @@ describe('getSharedContextEngine 多根缓存', () => {
     const b = getSharedContextEngine([frontendRoot]);
     expect(a).toBe(b);
     resetSharedContextEngine();
+  });
+});
+
+// ---- V5.3 跨根包名互引 ----
+
+describe('ContextEngine 跨根 import（V5.3 包名别名）', () => {
+  let parent: string;
+  let appRoot: string; // 目录名 app，package.json name = my-app
+  let sharedRoot: string; // 目录名 sharedlib，package.json name = @acme/shared-lib
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    parent = mkdtempSync(join(tmpdir(), 'codex-ws-xpkg-'));
+    appRoot = join(parent, 'app');
+    sharedRoot = join(parent, 'sharedlib');
+    mkdirSync(join(appRoot, 'src'), { recursive: true });
+    mkdirSync(join(sharedRoot, 'src'), { recursive: true });
+
+    // 共享库根：scoped 包名，入口在 src/index.ts（源码布局）
+    writeFileSync(join(sharedRoot, 'package.json'), JSON.stringify({ name: '@acme/shared-lib', version: '0.1.0' }));
+    writeFileSync(join(sharedRoot, 'src', 'index.ts'), `export { SharedUtil } from './utils';\n`);
+    writeFileSync(join(sharedRoot, 'src', 'utils.ts'), `export class SharedUtil { static help(): string { return 'ok'; } }\n`);
+
+    // 应用根：裸说明符跨根互引 + 外部依赖 + node 内建 + 同根相对 import 混合
+    writeFileSync(join(appRoot, 'package.json'), JSON.stringify({ name: 'my-app' }));
+    writeFileSync(
+      join(appRoot, 'src', 'main.ts'),
+      [
+        `import { SharedUtil } from '@acme/shared-lib';`,
+        `import { helper } from '@acme/shared-lib/utils';`,
+        `import _ from 'lodash-es';`,
+        `import { readFileSync } from 'node:fs';`,
+        `import { local } from './local';`,
+        ``,
+        `export function run(): string { return SharedUtil.help() + local(); }`,
+        ``,
+      ].join('\n'),
+    );
+    writeFileSync(join(appRoot, 'src', 'local.ts'), `export function local(): string { return 'L'; }\n`);
+
+    e = new ContextEngine();
+    await e.index([appRoot, sharedRoot]);
+  });
+
+  afterAll(() => {
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it('包名互引：@scope/pkg → 目标根入口（src/index 布局兜底命中）', () => {
+    const deps = e.parseImports('app/src/main.ts');
+    expect(deps).toContain('sharedlib/src/index.ts');
+  });
+
+  it('子路径互引：@scope/pkg/sub → 目标根 src/sub.ts', () => {
+    const deps = e.parseImports('app/src/main.ts');
+    expect(deps).toContain('sharedlib/src/utils.ts');
+  });
+
+  it('同根相对 import 不受影响（混合场景）', () => {
+    const deps = e.parseImports('app/src/main.ts');
+    expect(deps).toContain('app/src/local.ts');
+    expect(deps).toHaveLength(3); // 恰好三个：入口 + 子路径 + 相对
+  });
+
+  it('import 图 BFS 跨根扩展：getRelatedFiles 触达另一根', () => {
+    const related = e.getRelatedFiles(['app/src/main.ts']);
+    expect(related).toContain('sharedlib/src/index.ts');
+    expect(related).toContain('sharedlib/src/utils.ts');
+    expect(related).toContain('app/src/local.ts');
+  });
+
+  it('外部依赖与 node: 内建不入图（无假路径）', () => {
+    const deps = e.parseImports('app/src/main.ts');
+    expect(deps.some((d) => d.includes('lodash'))).toBe(false);
+    // 未命中别名的裸包不会被误拼为 dirname/pkg 相对路径
+    expect(deps.some((d) => d.startsWith('app/src/lodash'))).toBe(false);
+    expect(deps.some((d) => d.includes('node:fs'))).toBe(false);
+  });
+
+  it('无别名多根：裸说明符不收集（与旧版行为一致）', async () => {
+    const p2 = mkdtempSync(join(tmpdir(), 'codex-ws-noalias-'));
+    const a2 = join(p2, 'a');
+    const b2 = join(p2, 'b');
+    mkdirSync(join(a2, 'src'), { recursive: true });
+    mkdirSync(join(b2, 'src'), { recursive: true });
+    writeFileSync(join(a2, 'src', 'm.ts'), `import { x } from 'b-lib';\nexport const y = x;\n`);
+    writeFileSync(join(b2, 'src', 'lib.ts'), `export const x = 1;\n`);
+    const e2 = new ContextEngine();
+    await e2.index([a2, b2]);
+    expect(e2.parseImports('a/src/m.ts')).toEqual([]);
+    rmSync(p2, { recursive: true, force: true });
+  });
+
+  it('单根不回归：别名表恒空，裸说明符（含自身包名）从不解析', async () => {
+    const p3 = mkdtempSync(join(tmpdir(), 'codex-ws-single-'));
+    mkdirSync(join(p3, 'src'), { recursive: true });
+    writeFileSync(join(p3, 'package.json'), JSON.stringify({ name: 'solo' }));
+    writeFileSync(
+      join(p3, 'src', 'm.ts'),
+      `import { x } from 'solo';\nimport { y } from './n';\nexport const z = x + y;\n`,
+    );
+    writeFileSync(join(p3, 'src', 'n.ts'), `export const y = 1;\n`);
+    const e3 = new ContextEngine();
+    await e3.index(p3);
+    // 'solo' 是自己的包名，但单根模式别名关闭 → 只解析相对 import
+    expect(e3.parseImports('src/m.ts')).toEqual(['src/n.ts']);
+    rmSync(p3, { recursive: true, force: true });
   });
 });
