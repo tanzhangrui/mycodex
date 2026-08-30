@@ -38,6 +38,28 @@
 
 ---
 
+## V3.3 — 2026-08-30 — 本地补全与终端自然语言化
+
+> 纲领文档：`V3.3-ITERATION-PROMPT.md`。对照 Copilot/Continue（Tab 补全）与 GitHub Cop CLI/Warp AI（终端 NL 化），
+> 但补全通道**完全本地零外发**（隐私+成本双宪法），NL 化走既有廉价模型通道。
+
+### A. 本地 FIM Tab 补全（`codex-ide/src/completion/`）
+- **fim-core.ts（纯逻辑，零 vscode 依赖，可直测）**：qwen2.5-coder FIM 模板（`<|fim_begin|>prefix<|fim_hole|>suffix<|fim_end|>`）；触发判定（≥3 非空白字符 + 非纯标点，防按键风暴）；响应清洗（去模板残留/截断首空行长尾/空补全不返回）
+- **fim-provider.ts**：`InlineCompletionItemProvider` + Ollama `/api/generate`（qwen2.5-coder:1.5b，6G 显存流畅）；防抖 400ms（序号抢占语义，无 promise 泄漏）；单飞行请求（新请求 abort 旧请求）；Ollama 不可达熔断 5 分钟静默降级（不打扰编辑，OutputChannel 记录）
+- 上下文裁剪：前缀 ≤64 行 / 后缀 ≤32 行 / 补全 ≤96 token；6 个 `codex-ide.fim.*` 配置项
+- 明确不做云端补全通道——按键级请求 = 成本失控 + 代码外发，双红线
+
+### B. 终端命令自然语言化（`codex-ide/src/terminal/`）
+- **nl-command-core.ts（纯逻辑）**：prompt 注入平台/shell/工作目录上下文；响应容错解析（代码块提取 / 前言行跳过 / 行内注释去除 / "命令:"前缀去除）；危险命令检测（rm -rf、rmdir /s、Remove-Item -Recurse -Force、DROP TABLE、--force、format、注册表强删等 11 类模式）
+- **nl-command.ts**：`Ctrl+Alt+T` 或命令面板 → 自然语言输入 → 廉价模型转换（复用 streamOnce 通道）→ **预填可编辑确认框**（危险命令显著警告）→ 填入终端**不自动执行**（用户审视后自己回车——确认环节永久保留，模型永远不直接执行命令）
+- 测试中发现并修复真实解析缺陷：模型输出"命令是：\nls -la"时前言行以冒号结尾需跳过
+
+### 验收
+- 新增 23 项测试（FIM 触发/模板/裁剪/清洗 + NL prompt/解析/危险检测）
+- 双侧 typecheck 零错误 / **131 测试全绿**（108 + 23）/ CLI 打包 77.6KB / 扩展打包 530.4KB
+
+---
+
 ## V3.2 — 2026-08-30 — 上下文引擎：让廉价模型"看得准"
 
 > 纲领文档：`V3.2-ITERATION-PROMPT.md`（对照 Cursor @codebase / Claude Code 自动相关文件收集 / Aider repo-map）。
@@ -116,6 +138,5 @@
 
 | 版本 | 主题 | 关键项 |
 |---|---|---|
-| V3.3 | 补全与终端 | 本地 FIM Tab 补全（Ollama 1.5B，6G 显存可跑）、终端命令自然语言化 |
 | V3.4 | 上下文进阶 | 向量/语义检索、索引持久化与增量更新、IDE 侧 @codebase 入口复用 CLI 引擎 |
 | V4.0 | 多智能体 | Planner/Editor/Tester 分工（全部可用廉价模型驱动）、插件市场 |

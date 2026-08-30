@@ -11,6 +11,8 @@ import { DiffManager } from './editor/diff-manager.js';
 import { InlineChat } from './editor/inline-chat.js';
 import { registerCodeActions } from './editor/code-actions.js';
 import { StatusBar } from './status/status-bar.js';
+import { FimCompletionProvider } from './completion/fim-provider.js';
+import { NlTerminalCommand } from './terminal/nl-command.js';
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel('Codex IDE');
@@ -24,6 +26,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const inlineChat = new InlineChat(agent);
   const chat = new ChatViewProvider(context.extensionUri, agent, diff, statusBar, secrets);
 
+  // V3.3：本地 FIM Tab 补全（纯本地零外发；Ollama 不可达静默熔断）
+  const fim = new FimCompletionProvider(log);
+
+  // V3.3：终端命令自然语言化（模型生成 → 用户确认 → 填入终端）
+  const nlCommand = new NlTerminalCommand(agent, log);
+
   log('[codex-ide] 扩展已激活');
 
   context.subscriptions.push(
@@ -33,6 +41,7 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar,
     inlineChat,
     chat,
+    fim,
 
     // 侧栏聊天视图
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chat, {
@@ -53,6 +62,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codex-ide.rejectChanges', () => diff.rejectAll()),
     vscode.commands.registerCommand('codex-ide.switchModel', () => statusBar.switchModel()),
     vscode.commands.registerCommand('codex-ide.newSession', () => agent.newSession()),
+    vscode.commands.registerCommand('codex-ide.nlToTerminal', () => nlCommand.run()),
 
     // 右键 AI 命令
     ...registerCodeActions(chat),

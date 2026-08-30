@@ -42,7 +42,8 @@
       { "command": "codex-ide.applyChanges", "title": "Codex: 应用全部变更", "icon": "$(check)" },
       { "command": "codex-ide.rejectChanges", "title": "Codex: 拒绝全部变更", "icon": "$(discard)" },
       { "command": "codex-ide.switchModel", "title": "Codex: 切换模型", "icon": "$(zap)" },
-      { "command": "codex-ide.newSession", "title": "Codex: 新会话", "icon": "$(add)" }
+      { "command": "codex-ide.newSession", "title": "Codex: 新会话", "icon": "$(add)" },
+      { "command": "codex-ide.nlToTerminal", "title": "Codex: 自然语言 → 终端命令", "icon": "$(terminal)" }
     ],
     "keybindings": [
       {
@@ -55,6 +56,11 @@
         "command": "codex-ide.openChat",
         "key": "ctrl+alt+c",
         "mac": "cmd+alt+c"
+      },
+      {
+        "command": "codex-ide.nlToTerminal",
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t"
       }
     ],
     "menus": {
@@ -83,6 +89,41 @@
           "type": "number",
           "default": 0,
           "description": "会话成本预算（元），0 = 不限。达到后自动熔断，防止账单失控"
+        },
+        "codex-ide.fim.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "本地 Tab 代码补全（需 Ollama 运行 qwen2.5-coder，纯本地零外发；Ollama 不可达时自动静默禁用）"
+        },
+        "codex-ide.fim.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama 服务地址"
+        },
+        "codex-ide.fim.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:1.5b",
+          "description": "FIM 补全模型（推荐 qwen2.5-coder:1.5b，6G 显存可流畅运行；更大显存可用 7b）"
+        },
+        "codex-ide.fim.debounceMs": {
+          "type": "number",
+          "default": 400,
+          "description": "补全触发防抖（毫秒）：击键停顿多久后才发起请求"
+        },
+        "codex-ide.fim.maxPrefixLines": {
+          "type": "number",
+          "default": 64,
+          "description": "补全上下文：光标前保留的最大行数"
+        },
+        "codex-ide.fim.maxSuffixLines": {
+          "type": "number",
+          "default": 32,
+          "description": "补全上下文：光标后保留的最大行数"
+        },
+        "codex-ide.fim.maxTokens": {
+          "type": "number",
+          "default": 96,
+          "description": "单次补全最大生成长度（token）"
         }
       }
     }
