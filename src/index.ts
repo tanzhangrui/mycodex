@@ -26,7 +26,7 @@
 import { config as loadDotenv } from 'dotenv';
 loadDotenv(); // 必须在所有其他 import 之前加载 .env
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, mkdirSync } from 'node:fs';
 import { join, resolve, isAbsolute, basename } from 'node:path';
 import { render } from 'ink';
 import React from 'react';
@@ -105,6 +105,7 @@ Codex — 顶级 CLI AI 编程工具 v${VERSION}
   codex chat      启动对话 REPL（支持工具调用）
   codex config    配置 API Key 和模型参数
   codex update    检查更新
+  codex doctor    环境体检（配置 / 运行时 / 插件健康）
   codex plugin    插件市场（list / search / install / update / outdated / remove）
   codex --help    显示此帮助
   codex --version 显示版本号
@@ -712,6 +713,107 @@ async function handleUpdate(): Promise<void> {
   }
 }
 
+/**
+ * V5.14 环境体检：配置 / 运行时 / 插件健康逐项检查。
+ * 全部通过退出码 0；有问题退出码 1（CI 可感知）。
+ * 不做真实网络调用（provider 连通性由实际对话验证，体检只查本地可判定项）。
+ */
+async function handleDoctor(): Promise<void> {
+  console.log(`Codex v${VERSION} 环境体检`);
+  console.log('');
+  let failures = 0;
+  const ok = (msg: string) => console.log(`  ✔ ${msg}`);
+  const fail = (msg: string, hint?: string) => {
+    failures++;
+    console.log(`  × ${msg}`);
+    if (hint) console.log(`    → ${hint}`);
+  };
+
+  // 1) Provider 配置
+  const config = loadConfig();
+  console.log('[Provider]');
+  if (config.provider === 'mock') {
+    ok('mock provider（测试用，无需 API key）');
+  } else {
+    const apiKey =
+      config.provider === 'anthropic'
+        ? config.providers.anthropic.apiKey
+        : config.provider === 'openai-compatible'
+          ? config.providers['openai-compatible'].apiKey
+          : ''; // local 无 key
+    if (config.provider === 'local' || apiKey) {
+      ok(`${getProviderDisplayName(config)}`);
+      if (config.provider !== 'local' && !apiKey) fail('不应到达');
+    } else {
+      fail(`${config.provider} provider 缺少 API key`, '运行 codex config 或设置对应环境变量');
+    }
+  }
+
+  // 2) 环境变量覆盖提示
+  console.log('[环境变量]');
+  const envVars: Array<[string, string]> = [
+    ['ANTHROPIC_API_KEY', 'Anthropic key 覆盖'],
+    ['GLM_API_KEY', 'GLM key 覆盖'],
+    ['ANTHROPIC_MODEL', 'Anthropic 模型覆盖'],
+    ['GLM_MODEL', 'GLM 模型覆盖'],
+    ['OLLAMA_MODEL', 'Ollama 模型覆盖'],
+    ['CODEX_CONFIG_PATH', '配置目录覆盖'],
+  ];
+  let envHits = 0;
+  for (const [key, desc] of envVars) {
+    if (process.env[key]) {
+      ok(`${desc}: ${key} 已设置`);
+      envHits++;
+    }
+  }
+  if (envHits === 0) ok('无环境变量覆盖（使用配置文件）');
+
+  // 3) Node 运行时（fetch 需 18+）
+  console.log('[运行时]');
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (nodeMajor >= 18) ok(`Node ${process.versions.node}（fetch 可用）`);
+  else fail(`Node ${process.versions.node} 过旧`, '升级到 Node 18+（远程索引/插件下载依赖 fetch）');
+
+  // 4) 配置目录可写（目录由 initConfig/saveConfig 懒创建——体检时确保存在）
+  try {
+    const dir = getConfigDir();
+    mkdirSync(dir, { recursive: true });
+    const probe = join(dir, `.doctor-probe-${Date.now()}`);
+    writeFileSync(probe, '');
+    unlinkSync(probe);
+    ok(`配置目录可写: ${dir}`);
+  } catch (err) {
+    fail(`配置目录不可写: ${getConfigDir()}`, err instanceof Error ? err.message : String(err));
+  }
+
+  // 5) 插件健康：逐路径存在性 + 加载结果
+  console.log('[插件]');
+  const pluginPaths = config.plugins ?? [];
+  if (pluginPaths.length === 0) {
+    ok('无常驻插件');
+  } else {
+    for (const p of pluginPaths) {
+      if (!existsSync(p)) {
+        fail(`插件文件不存在: ${p}`, '路径已失效，codex plugin remove 移除或重新安装');
+      }
+    }
+    registerBuiltinTools();
+    const results = await toolRegistry.loadPlugins(pluginPaths);
+    for (const r of results) {
+      if (r.error) fail(`插件加载失败: ${basename(r.path)}`, r.error);
+      else ok(`${basename(r.path)}（${r.count} 个工具）`);
+    }
+  }
+
+  console.log('');
+  if (failures === 0) {
+    console.log('体检结果: 全部通过 ✔');
+  } else {
+    console.log(`体检结果: ${failures} 项待修复`);
+    process.exit(1);
+  }
+}
+
 // ---- 主入口 ----
 
 async function main(): Promise<void> {
@@ -727,6 +829,9 @@ async function main(): Promise<void> {
       break;
     case 'update':
       await handleUpdate();
+      break;
+    case 'doctor':
+      await handleDoctor();
       break;
     case 'plugin':
       await handlePlugin(args.slice(1));

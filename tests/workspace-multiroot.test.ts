@@ -601,3 +601,74 @@ describe('ContextEngine tsconfig paths 别名（V5.7）', () => {
     rmSync(solo, { recursive: true, force: true });
   });
 });
+
+// ---- V5.13 cwd 邻近加权 ----
+
+describe('ContextEngine cwd 邻近加权（V5.13）', () => {
+  let parent: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    parent = mkdtempSync(join(tmpdir(), 'codex-ws-cwd-'));
+    // 两根各放同名同内容文件 → 召回相关性天然相同，排序只受 cwd 加权影响
+    for (const root of ['app-web', 'app-api']) {
+      mkdirSync(join(parent, root, 'src'), { recursive: true });
+      writeFileSync(
+        join(parent, root, 'src', 'user-service.ts'),
+        'export class UserService {\n  find(id: string): string { return id; }\n}\n',
+      );
+    }
+    e = new ContextEngine();
+    await e.index([join(parent, 'app-web'), join(parent, 'app-api')]);
+  });
+
+  afterAll(() => {
+    rmSync(parent, { recursive: true, force: true });
+  });
+
+  it('无 cwd：稳定排序（索引序，app-web 在前）', () => {
+    const chunks = e.assembleContext('UserService');
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    expect(chunks[0].path.startsWith('app-web/')).toBe(true);
+  });
+
+  it('cwd 指向 app-api/src：该根命中排最前（+15 子树加权）', () => {
+    const chunks = e.assembleContext('UserService', { cwd: 'app-api/src' });
+    expect(chunks[0].path).toBe('app-api/src/user-service.ts');
+    expect(chunks[1].path).toBe('app-web/src/user-service.ts');
+  });
+
+  it('cwd 指向 app-web/src：该根命中排最前（对称性）', () => {
+    const chunks = e.assembleContext('UserService', { cwd: 'app-web/src' });
+    expect(chunks[0].path).toBe('app-web/src/user-service.ts');
+  });
+
+  it('cwd 为根级（app-api，非子树）：同根 +8 仍优先于异根', () => {
+    const chunks = e.assembleContext('UserService', { cwd: 'app-api' });
+    expect(chunks[0].path.startsWith('app-api/')).toBe(true);
+  });
+
+  it('反斜杠 cwd 归一化：app-api\\src 等价 app-api/src', () => {
+    const chunks = e.assembleContext('UserService', { cwd: 'app-api\\src' });
+    expect(chunks[0].path).toBe('app-api/src/user-service.ts');
+  });
+
+  it('加权只改排序不改召回集合：有/无 cwd 的命中集合一致', () => {
+    const noCwd = e.assembleContext('UserService').map((c) => c.path).sort();
+    const withCwd = e.assembleContext('UserService', { cwd: 'app-api/src' }).map((c) => c.path).sort();
+    expect(withCwd).toEqual(noCwd);
+  });
+
+  it('单根模式：cwd 子树加权同样生效', async () => {
+    const solo = mkdtempSync(join(tmpdir(), 'codex-ws-cwd-solo-'));
+    mkdirSync(join(solo, 'a'), { recursive: true });
+    mkdirSync(join(solo, 'b'), { recursive: true });
+    writeFileSync(join(solo, 'a', 'helper.ts'), 'export class Helper {}\n');
+    writeFileSync(join(solo, 'b', 'helper.ts'), 'export class Helper {}\n');
+    const es = new ContextEngine();
+    await es.index(solo);
+    const chunks = es.assembleContext('Helper', { cwd: 'b' });
+    expect(chunks[0].path).toBe('b/helper.ts');
+    rmSync(solo, { recursive: true, force: true });
+  });
+});

@@ -81,6 +81,12 @@ export interface AssembleOptions {
   seedFiles?: string[];
   /** 上下文 token 预算（默认 12K） */
   maxTokens?: number;
+  /**
+   * V5.13 当前工作目录（键空间内路径，多根含根名前缀如 `web/src`，单根 `src`）。
+   * 召回排序前做邻近加权：cwd 子树内文件 +15、同根（多根）+8——
+   * 用户正在看的区域优先于语义等价但远处的命中。
+   */
+  cwd?: string;
 }
 
 // ---- 常量 ----
@@ -1180,6 +1186,19 @@ export class ContextEngine {
       if (chunk) {
         chunk.relevance = 5;
         byPath.set(file, chunk);
+      }
+    }
+
+    // V5.13 cwd 邻近加权：用户正在看的区域优先（仅影响排序，不改召回集合）
+    const cwd = opts.cwd ? normalizeRelPath(opts.cwd) : '';
+    if (cwd) {
+      const cwdRoot = cwd.includes('/') ? cwd.split('/')[0] : null;
+      for (const chunk of byPath.values()) {
+        if (chunk.path === cwd || chunk.path.startsWith(cwd + '/')) {
+          chunk.relevance += 15; // cwd 子树内
+        } else if (cwdRoot && this.multiRoots && chunk.path.startsWith(cwdRoot + '/')) {
+          chunk.relevance += 8; // 多根模式下同根
+        }
       }
     }
 
