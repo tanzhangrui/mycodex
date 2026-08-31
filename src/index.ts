@@ -1155,6 +1155,7 @@ async function handleContextBench(args: string[]): Promise<void> {
           queries: metrics.queries,
           maxTokens,
           recall: metrics.recall,
+          crossLingual: metrics.crossLingual,
           perf: metrics.perf,
           negatives: metrics.negatives,
           samples: metrics.samples.map((r) => ({
@@ -1162,6 +1163,8 @@ async function handleContextBench(args: string[]): Promise<void> {
             kind: r.kind,
             file: r.file,
             rank: r.rank,
+            crossQuery: r.crossQuery,
+            crossRank: r.crossRank,
           })),
           baseline: savedBaseline
             ? { file: baselineFile, saved: true, savedAt: savedBaseline.savedAt }
@@ -1193,6 +1196,17 @@ async function handleContextBench(args: string[]): Promise<void> {
       for (const m of missed.slice(0, 5)) console.log(`  ! 未召回: ${m.symbol}（${m.kind}）— ${m.file}`);
       if (missed.length > 5) console.log(`  ! …另有 ${missed.length - 5} 个未召回`);
     }
+    // V5.36 跨语言召回：中文口语查询 → 英文命名代码（符号子词反查词典）
+    const cl = metrics.crossLingual;
+    if (cl.queries > 0) {
+      console.log('');
+      console.log('[跨语言召回]（中文查询 → 英文命名代码）');
+      console.log(`  Recall@3: ${((cl.at3 / cl.queries) * 100).toFixed(1)}%（${cl.at3}/${cl.queries}）`);
+      console.log(`  Recall@10: ${((cl.at10 / cl.queries) * 100).toFixed(1)}%（${cl.at10}/${cl.queries}）`);
+      console.log(`  MRR: ${cl.mrr.toFixed(3)}`);
+      const clMissed = metrics.samples.filter((r) => r.crossQuery !== null && r.crossRank === null);
+      for (const m of clMissed.slice(0, 3)) console.log(`  ! 中文未召回: ${m.symbol} ← "${m.crossQuery}"`);
+    }
     console.log('');
     console.log('[性能]');
     console.log(`  平均组装耗时: ${metrics.perf.avgMs}ms`);
@@ -1216,7 +1230,7 @@ async function handleContextBench(args: string[]): Promise<void> {
       console.log(`  基线: ${baselineInfo.file}${baselineInfo.savedAt ? `（${baselineInfo.savedAt}）` : ''}`);
       const d = compare.deltas;
       const fmt = (label: string, v: number): string => `${label}: ${v >= 0 ? '+' : ''}${v}`;
-      console.log(`  ${fmt('Recall@3', d.at3)}  ${fmt('Recall@10', d.at10)}  ${fmt('MRR', d.mrr)}`);
+      console.log(`  ${fmt('Recall@3', d.at3)}  ${fmt('Recall@10', d.at10)}  ${fmt('MRR', d.mrr)}  ${fmt('跨语言@3', d.crossAt3)}`);
       for (const r of compare.regressions) console.log(`  ! ${r}`);
     }
     if (minR3 !== undefined) {

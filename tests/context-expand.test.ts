@@ -134,12 +134,37 @@ describe('V5.34 引擎级：跨语言口语查询召回', () => {
   it('负例回归：乱码查询零扩展零召回', () => {
     expect(e.assembleContext('xqzww vvqqz', { maxTokens: 20_000 })).toEqual([]);
   });
+
+  it('V5.37 符号路扩展兜底：中文查询命中英文名符号定义（ProviderType ← 提供者）', () => {
+    // 语料补充：config.ts 定义 ProviderType（"提供者" 与其零词面交集）
+    writeFileSync(
+      join(r, 'src', 'provider-type.ts'),
+      `export type ProviderType = 'anthropic' | 'openai-compatible' | 'local' | 'mock';\n`,
+    );
+    e.refresh(); // 新文件入索引（invalidateFile 只处理已收录文件的内容变化）
+    const syms = e.resolveQuerySymbols('提供者');
+    expect(syms.some((s) => s.name === 'ProviderType')).toBe(true);
+    // 组装链路同样召回定义文件
+    const chunks = e.assembleContext('提供者', { maxTokens: 20_000 });
+    expect(chunks.map((c) => c.path)).toContain('src/provider-type.ts');
+  });
+
+  it('V5.37 兜底门控：已有精确命中时扩展不污染（支付 仍命中 PayGateway 而非 provider 类符号）', () => {
+    // "支付扣款" 走扩展词典命中 payment 类符号；确认结果不含无关扩展污染
+    const syms = e.resolveQuerySymbols('支付扣款');
+    expect(syms.length).toBeGreaterThan(0);
+    // 全部命中要么词面相关（pay/charge）要么扩展相关（payment），不能是无关符号
+    for (const s of syms) {
+      expect(s.name.toLowerCase()).toMatch(/pay|charge|order|refund/);
+    }
+  });
 });
 
 describe('V5.35 checkBaselineHealth（doctor 数据源）', () => {
   const mkMetrics = (at3 = 9, queries = 10): BenchMetrics => ({
     queries,
     recall: { at1: at3, at3, at10: at3, mrr: 0.9 },
+    crossLingual: { queries: 4, at3: 4, at10: 4, mrr: 1 },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],

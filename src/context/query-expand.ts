@@ -189,3 +189,12 @@ export function expandQuery(query: string): QueryExpansion {
 
   return { tokens: uniqueTokens, expansions, sources };
 }
+
+/**
+ * V5.36 反查：token 的中文同义词（bench 跨语言语料生成用）。
+ * payment → ['支付']；无词典命中 / 无中文成员 → 空数组。
+ */
+export function chineseSynonymsOf(token: string): string[] {
+  const syms = SYNONYM_MAP.get(token.toLowerCase()) ?? [];
+  return syms.filter((s) => /[\u4e00-\u9fa5]/.test(s));
+}

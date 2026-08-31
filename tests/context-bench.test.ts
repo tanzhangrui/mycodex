@@ -15,6 +15,7 @@ import {
   loadBaseline,
   compareWithBaseline,
   evalGate,
+  buildCrossLingualQuery,
   type BenchMetrics,
 } from '../src/context/bench.js';
 
@@ -96,6 +97,7 @@ describe('V5.32 基线对比（compareWithBaseline）', () => {
   const mk = (at3: number, at10: number, mrr: number): BenchMetrics => ({
     queries: 10,
     recall: { at1: at3, at3, at10, mrr },
+    crossLingual: { queries: 5, at3: 5, at10: 5, mrr: 1 },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],
@@ -128,6 +130,7 @@ describe('V5.32 CI 门禁（evalGate）', () => {
   const ok: BenchMetrics = {
     queries: 10,
     recall: { at1: 9, at3: 10, at10: 10, mrr: 0.95 },
+    crossLingual: { queries: 5, at3: 5, at10: 5, mrr: 1 },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],
@@ -178,8 +181,90 @@ function mkMetrics(at3: number, at10: number, mrr: number): BenchMetrics {
   return {
     queries: 10,
     recall: { at1: at3, at3, at10, mrr },
+    crossLingual: { queries: 0, at3: 0, at10: 0, mrr: 0 },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],
   };
 }
+
+// ---- V5.36 跨语言语料与指标 ----
+
+describe('V5.36 buildCrossLingualQuery（符号子词反查词典）', () => {
+  it('PaymentGateway → 支付（payment 子词命中词典）', () => {
+    expect(buildCrossLingualQuery('PaymentGateway')).toBe('支付');
+  });
+
+  it('UserRepository → 用户 仓库 存储（多子词各自命中，组内中文全收）', () => {
+    expect(buildCrossLingualQuery('UserRepository')).toBe('用户 仓库 存储');
+  });
+
+  it('无词典命中 → null（不强行生成无意义查询）', () => {
+    expect(buildCrossLingualQuery('ZzyzxBlorp')).toBeNull();
+  });
+
+  it('snake_case 与单词符号同样处理', () => {
+    expect(buildCrossLingualQuery('create_user')).toBe('创建 用户');
+    expect(buildCrossLingualQuery('login')).toBe('登录');
+  });
+});
+
+describe('V5.36 runBench 跨语言指标', () => {
+  // 语料含词典命中符号（PayGateway/CartBasket）与纯中文注释文件
+  it('跨语言指标：中文查询召回英文符号文件（queries>0 且 at3 计数正确）', () => {
+    const m = runBench(engine, { queries: 10, maxTokens: 20_000 });
+    expect(m.crossLingual.queries).toBeGreaterThan(0);
+    // 分母一致性：有跨语言查询的样本数 = crossLingual.queries
+    expect(m.samples.filter((s) => s.crossQuery !== null).length).toBe(m.crossLingual.queries);
+    // at3 ≤ queries 且计数值为整数计数
+    expect(m.crossLingual.at3).toBeLessThanOrEqual(m.crossLingual.queries);
+    // 本语料全部跨语言样本可召回（小库 + 词典命中）
+    expect(m.crossLingual.at3).toBe(m.crossLingual.queries);
+    expect(m.crossLingual.mrr).toBeGreaterThan(0);
+  });
+
+  it('跨语言样本字段：crossQuery 是中文、crossRank 与 rank 独立', () => {
+    const m = runBench(engine, { queries: 10, maxTokens: 20_000 });
+    const cross = m.samples.filter((s) => s.crossQuery !== null);
+    expect(cross.length).toBeGreaterThan(0);
+    for (const s of cross) {
+      expect(s.crossQuery).toMatch(/[\u4e00-\u9fa5]/);
+      if (s.crossRank !== null) expect(s.crossRank).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('基线对比：跨语言回退进门禁（样本数一致时）', () => {
+    const mk = (clAt3: number): BenchMetrics => ({
+      queries: 10,
+      recall: { at1: 10, at3: 10, at10: 10, mrr: 1 },
+      crossLingual: { queries: 5, at3: clAt3, at10: 5, mrr: 0.9 },
+      perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
+      negatives: { probes: 3, falsePositives: [] },
+      samples: [],
+    });
+    const c = compareWithBaseline(mk(3), mk(5));
+    expect(c.pass).toBe(false);
+    expect(c.regressions.some((r) => r.includes('跨语言 Recall@3 回退'))).toBe(true);
+    expect(c.deltas.crossAt3).toBe(-2);
+    // 持平不回退
+    expect(compareWithBaseline(mk(5), mk(5)).pass).toBe(true);
+  });
+
+  it('词典扩容（样本数变化）→ 跨语言不对比不回退（无可比性）', () => {
+    const cur: BenchMetrics = {
+      queries: 10,
+      recall: { at1: 10, at3: 10, at10: 10, mrr: 1 },
+      crossLingual: { queries: 8, at3: 0, at10: 0, mrr: 0 }, // 样本数变了
+      perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
+      negatives: { probes: 3, falsePositives: [] },
+      samples: [],
+    };
+    const base: BenchMetrics = {
+      ...cur,
+      crossLingual: { queries: 5, at3: 5, at10: 5, mrr: 1 },
+    };
+    const c = compareWithBaseline(cur, base);
+    expect(c.pass).toBe(true); // 样本数不一致 → 跳过跨语言对比
+    expect(c.deltas.crossAt3).toBe(0);
+  });
+});

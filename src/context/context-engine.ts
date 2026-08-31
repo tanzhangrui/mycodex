@@ -1027,7 +1027,8 @@ export class ContextEngine {
     if (!this.indexed) return [];
 
     const tokens = extractIdentifierTokens(query);
-    if (tokens.length === 0) return [];
+    // V5.37：CJK 查询 tokens 为空但有同义词扩展 → 不提前返回（第三轮兜底要用）
+    if (tokens.length === 0 && expandQuery(query).expansions.size === 0) return [];
 
     const index = this.buildSymbolIndex();
     const hits: SymbolEntry[] = [];
@@ -1056,6 +1057,31 @@ export class ContextEngine {
         for (const [name, list] of index) {
           if (name.length < 3) continue;
           if (name.startsWith(lower) || lower.startsWith(name)) {
+            for (const sym of list) {
+              const k = `${sym.file}:${sym.line}:${sym.name}`;
+              if (!seen.has(k)) {
+                seen.add(k);
+                hits.push(sym);
+                if (hits.length >= limit) break;
+              }
+            }
+          }
+          if (hits.length >= limit) break;
+        }
+      }
+    }
+
+    // V5.37 第三轮：同义词扩展兜底（前两轮零命中才启用）——
+    // "提供者" 与 ProviderType 无词面交集，但扩展 token "provider"
+    // 前缀命中。兜底门控保证已有精确/前缀命中时扩展不污染结果。
+    if (hits.length === 0) {
+      const { expansions } = expandQuery(query);
+      for (const [tok] of expansions) {
+        if (tok.length < 3 || hits.length >= limit) break;
+        const lower = tok.toLowerCase();
+        for (const [name, list] of index) {
+          if (name.length < 3) continue;
+          if (name === lower || name.startsWith(lower) || lower.startsWith(name)) {
             for (const sym of list) {
               const k = `${sym.file}:${sym.line}:${sym.name}`;
               if (!seen.has(k)) {

@@ -17,6 +17,7 @@
 import { writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ContextEngine } from './context-engine.js';
+import { chineseSynonymsOf } from './query-expand.js';
 
 /**
  * 负例探针：固定乱码查询（跨库稳定）——任何非空组装都是误召回。
@@ -43,6 +44,10 @@ export interface BenchSample {
   file: string;
   /** 定义文件在组装结果中的排名（1 起始；null = 未召回） */
   rank: number | null;
+  /** V5.36 跨语言查询（符号子词反查词典的中文同义词；null = 无词典命中） */
+  crossQuery: string | null;
+  /** 跨语言查询下定义文件的排名（null = 未召回 / 无跨语言查询） */
+  crossRank: number | null;
   ms: number;
   chunks: number;
   tokens: number;
@@ -51,6 +56,8 @@ export interface BenchSample {
 export interface BenchMetrics {
   queries: number;
   recall: { at1: number; at3: number; at10: number; mrr: number };
+  /** V5.36 跨语言召回（中文口语查询 → 英文命名代码；queries=有词典命中的样本数） */
+  crossLingual: { queries: number; at3: number; at10: number; mrr: number };
   perf: { avgMs: number; avgChunks: number; avgTokens: number };
   negatives: { probes: number; falsePositives: string[] };
   samples: BenchSample[];
@@ -62,6 +69,21 @@ export interface BenchBaseline {
   savedAt: string;
   params: BenchParams;
   metrics: BenchMetrics;
+}
+
+/**
+ * V5.36 跨语言查询构造：符号子词反查词典的中文同义词。
+ * PaymentGateway → 子词 payment → "支付"；Repository → "仓库"。
+ * 任一子词有中文同义词 → 空格连接返回；否则 null（该样本无跨语言查询）。
+ */
+export function buildCrossLingualQuery(symbolName: string): string | null {
+  const subwords = symbolName
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[_\s]+/)
+    .map((s) => s.toLowerCase())
+    .filter((s) => s.length >= 2);
+  const zh = [...new Set(subwords.flatMap((s) => chineseSynonymsOf(s)))];
+  return zh.length > 0 ? zh.join(' ') : null;
 }
 
 /**
@@ -89,11 +111,21 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
     const t0 = Date.now();
     const chunks = engine.assembleContext(s.name, { maxTokens: params.maxTokens });
     const idx = chunks.findIndex((c) => c.path === s.file);
+    // V5.36 跨语言查询：中文口语查英文命名（比字面查询难——无直接词面交集）
+    const crossQuery = buildCrossLingualQuery(s.name);
+    let crossRank: number | null = null;
+    if (crossQuery) {
+      const crossChunks = engine.assembleContext(crossQuery, { maxTokens: params.maxTokens });
+      const ci = crossChunks.findIndex((c) => c.path === s.file);
+      crossRank = ci === -1 ? null : ci + 1;
+    }
     results.push({
       symbol: s.name,
       kind: s.kind,
       file: s.file,
       rank: idx === -1 ? null : idx + 1,
+      crossQuery,
+      crossRank,
       ms: Date.now() - t0,
       chunks: chunks.length,
       tokens: Math.round(chunks.reduce((n, c) => n + c.content.length, 0) / 4),
@@ -109,6 +141,13 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
   const avg = (f: (r: BenchSample) => number) =>
     total === 0 ? 0 : results.reduce((n, r) => n + f(r), 0) / total;
 
+  // V5.36 跨语言指标：仅有词典命中的样本计入（分母 = crossQuery 非空样本数）
+  const crossSamples = results.filter((r) => r.crossQuery !== null);
+  const crossTotal = crossSamples.length;
+  const crossHitAt = (k: number) => crossSamples.filter((r) => (r.crossRank ?? Infinity) <= k).length;
+  const crossMrr =
+    crossTotal === 0 ? 0 : crossSamples.reduce((n, r) => n + (r.crossRank !== null ? 1 / r.crossRank : 0), 0) / crossTotal;
+
   return {
     queries: total,
     recall: {
@@ -116,6 +155,12 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
       at3: hitAt(3),
       at10: hitAt(10),
       mrr: Number(mrr.toFixed(4)),
+    },
+    crossLingual: {
+      queries: crossTotal,
+      at3: crossHitAt(3),
+      at10: crossHitAt(10),
+      mrr: Number(crossMrr.toFixed(4)),
     },
     perf: {
       avgMs: Number(avg((r) => r.ms).toFixed(1)),
@@ -153,20 +198,24 @@ export function loadBaseline(file: string): BenchBaseline | null {
 export interface BenchCompare {
   pass: boolean;
   /** 相对基线的增量（当前 - 基线；正 = 改善） */
-  deltas: { at3: number; at10: number; mrr: number };
+  deltas: { at3: number; at10: number; mrr: number; crossAt3: number };
   /** 逐条回退说明（空 = 无回退） */
   regressions: string[];
 }
 
 /**
- * 与基线对比：Recall@3 / Recall@10 / MRR 任一低于基线即回退。
+ * 与基线对比：Recall@3 / Recall@10 / MRR / 跨语言 Recall@3 任一低于基线即回退。
  * 耗时不入对比（机器噪声大，且性能回退有 perf 指标可观察非门禁）。
+ * 跨语言指标仅在两边样本数一致且 >0 时对比（词典扩容会改变样本集，无可比性）。
  */
 export function compareWithBaseline(current: BenchMetrics, baseline: BenchMetrics): BenchCompare {
+  const crossComparable =
+    current.crossLingual.queries === baseline.crossLingual.queries && current.crossLingual.queries > 0;
   const deltas = {
     at3: current.recall.at3 - baseline.recall.at3,
     at10: current.recall.at10 - baseline.recall.at10,
     mrr: Number((current.recall.mrr - baseline.recall.mrr).toFixed(4)),
+    crossAt3: crossComparable ? current.crossLingual.at3 - baseline.crossLingual.at3 : 0,
   };
   const regressions: string[] = [];
   if (current.recall.at3 < baseline.recall.at3) {
@@ -177,6 +226,9 @@ export function compareWithBaseline(current: BenchMetrics, baseline: BenchMetric
   }
   if (current.recall.mrr < baseline.recall.mrr) {
     regressions.push(`MRR 回退: ${current.recall.mrr} < 基线 ${baseline.recall.mrr}`);
+  }
+  if (crossComparable && current.crossLingual.at3 < baseline.crossLingual.at3) {
+    regressions.push(`跨语言 Recall@3 回退: ${current.crossLingual.at3} < 基线 ${baseline.crossLingual.at3}`);
   }
   return { pass: regressions.length === 0, deltas, regressions };
 }
