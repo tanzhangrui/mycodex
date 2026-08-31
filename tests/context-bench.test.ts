@@ -5,10 +5,10 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ContextEngine } from '../src/context/context-engine.js';
+import { ContextEngine, tokenizeForEmbedding } from '../src/context/context-engine.js';
 import {
   runBench,
   saveBaseline,
@@ -16,6 +16,8 @@ import {
   compareWithBaseline,
   evalGate,
   buildCrossLingualQuery,
+  stableSample,
+  NEG_PROBES,
   type BenchMetrics,
 } from '../src/context/bench.js';
 
@@ -266,5 +268,133 @@ describe('V5.36 runBench 跨语言指标', () => {
     const c = compareWithBaseline(cur, base);
     expect(c.pass).toBe(true); // 样本数不一致 → 跳过跨语言对比
     expect(c.deltas.crossAt3).toBe(0);
+  });
+});
+
+// ---- V5.39 稳定采样（--seed） ----
+
+describe('V5.39 stableSample（哈希过滤稳定采样）', () => {
+  const mkPool = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ name: `Sym${i}`, kind: 'class', file: `src/f${i}.ts` }));
+
+  it('同种子确定性：同池同 seed 两次采样结果一致', () => {
+    const pool = mkPool(200);
+    const a = stableSample(pool, 20, 42);
+    const b = stableSample(pool, 20, 42);
+    expect(a.map((s) => s.name)).toEqual(b.map((s) => s.name));
+  });
+
+  it('样本量近似目标：200 池取 20 → 样本数在合理区间（概率保证）', () => {
+    const pool = mkPool(200);
+    const s = stableSample(pool, 20, 42);
+    expect(s.length).toBeGreaterThan(5);
+    expect(s.length).toBeLessThan(50);
+  });
+
+  it('核心性质——池增删不改既有成员选中状态（跨代码变更可比）', () => {
+    const pool = mkPool(200);
+    const before = new Set(stableSample(pool, 20, 42).map((s) => s.name));
+    // 模拟代码变更：删 30 个旧符号 + 加 30 个新符号
+    const changed = [...pool.slice(0, 170), ...mkPool(30).map((s) => ({ ...s, name: `New${s.name}` }))];
+    const after = new Set(stableSample(changed, 20, 42).map((s) => s.name));
+    // 存活成员的选中状态不变：before 中仍在池里的成员，选中集一致
+    const survivors = new Set(pool.slice(0, 170).map((s) => s.name));
+    for (const name of before) {
+      if (survivors.has(name)) expect(after.has(name)).toBe(true);
+    }
+  });
+
+  it('不同种子 → 不同样本集（避免系统性偏差）', () => {
+    const pool = mkPool(200);
+    const a = new Set(stableSample(pool, 20, 1).map((s) => s.name));
+    const b = new Set(stableSample(pool, 20, 2).map((s) => s.name));
+    // 期望不同但可能有少量交集；完全相同即失败
+    expect([...a].every((x) => b.has(x))).toBe(false);
+  });
+
+  it('runBench 接入 seed：同库同 seed 复现一致，样本集与无 seed 不同', () => {
+    const a = runBench(engine, { queries: 2, maxTokens: 20_000, seed: 7 });
+    const b = runBench(engine, { queries: 2, maxTokens: 20_000, seed: 7 });
+    expect(a.samples.map((s) => s.symbol)).toEqual(b.samples.map((s) => s.symbol));
+    expect(a.recall.at3).toBe(b.recall.at3);
+  });
+
+  it('基线 params 携带 seed（roundtrip 保真）', () => {
+    const m = runBench(engine, { queries: 3, maxTokens: 20_000, seed: 9 });
+    const file = join(root, 'seed-baseline.json');
+    saveBaseline(m, { queries: 3, maxTokens: 20_000, seed: 9 }, file);
+    const loaded = loadBaseline(file);
+    expect(loaded!.params.seed).toBe(9);
+  });
+});
+
+// ---- V5.40 负例探针重设计 + lock 文件排除 ----
+
+describe('V5.40 负例探针设计不变量', () => {
+  it('探针词全部 < 4 字符（不触发字符 trigram 提取）', () => {
+    for (const probe of NEG_PROBES) {
+      for (const word of probe.split(' ')) {
+        expect(word.length).toBeLessThan(4);
+      }
+    }
+  });
+
+  it('三探针互不相同（多样性）', () => {
+    expect(new Set(NEG_PROBES).size).toBe(3);
+  });
+
+  it('自指防线：bench.ts 源码分词不含任何探针词', () => {
+    const src = readFileSync('src/context/bench.ts', 'utf-8');
+    const tokens = new Set(tokenizeForEmbedding(src));
+    for (const probe of NEG_PROBES) {
+      for (const word of probe.split(' ')) {
+        expect(tokens.has(word)).toBe(false);
+      }
+    }
+  });
+
+  it('trigram 碰撞回归：夹具含旧式乱码字面量，新探针零组装（旧探针必误召回）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-v540-noise-'));
+    try {
+      // 模拟真实仓库：测试夹具里常见乱码字面量（旧探针的 trigram 碰撞源）
+      writeFileSync(
+        join(dir, 'noise.test.ts'),
+        `// 负例夹具\nexport const fixtures = ['zzzqqq wvvv', 'zzz不存在的查询xxx'];\n`,
+      );
+      writeFileSync(join(dir, 'real.ts'), `export class PayGateway {\n  charge(): void {}\n}\n`);
+      const e = new ContextEngine();
+      await e.index(dir);
+      // 新探针：任何非空组装 = 误召回
+      for (const probe of NEG_PROBES) {
+        expect(e.assembleContext(probe, { maxTokens: 12_000 })).toEqual([]);
+      }
+      // 旧式 6/4 字符 repeat 探针在同一夹具上确实误召回（证明修复针对真实缺陷）
+      const oldProbe = 'z'.repeat(6) + ' ' + 'w'.repeat(4);
+      expect(e.assembleContext(oldProbe, { maxTokens: 12_000 }).length).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('V5.40 lock 文件不入索引', () => {
+  it('package-lock.json 被排除：哈希串不产生 token、不污染召回', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-v540-lock-'));
+    try {
+      // 哈希内容：随机串的字符 trigram 会与短查询词碰撞（旧版实测污染负例防线）
+      writeFileSync(
+        join(dir, 'package-lock.json'),
+        `{"integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw"}`,
+      );
+      writeFileSync(join(dir, 'real.ts'), `export class CartBasket {\n  add(): void {}\n}\n`);
+      const e = new ContextEngine();
+      await e.index(dir);
+      const report = e.getContextReport();
+      expect(report.fileCount).toBe(1);
+      // 哈希内的随机子串作查询不得召回（文件不在索引 → 无信号可命中）
+      expect(e.assembleContext('RGwwWnwQvk', { maxTokens: 12_000 })).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

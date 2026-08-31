@@ -121,16 +121,39 @@ const SYNONYM_MAP: ReadonlyMap<string, ReadonlyArray<string>> = (() => {
   return map;
 })();
 
-/** 扩展 token 权重折扣：原词主导，扩展只补位 */
-export const EXPANSION_DISCOUNT = 0.4;
+/**
+ * V5.38 置信度分级：词 → 合并组规模。
+ * SYNONYM_MAP 跨组并了同词（auth 连通 "验证" 与 "权限" 两组）——
+ * 置信度必须按合并后的连通词集算，否则跨组词拿到虚高折扣。
+ * 连通集规模 2 = 一一对应（用户↔user）；>2 = 多对多，任一配对只是"可能"。
+ */
+const WORD_GROUP_SIZE: ReadonlyMap<string, number> = (() => {
+  const map = new Map<string, number>();
+  for (const [word, syns] of SYNONYM_MAP) {
+    map.set(word, syns.length + 1); // 连通集 = 自身 + 全部同义词
+  }
+  return map;
+})();
+
+/** 一一对应组（规模 2）的扩展折扣：翻译确定性高 */
+export const EXPANSION_DISCOUNT_EXACT = 0.6;
+/** 多对多组的扩展折扣：任一配对只是"可能" */
+export const EXPANSION_DISCOUNT_AMBIGUOUS = 0.3;
+
+/** 按组规模取折扣（词不在词典 → 0） */
+export function expansionDiscountOf(word: string): number {
+  const size = WORD_GROUP_SIZE.get(word) ?? 0;
+  if (size === 0) return 0;
+  return size <= 2 ? EXPANSION_DISCOUNT_EXACT : EXPANSION_DISCOUNT_AMBIGUOUS;
+}
 
 export interface QueryExpansion {
   /** 原查询 token（含驼峰子词拆分） */
   tokens: string[];
-  /** 扩展 token → 权重折扣（组内同义词，去重、排除原词） */
+  /** 扩展 token → 权重折扣（V5.38 分级：一一对应 0.6 / 多对多 0.3） */
   expansions: Map<string, number>;
-  /** 扩展来源（可观测：哪个词触发了哪些扩展） */
-  sources: Array<{ from: string; to: string[] }>;
+  /** 扩展来源（可观测：哪个词触发了哪些扩展 + 置信度） */
+  sources: Array<{ from: string; to: string[]; discount: number }>;
 }
 
 /**
@@ -174,17 +197,20 @@ export function expandQuery(query: string): QueryExpansion {
   }
 
   const expansions = new Map<string, number>();
-  const sources: Array<{ from: string; to: string[] }> = [];
+  const sources: Array<{ from: string; to: string[]; discount: number }> = [];
   for (const tok of matchWords) {
     const synonyms = SYNONYM_MAP.get(tok);
     if (!synonyms) continue;
+    const discount = expansionDiscountOf(tok);
     const added: string[] = [];
     for (const syn of synonyms) {
       if (tokenSet.has(syn) || expansions.has(syn)) continue; // 已有词不重复扩展
-      expansions.set(syn, EXPANSION_DISCOUNT);
+      // V5.38 分级折扣：取触发词与目标词折扣的较大值
+      //（触发词所在连通集大但目标词一一对应 → 目标词置信度仍高）
+      expansions.set(syn, Math.max(discount, expansionDiscountOf(syn)));
       added.push(syn);
     }
-    if (added.length > 0) sources.push({ from: tok, to: added });
+    if (added.length > 0) sources.push({ from: tok, to: added, discount });
   }
 
   return { tokens: uniqueTokens, expansions, sources };

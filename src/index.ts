@@ -1028,9 +1028,9 @@ async function handleContextQuery(args: string[]): Promise<void> {
   console.log(`Codex v${VERSION} 召回分解`);
   console.log(`  查询: ${q}`);
   console.log(`  关键词: ${bd.keywords.length > 0 ? bd.keywords.join(', ') : '（无）'}${cwdKey ? `  cwd 加权: ${cwdKey}` : ''}`);
-  // V5.34 同义词扩展（仅语义路）：中文口语 ↔ 英文命名
+  // V5.34 同义词扩展（仅语义路）：中文口语 ↔ 英文命名；V5.38 显示置信度折扣
   if (bd.expansions.length > 0) {
-    const parts = bd.expansions.map((e) => `${e.from} → ${e.to.join('/')}`);
+    const parts = bd.expansions.map((e) => `${e.from} → ${e.to.join('/')}（×${e.discount}）`);
     console.log(`  同义词扩展: ${parts.join('；')}`);
   }
   console.log('');
@@ -1095,10 +1095,11 @@ async function handleContextBench(args: string[]): Promise<void> {
   const queriesIdx = args.indexOf('--queries');
   const tokensIdx = args.indexOf('--max-tokens');
   const minR3Idx = args.indexOf('--min-r3');
+  const seedIdx = args.indexOf('--seed');
   const saveIdx = args.indexOf('--save');
   const cmpIdx = args.indexOf('--compare');
   // 带值 flag 的值不算位置参数（--save/--compare 的值可选：后随非 flag 才是路径）
-  const valueIdxSet = new Set([queriesIdx, tokensIdx, minR3Idx, saveIdx, cmpIdx].filter((i) => i !== -1));
+  const valueIdxSet = new Set([queriesIdx, tokensIdx, minR3Idx, seedIdx, saveIdx, cmpIdx].filter((i) => i !== -1));
   const valueOf = (i: number): string | undefined =>
     i !== -1 && i + 1 < args.length && !args[i + 1].startsWith('-') ? args[i + 1] : undefined;
   const positional = args.filter((a, i) => !a.startsWith('-') && !valueIdxSet.has(i - 1));
@@ -1108,6 +1109,9 @@ async function handleContextBench(args: string[]): Promise<void> {
   const maxTokens = Math.max(500, Number(valueOf(tokensIdx) ?? 12_000) || 12_000);
   const minR3Raw = valueOf(minR3Idx);
   const minR3 = minR3Raw !== undefined ? Math.max(0, Math.min(100, Number(minR3Raw))) : undefined;
+  // V5.39 稳定采样种子：样本集是符号条目自身的函数，跨代码变更基线可比
+  const seedRaw = valueOf(seedIdx);
+  const seed = seedRaw !== undefined && Number.isFinite(Number(seedRaw)) ? Number(seedRaw) : undefined;
 
   const workingDir: string | string[] =
     targets.length > 1 ? targets.map((t) => resolve(t)) : resolve(targets[0] ?? '.');
@@ -1121,13 +1125,13 @@ async function handleContextBench(args: string[]): Promise<void> {
   }
 
   const report = engine.getContextReport();
-  const metrics = runBench(engine, { queries: queryCount, maxTokens });
+  const metrics = runBench(engine, { queries: queryCount, maxTokens, seed });
 
   // V5.32 基线：--save 落盘 / --compare 逐指标对比（缺省 <主根>/.codex-bench.json）
   const baselineFile = valueOf(saveIdx) ?? valueOf(cmpIdx) ?? join(primaryRootOf(workingDir), '.codex-bench.json');
   let savedBaseline: { savedAt: string } | null = null;
   if (saveIdx !== -1) {
-    const b = saveBaseline(metrics, { queries: queryCount, maxTokens }, baselineFile);
+    const b = saveBaseline(metrics, { queries: queryCount, maxTokens, seed }, baselineFile);
     savedBaseline = { savedAt: b.savedAt };
   }
   let compare: BenchCompare | null = null;
@@ -1136,6 +1140,14 @@ async function handleContextBench(args: string[]): Promise<void> {
     const b = loadBaseline(baselineFile);
     if (!b) {
       console.error(`错误: 基线不可用 — ${baselineFile}（不存在 / 损坏 / 格式不符；先跑 --save 生成）`);
+      process.exit(1);
+    }
+    // V5.39：采样方式（seed）不同 → 样本集不可比 → 拒绝对比（防假回退/假改善）
+    if ((b.params.seed ?? null) !== (seed ?? null)) {
+      console.error(
+        `错误: 采样种子不一致 — 基线 seed=${b.params.seed ?? '无'} vs 当前 seed=${seed ?? '无'}；` +
+          `样本集不可比。用相同 --seed 重跑，或 --save 重建基线`,
+      );
       process.exit(1);
     }
     baselineInfo = { file: baselineFile, savedAt: b.savedAt };
@@ -1182,7 +1194,9 @@ async function handleContextBench(args: string[]): Promise<void> {
     console.log(
       `  目录: ${report.roots.map((r) => r.abs).join(' + ')}（${report.fileCount} 文件 / ${report.symbolCount} 符号）`,
     );
-    console.log(`  查询: ${total} 个（符号分层抽样，确定性复现）  预算: ${maxTokens} tokens`);
+    console.log(
+      `  查询: ${total} 个（${seed !== undefined ? `--seed ${seed} 稳定采样` : '均匀抽样'}，确定性复现）  预算: ${maxTokens} tokens`,
+    );
     console.log('');
     console.log('[召回质量]');
     if (total === 0) {

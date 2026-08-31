@@ -5,6 +5,73 @@
 
 ***
 
+## V5.40 — 2026-08-31 — 负例探针重设计 + lock 文件排除（修复负例防线 3/3 误召回）
+
+> 本仓库自测 `context bench` 连续 FAIL：三个乱码探针全部误召回。
+> 排查发现两层污染源，均为真实缺陷。
+
+### A. 根因一：trigram 碰撞（探针设计缺陷）
+
+* 旧探针（6 连 z + 4 连 w 式 repeat 构造）≥ 4 字符 → 生成字符 trigram；trigram `zzz` 与测试文件里的乱码夹具字面量（`zzzqqq` 等）共享子串
+* V5.33 把 df=0 token 从覆盖率分母排除后，仅存的 `zzz` 单 token 覆盖率被抬满 → 语义路 80% 相关性直接命中 4 个测试文件
+* **探针重设计三原则**：① 词长 < 4（不触发 trigram 提取）；② 混合字母三字词（无词面碰撞）；③ 单字符数组拼词（源码无探针整词，注释也不写探针词样——自指防线）
+
+### B. 根因二：lock 文件污染索引（scanDirectory 忽略清单）
+
+* `package-lock.json` 的依赖哈希是随机串——随机串的字符 trigram 会与任意 3 字符查询词碰撞（实测 43% 覆盖率命中），且本身零召回价值
+* 忽略清单补入 package-lock.json / yarn.lock / pnpm-lock.yaml / bun.lockb / composer.lock / poetry.lock / Cargo.lock / go.sum
+
+### 验收
+
+* `context bench --seed 42` 整体 **PASS**（负例 0/3 误召回；Recall@3 87.9%）
+* 新增 5 项测试：探针词长不变量 / 探针多样性 / bench.ts 源码分词不含探针词（自指防线）/ trigram 碰撞回归（新探针零组装 + 旧探针确实误召回，证明修复针对真实缺陷）/ lock 文件排除（fileCount 不含 + 哈希子串查询零召回）
+* typecheck 零错误 / **436 测试全绿**（431 + 5）
+
+***
+
+## V5.39 — 2026-08-31 — bench 稳定采样（--seed）
+
+> 均匀索引采样在池增删后样本集整体漂移——基线对比跨代码变更不可比，增一个符号就可能全线"回退"假警报。
+
+### A. `stableSample`（bench.ts）
+
+* 哈希过滤采样：命中条件 `hash(name@file, seed)/MAX < rate`——样本集是**条目自身**的函数，池增删成员不改既有成员的选中状态
+* `rate = queries/pool.length`（样本数期望 ≈ queries）；FNV-1a 与引擎一致
+* `BenchParams.seed` 缺省 = 原均匀索引采样（确定性不变）
+
+### B. CLI `codex context bench --seed <n>`
+
+* `--save` 基线 params 携带 seed（roundtrip 保真）；`--compare` 校验种子一致性——不一致 → 拒绝对比 exit 1（防假回退/假改善）
+* 输出标注采样方式（`--seed N 稳定采样` / `均匀抽样`）
+
+### 验收
+
+* 新增 6 项测试：种子确定性 / 样本量近似目标 / 池增删不改既有成员选中状态 / 不同种子不同样本集 / runBench 接入 seed / 基线 params roundtrip 携带 seed
+* typecheck 零错误 / **431 测试全绿**（425 + 6）
+
+***
+
+## V5.38 — 2026-08-31 — 扩展置信度分级
+
+> V5.34 所有扩展词统一折扣 0.4——`用户→user` 一一对应与 `支付→pay/payment/charge` 多对多同权重，确定性高的翻译被稀释、低置信的猜测被抬高。
+
+### A. 分级折扣（query-expand.ts）
+
+* `WORD_GROUP_SIZE`：词 → 合并连通集规模（`auth` 连通"验证"+"权限"两组 → 按 5 算，不按单组虚高）
+* `EXPANSION_DISCOUNT_EXACT = 0.6`（一一对应，规模 2）/ `EXPANSION_DISCOUNT_AMBIGUOUS = 0.3`（多对多）
+* 扩展词折扣取 `max(触发词, 目标词)`——触发词连通集大但目标词一一对应时，目标词置信度仍高
+
+### B. 可观测性
+
+* `sources` 携带 `discount`；`context query` 输出 `（×0.6）` 置信度标注；`RecallBreakdown.expansions` 同步类型
+
+### 验收
+
+* 新增 6 项测试：一一对应高折扣 / 多对多低折扣 / 跨组连通词按合并集 / 不在词典 → 0 / expandQuery 分级生效 / sources 携带置信度
+* typecheck 零错误 / **425 测试全绿**（419 + 6）
+
+***
+
 ## V5.37 — 2026-08-31 — 符号路同义词扩展兜底
 
 > V5.36 量化暴露：跨语言召回 @3 仅 40%——`提供者` 与 `ProviderType`
@@ -14,13 +81,17 @@
 ### A. resolveQuerySymbols 第三轮：同义词扩展兜底
 
 * 前两轮（精确 + 前缀）**零命中**才启用扩展 token 匹配——兜底门控保证已有命中时扩展不污染结果
+
 * 修复连带 bug：CJK 查询在 `extractIdentifierTokens` 后为空被提前 return——第三轮永远不可达；改为 tokens 空且无扩展才短路
+
 * 本仓库实测：跨语言 @3 **40% → 85.7%**（`提供者` 现直达 `ProviderType` 定义）
 
 ### 验收
 
 * 新增 2 项测试：中文查询命中英文名符号定义（含组装链路）/ 兜底门控无污染
+
 * 主召回未回归：仅 `msg`/`roots` 等通用短词符号 rank>3（固有难例，与本次改动无关）
+
 * typecheck 零错误 / **419 测试全绿**（417 + 2）
 
 ***
@@ -32,18 +103,23 @@
 ### A. `buildCrossLingualQuery`（bench.ts）
 
 * 符号子词反查词典中文同义词：PaymentGateway → "支付"、UserRepository → "用户 仓库 存储"
+
 * 无词典命中 → null（不强行生成无意义查询）；`chineseSynonymsOf` 从 query-expand 导出
 
 ### B. runBench 跨语言指标（独立于主指标）
 
 * `crossLingual: { queries, at3, at10, mrr }`——分母仅为有词典命中的样本；样本含 `crossQuery`/`crossRank` 字段
+
 * 基线对比纳入跨语言 @3 回退检测；**样本数不一致时跳过对比**（词典扩容改变样本集，无可比性——防误报）
-* CLI：人读 [跨语言召回] 段（含中文未召回明细）+ `--json` 全字段
+
+* CLI：人读 \[跨语言召回] 段（含中文未召回明细）+ `--json` 全字段
 
 ### 验收
 
-* 新增 8 项测试：反查构造（camelCase/snake_case/多子词/无命中）/ 指标分母一致性 / 字段独立性 / 基线回退检测 / 样本数变化跳过
+* 新增 8 项测试：反查构造（camelCase/snake\_case/多子词/无命中）/ 指标分母一致性 / 字段独立性 / 基线回退检测 / 样本数变化跳过
+
 * 本仓库首测：跨语言 @3 40%、@10 60%（V5.34 真实水位——直接驱动 V5.37）
+
 * typecheck 零错误 / **417 测试全绿**（409 + 8）
 
 ***

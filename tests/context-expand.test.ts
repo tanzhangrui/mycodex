@@ -5,7 +5,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { expandQuery, EXPANSION_DISCOUNT } from '../src/context/query-expand.js';
+import {
+  expandQuery,
+  EXPANSION_DISCOUNT_EXACT,
+  EXPANSION_DISCOUNT_AMBIGUOUS,
+  expansionDiscountOf,
+} from '../src/context/query-expand.js';
 import { tokenizeForEmbedding, ContextEngine } from '../src/context/context-engine.js';
 import { checkBaselineHealth, saveBaseline, runBench, type BenchMetrics } from '../src/context/bench.js';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
@@ -16,14 +21,14 @@ describe('V5.34 expandQuery（同义词扩展）', () => {
   it('中文词扩展出英文命名（登录 → login/signin）', () => {
     const { tokens, expansions, sources } = expandQuery('登录');
     expect(tokens).toContain('登录');
-    expect(expansions.get('login')).toBe(EXPANSION_DISCOUNT);
-    expect(expansions.get('signin')).toBe(EXPANSION_DISCOUNT);
+    expect(expansions.get('login')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS); // 组规模 3 → 低置信
+    expect(expansions.get('signin')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
     expect(sources.some((s) => s.from === '登录' && s.to.includes('login'))).toBe(true);
   });
 
   it('英文词扩展出中文（payment → 支付）与同组英文（pay/charge）', () => {
     const { expansions } = expandQuery('payment');
-    expect(expansions.get('支付')).toBe(EXPANSION_DISCOUNT);
+    expect(expansions.get('支付')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS); // 多对多组 → 低置信
     expect(expansions.has('pay')).toBe(true);
     expect(expansions.has('charge')).toBe(true);
   });
@@ -51,6 +56,43 @@ describe('V5.34 expandQuery（同义词扩展）', () => {
     const { tokens, expansions } = expandQuery('xqz wvv');
     expect(tokens).toEqual(['xqz', 'wvv']);
     expect(expansions.size).toBe(0);
+  });
+});
+
+// ---- V5.38 置信度分级 ----
+
+describe('V5.38 expansionDiscountOf（组规模分级）', () => {
+  it('一一对应组（规模 2）→ 高置信折扣', () => {
+    expect(expansionDiscountOf('用户')).toBe(EXPANSION_DISCOUNT_EXACT); // 用户↔user
+    expect(expansionDiscountOf('user')).toBe(EXPANSION_DISCOUNT_EXACT);
+    expect(expansionDiscountOf('缓存')).toBe(EXPANSION_DISCOUNT_EXACT); // 缓存↔cache
+    expect(expansionDiscountOf('password')).toBe(EXPANSION_DISCOUNT_EXACT);
+  });
+
+  it('多对多组（规模 >2）→ 低置信折扣', () => {
+    expect(expansionDiscountOf('支付')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS); // pay/payment/charge
+    expect(expansionDiscountOf('payment')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
+  });
+
+  it('跨组连通词按合并集算（auth 连通 验证/权限 两组 → 低置信）', () => {
+    // auth 出现在 [验证] 和 [权限] 两组 → 连通集 > 2 → 低置信
+    expect(expansionDiscountOf('auth')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
+  });
+
+  it('不在词典 → 0 折扣', () => {
+    expect(expansionDiscountOf('xqz')).toBe(0);
+  });
+
+  it('expandQuery 分级生效：用户 → user 拿高折扣（目标词一一对应）', () => {
+    const { expansions } = expandQuery('用户');
+    expect(expansions.get('user')).toBe(EXPANSION_DISCOUNT_EXACT);
+  });
+
+  it('sources 携带置信度（可观测）', () => {
+    const { sources } = expandQuery('支付');
+    const src = sources.find((s) => s.from === '支付');
+    expect(src).toBeDefined();
+    expect(src!.discount).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
   });
 });
 

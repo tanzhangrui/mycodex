@@ -21,14 +21,23 @@ import { chineseSynonymsOf } from './query-expand.js';
 
 /**
  * 负例探针：固定乱码查询（跨库稳定）——任何非空组装都是误召回。
- * repeat 构造而非字面量/拼接：语义路是字符 trigram 匹配，源码里出现
- * 任何与探针相同的 trigram 序列（注释里写探针字样也不行）都会让
- * bench 索引自家源码时命中 bench.ts 自身（自指污染，实测负例全误召回）。
+ *
+ * V5.40 探针设计三原则（旧版 6/4 字符同字母 repeat 探针在本仓库全军覆没）：
+ * 1. **无 trigram 碰撞**：词长 < 4 不触发字符 trigram 提取（≥4 才提取）——
+ *    旧探针（6 连 z + 4 连 w）的 trigram 与测试夹具里的乱码字面量共享
+ *    3 字符子串，语义路直接满覆盖率命中；
+ * 2. **无词面碰撞**：混合字母三字词不会作为整词出现在任何真实代码里
+ *    （旧探针的三连字母子串会——测试文件里就有）；
+ * 3. **无自指**：数组 join 构造而非字面量/拼接——源码里只有单字符
+ *    字面量，tokenize 不会产出探针词本身；同理本注释也绝不写探针词样
+ *    （bench 索引自家源码时 bench.ts 不得命中探针）。
  */
+/** 单字符数组拼词：源码里只有单字符字面量，tokenize 提不出探针整词 */
+const w = (chars: string[]): string => chars.join('');
 export const NEG_PROBES = [
-  'z'.repeat(6) + ' ' + 'w'.repeat(4),
-  'q'.repeat(6) + ' ' + 'y'.repeat(4),
-  'a'.repeat(6) + ' ' + 'c'.repeat(6),
+  w(['z', 'q', 'j']) + ' ' + w(['w', 'v', 'k']),
+  w(['x', 'q', 'm']) + ' ' + w(['b', 'j', 'n']),
+  w(['v', 'f', 'z']) + ' ' + w(['h', 'q', 'x']),
 ];
 
 export interface BenchParams {
@@ -36,6 +45,13 @@ export interface BenchParams {
   queries: number;
   /** 组装 token 预算 */
   maxTokens: number;
+  /**
+   * V5.39 稳定采样种子（缺省 = 均匀索引采样）。
+   * 哈希过滤采样：样本 = 池中 hash(name@file, seed) 命中率分位的条目——
+   * 样本集是"条目自身"的函数，代码增删不改既有成员的选中状态，
+   * 基线跨代码变更可比（均匀索引采样在池变化后样本集整体漂移）。
+   */
+  seed?: number;
 }
 
 export interface BenchSample {
@@ -86,9 +102,34 @@ export function buildCrossLingualQuery(symbolName: string): string | null {
   return zh.length > 0 ? zh.join(' ') : null;
 }
 
+/** FNV-1a 32 位哈希（与引擎一致；稳定采样用） */
+function fnv1a(text: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 /**
- * 跑基准：符号池（名称 ≥3 字符，name@file 去重）分层抽样 N 个——
- * 排序后均匀取点，确定性：同代码库同参数必得同样本集。
+ * V5.39 稳定采样：按 hash(name@file, seed) 分位过滤。
+ * 命中条件 hash/MAX < rate —— 样本集是条目自身的函数：
+ * 池增删成员不改既有成员的选中状态（跨代码变更基线可比）。
+ * rate = queries/pool.length（样本数期望 ≈ queries）。
+ */
+export function stableSample(
+  pool: Array<{ name: string; kind: string; file: string }>,
+  count: number,
+  seed: number,
+): Array<{ name: string; kind: string; file: string }> {
+  const rate = Math.min(1, count / Math.max(1, pool.length));
+  return pool.filter((s) => fnv1a(`${s.name}@${s.file}#${seed}`) / 0xffffffff < rate);
+}
+
+/**
+ * 跑基准：符号池（名称 ≥3 字符，name@file 去重）抽样——
+ * 缺省均匀索引采样（确定性）；--seed 哈希过滤稳定采样（跨代码变更可比）。
  */
 export function runBench(engine: ContextEngine, params: BenchParams): BenchMetrics {
   const pool: Array<{ name: string; kind: string; file: string }> = [];
@@ -101,10 +142,15 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
     pool.push({ name: s.name, kind: s.kind, file: s.file });
   }
 
-  const samples =
-    pool.length <= params.queries
-      ? pool
-      : Array.from({ length: params.queries }, (_, i) => pool[Math.floor((i * pool.length) / params.queries)]);
+  let samples: Array<{ name: string; kind: string; file: string }>;
+  if (params.seed !== undefined && pool.length > params.queries) {
+    samples = stableSample(pool, params.queries, params.seed);
+  } else {
+    samples =
+      pool.length <= params.queries
+        ? pool
+        : Array.from({ length: params.queries }, (_, i) => pool[Math.floor((i * pool.length) / params.queries)]);
+  }
 
   const results: BenchSample[] = [];
   for (const s of samples) {

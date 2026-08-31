@@ -140,8 +140,8 @@ export interface ContextReport {
 export interface RecallBreakdown {
   /** 查询提取的关键词 */
   keywords: string[];
-  /** V5.34 同义词扩展（中文口语 ↔ 英文命名；仅语义路生效） */
-  expansions: Array<{ from: string; to: string[] }>;
+  /** V5.34 同义词扩展（中文口语 ↔ 英文命名；仅语义路生效；V5.38 带置信度折扣） */
+  expansions: Array<{ from: string; to: string[]; discount: number }>;
   /** 符号召回：定义位置 */
   symbols: SymbolEntry[];
   /** 语义召回：token 覆盖率命中 */
@@ -837,7 +837,26 @@ export class ContextEngine {
   private scanDirectory(dir: string, depth: number, out: FileIndexEntry[], baseDir: string, prefix: string): void {
     if (depth > 10) return;
 
-    const ignored = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.venv', 'coverage']);
+    // V5.40：lock 文件不入索引——内容是随机依赖哈希，无召回价值，
+    // 且随机串的字符 trigram 会与任意短查询词碰撞（实测污染负例防线）。
+    const ignored = new Set([
+      'node_modules',
+      '.git',
+      'dist',
+      'build',
+      '.next',
+      '__pycache__',
+      '.venv',
+      'coverage',
+      'package-lock.json',
+      'yarn.lock',
+      'pnpm-lock.yaml',
+      'bun.lockb',
+      'composer.lock',
+      'poetry.lock',
+      'Cargo.lock',
+      'go.sum',
+    ]);
 
     try {
       const entries = readdirSync(dir);
