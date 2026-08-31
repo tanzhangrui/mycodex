@@ -9,8 +9,10 @@ import {
   expandQuery,
   EXPANSION_DISCOUNT_EXACT,
   EXPANSION_DISCOUNT_AMBIGUOUS,
+  EXPANSION_DISCOUNT_MINED,
   expansionDiscountOf,
   pairDiscountOf,
+  mineCommentSynonyms,
 } from '../src/context/query-expand.js';
 import { tokenizeForEmbedding, ContextEngine } from '../src/context/context-engine.js';
 import { checkBaselineHealth, saveBaseline, runBench, type BenchMetrics } from '../src/context/bench.js';
@@ -150,6 +152,115 @@ describe('V5.41 pairDiscountOf（逐对精确映射）', () => {
       expect(byName.get('localConst')!.exported).toBe(false);
       expect(byName.get('localFn')!.exported).toBe(false);
       expect(byName.get('inner')!.exported).toBe(false); // 函数内局部变量
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- V5.42 词典自学习（注释-标识符共现挖掘） ----
+
+describe('V5.42 mineCommentSynonyms（注释-标识符共现挖掘）', () => {
+  it('TS 块注释紧邻导出类：中文注释 × 驼峰子词配对', () => {
+    const pairs = mineCommentSynonyms(
+      '/** 支付网关 */\nexport class PayGateway {\n  charge(): void {}\n}\n',
+      'ts',
+    );
+    // 全名小写 + 子词（≥3 字符）都是扩展目标
+    expect(pairs).toContainEqual(['支付网关', 'paygateway']);
+    expect(pairs).toContainEqual(['支付网关', 'pay']);
+    expect(pairs).toContainEqual(['支付网关', 'gateway']);
+  });
+
+  it('Python # 注释紧邻 def：同样挖掘', () => {
+    const pairs = mineCommentSynonyms('# 计算扣款金额\ndef calc_charge_amount():\n    pass\n', 'py');
+    expect(pairs).toContainEqual(['计算扣款金额', 'calc']);
+    expect(pairs).toContainEqual(['计算扣款金额', 'charge']);
+    expect(pairs).toContainEqual(['计算扣款金额', 'amount']);
+    expect(pairs).toContainEqual(['计算扣款金额', 'calc_charge_amount']);
+  });
+
+  it('注释与声明隔开（非紧邻）→ 不挖掘', () => {
+    const pairs = mineCommentSynonyms('// 支付网关\n\nconst unrelated = 1;\n', 'ts');
+    expect(pairs.length).toBe(0); // 空行隔断
+  });
+
+  it('无中文注释 → 零挖掘（纯英文注释不产生对）', () => {
+    const pairs = mineCommentSynonyms('/** pay gateway */\nexport class PayGateway {}\n', 'ts');
+    expect(pairs.length).toBe(0);
+  });
+});
+
+describe('V5.42 expandQuery 挖掘词典参与扩展', () => {
+  const mined = new Map<string, string[]>([['支付网关', ['paygateway', 'pay', 'gateway']]]);
+
+  it('领域词查询经挖掘词典扩展出英文 token（静态词典盲区）', () => {
+    const { expansions, sources } = expandQuery('支付网关在哪实现', mined);
+    expect(expansions.get('paygateway')).toBe(EXPANSION_DISCOUNT_MINED);
+    expect(expansions.get('gateway')).toBe(EXPANSION_DISCOUNT_MINED);
+    expect(sources.some((s) => s.from === '支付网关')).toBe(true);
+  });
+
+  it('静态词典优先：同一 token 静态已扩展则挖掘不覆盖', () => {
+    // "支付" 是静态词典词 → pay 走静态 0.6；挖掘短语"支付网关"补 paygateway/gateway
+    const { expansions } = expandQuery('支付网关', mined);
+    expect(expansions.get('pay')).toBe(EXPANSION_DISCOUNT_EXACT); // 静态优先
+    expect(expansions.get('paygateway')).toBe(EXPANSION_DISCOUNT_MINED); // 挖掘补位
+  });
+
+  it('无挖掘词典 → 全名 token 不可达（静态词典只命中子串"支付"）', () => {
+    const { expansions } = expandQuery('支付网关在哪实现');
+    expect(expansions.has('pay')).toBe(true); // 子串"支付"走静态词典
+    expect(expansions.has('paygateway')).toBe(false); // 全名只有挖掘词典能给
+    expect(expansions.has('gateway')).toBe(false);
+  });
+
+  it('负例防线：乱码查询经挖掘词典也零扩展', () => {
+    const { expansions } = expandQuery('xqz wvv', mined);
+    expect(expansions.size).toBe(0);
+  });
+});
+
+describe('V5.42 引擎级挖掘召回 + 持久化 roundtrip', () => {
+  it('中文领域词查询召回英文命名符号（注释共现挖掘）', async () => {
+    process.env.CODEX_CONFIG_PATH = join(tmpdir(), `codex-v542-cfg-${Date.now()}`);
+    const dir = mkdtempSync(join(tmpdir(), 'codex-v542-eng-'));
+    try {
+      writeFileSync(
+        join(dir, 'gateway.ts'),
+        '/** 支付网关 */\nexport class PayGateway {\n  charge(): void {}\n}\n',
+      );
+      const eng = new ContextEngine();
+      await eng.index(dir);
+      // "支付网关" 与 PayGateway 零词面交集——挖掘词典是唯一召回路径
+      const hits = eng.resolveQuerySymbols('支付网关');
+      expect(hits.some((s) => s.name === 'PayGateway')).toBe(true);
+      // stats 可观测面：挖掘对计数 > 0
+      const report = eng.getContextReport();
+      expect(report.signals.minedSynonymPairs).toBeGreaterThan(0);
+      await eng.flushIndexCache();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('持久化 roundtrip：种子路径（免读盘）仍保有挖掘对', async () => {
+    process.env.CODEX_CONFIG_PATH = join(tmpdir(), `codex-v542-rt-cfg-${Date.now()}`);
+    const dir = mkdtempSync(join(tmpdir(), 'codex-v542-rt-'));
+    try {
+      writeFileSync(
+        join(dir, 'gateway.ts'),
+        '/** 支付网关 */\nexport class PayGateway {\n  charge(): void {}\n}\n',
+      );
+      const first = new ContextEngine();
+      await first.index(dir);
+      first.resolveQuerySymbols('支付网关'); // 触发符号索引构建 + 挖掘 + 落盘排队
+      await first.flushIndexCache();
+
+      const second = new ContextEngine();
+      await second.index(dir);
+      const hits = second.resolveQuerySymbols('支付网关');
+      expect(hits.some((s) => s.name === 'PayGateway')).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

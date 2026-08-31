@@ -22,7 +22,7 @@ import { writeFile } from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { join, relative, resolve, dirname, normalize, sep, basename } from 'node:path';
 import { getConfigDir } from '../config/config.js';
-import { expandQuery } from './query-expand.js';
+import { expandQuery, mineCommentSynonyms, type MinedDictionary } from './query-expand.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
 import { WorkspaceResolver, type WorkspaceRoot } from '../core/workspace.js';
 
@@ -139,6 +139,8 @@ export interface ContextReport {
     gitRecentFiles: string[];
     /** 会话活动文件（最近操作在后；独立实例 stats 恒为空，共享实例对话中非空） */
     sessionActivityFiles: string[];
+    /** V5.42 注释-标识符共现挖掘的词典规模（去重后中文短语 × 英文 token 对数） */
+    minedSynonymPairs: number;
   };
 }
 
@@ -228,6 +230,8 @@ const MAX_PERSIST_FILES = 1500;
 const MAX_PERSIST_SYMBOLS_PER_FILE = 200;
 /** V5.16 单文件持久化 import 数上限 */
 const MAX_PERSIST_IMPORTS_PER_FILE = 100;
+/** V5.42 单文件持久化挖掘同义对上限 */
+const MAX_PERSIST_MINED_PER_FILE = 40;
 /**
  * V5.18 import 解析器版本——纳入结构指纹。
  * 解析逻辑升级（如 `.js`→`.ts` 后缀剥离）后旧缓存里的解析结果全部失配弃用，
@@ -604,6 +608,15 @@ export class ContextEngine {
    * imports 的解析结果依赖"当时"的文件集与别名表，任一变化即整体弃用（宁重读勿陈旧）。
    */
   private persistedImports = new Map<string, string[]>();
+  /**
+   * V5.42 挖掘同义词缓存（path → 中文短语↔英文 token 对列表）。
+   * minedSynCache：本会话读盘解析时挖掘（与 symbolCache 同生命周期）；
+   * persistedMined：持久化种子（v3 缓存携带，指纹校验同符号种子）。
+   * 聚合视图 minedAgg 惰性构建，随 symbolIndex 一起失效。
+   */
+  private minedSynCache = new Map<string, Array<[string, string]>>();
+  private persistedMined = new Map<string, Array<[string, string]>>();
+  private minedAgg: Map<string, string[]> | null = null;
   /** V5.18 上次加载的持久化缓存诊断（无缓存/被拒 → null；context stats 用） */
   private persistedInfo: { version: number; structureOk: boolean; savedAt: string | null } | null = null;
   /** 全局符号索引（name 小写 → 符号列表），惰性构建 */
@@ -663,6 +676,9 @@ export class ContextEngine {
     this.tokenCache = new LRUCache<string, Set<string>>(LRU_SIZE);
     this.persistedSymbols = new Map();
     this.persistedImports = new Map();
+    this.minedSynCache = new Map();
+    this.persistedMined = new Map();
+    this.minedAgg = null;
     this.persistedInfo = null;
     this.symbolIndex = null;
     this.reverseIndex = null;
@@ -805,6 +821,7 @@ export class ContextEngine {
 
     this.applyFileList(files);
     this.symbolIndex = null;
+    this.minedAgg = null; // V5.42 文件集变化 → 挖掘词典聚合重建
     this.reverseIndex = null; // V5.19：文件增删改会影响反向边，重建
     this.reExportIndex = null; // V5.19：re-export 边同理，重建
   }
@@ -817,6 +834,9 @@ export class ContextEngine {
     this.tokenCache.delete(relPath);
     this.persistedSymbols.delete(relPath);
     this.persistedImports.delete(relPath);
+    this.minedSynCache.delete(relPath); // V5.42 挖掘对随文件失效
+    this.persistedMined.delete(relPath);
+    this.minedAgg = null;
     this.indexGeneration++; // V5.29 文件内容/存在性变化 → 组装缓存代际失效
   }
 
@@ -1022,7 +1042,51 @@ export class ContextEngine {
 
     const symbols = extractSymbols(content, lang).map((s) => ({ ...s, file: key }));
     this.symbolCache.set(key, symbols);
+    // V5.42 同一趟内容做注释-标识符共现挖掘（代码库专属同义对）
+    this.minedSynCache.set(key, mineCommentSynonyms(content, lang));
     return symbols;
+  }
+
+  /**
+   * V5.42 挖掘词典规模（stats 可观测面）：去重后的短语→token 对总数。
+   * 未索引/未触发查询时仅统计已有缓存（不强制构建全局符号索引）。
+   */
+  private getMinedSynonymsSize(): number {
+    if (this.minedAgg) {
+      let n = 0;
+      for (const list of this.minedAgg.values()) n += list.length;
+      return n;
+    }
+    const seen = new Set<string>();
+    for (const pairs of [this.minedSynCache, this.persistedMined]) {
+      for (const list of pairs.values()) for (const [c, t] of list) seen.add(`${c}\u0000${t}`);
+    }
+    return seen.size;
+  }
+
+  /**
+   * V5.42 挖掘词典聚合视图（中文短语 → 英文 token 列表）。
+   * 惰性构建：首次查询扩展时聚合 minedSynCache ∪ persistedMined，
+   * 随 symbolIndex 一起失效（文件增删改触发重建）。
+   */
+  private getMinedSynonyms(): MinedDictionary {
+    if (this.minedAgg) return this.minedAgg;
+    this.buildSymbolIndex(); // 确保符号提取趟已跑（minedSynCache 随之填充）
+    const agg = new Map<string, string[]>();
+    const merge = (pairs: Array<[string, string]>): void => {
+      for (const [cjk, token] of pairs) {
+        const list = agg.get(cjk);
+        if (list) {
+          if (!list.includes(token)) list.push(token);
+        } else {
+          agg.set(cjk, [token]);
+        }
+      }
+    };
+    for (const pairs of this.minedSynCache.values()) merge(pairs);
+    for (const pairs of this.persistedMined.values()) merge(pairs);
+    this.minedAgg = agg;
+    return agg;
   }
 
   /**
@@ -1061,7 +1125,8 @@ export class ContextEngine {
 
     const tokens = extractIdentifierTokens(query);
     // V5.37：CJK 查询 tokens 为空但有同义词扩展 → 不提前返回（第三轮兜底要用）
-    if (tokens.length === 0 && expandQuery(query).expansions.size === 0) return [];
+    // V5.42：挖掘词典也计入（纯领域词查询，如"支付网关"）
+    if (tokens.length === 0 && expandQuery(query, this.getMinedSynonyms()).expansions.size === 0) return [];
 
     const index = this.buildSymbolIndex();
     const hits: SymbolEntry[] = [];
@@ -1108,7 +1173,8 @@ export class ContextEngine {
     // "提供者" 与 ProviderType 无词面交集，但扩展 token "provider"
     // 前缀命中。兜底门控保证已有精确/前缀命中时扩展不污染结果。
     if (hits.length === 0) {
-      const { expansions } = expandQuery(query);
+      // V5.42：挖掘词典参与兜底（代码库专属领域词的符号召回）
+      const { expansions } = expandQuery(query, this.getMinedSynonyms());
       for (const [tok] of expansions) {
         if (tok.length < 3 || hits.length >= limit) break;
         const lower = tok.toLowerCase();
@@ -1547,7 +1613,8 @@ export class ContextEngine {
       queryWeights.set(tok, (queryWeights.get(tok) || 0) + weight);
     });
     // V5.34 同义词扩展：中文口语词 ↔ 英文命名（低权重补位；df=0 时零权重不误召回）
-    const { expansions } = expandQuery(query);
+    // V5.42：挖掘词典参与（代码库专属领域词同样低权重补位）
+    const { expansions } = expandQuery(query, this.getMinedSynonyms());
     for (const [tok, discount] of expansions) {
       queryWeights.set(tok, (queryWeights.get(tok) || 0) + discount);
     }
@@ -2029,7 +2096,7 @@ export class ContextEngine {
   private serializeIndex(): string {
     const byFile = new Map<
       string,
-      { size: number; mtime: number; symbols: SymbolEntry[]; imports: string[] }
+      { size: number; mtime: number; symbols: SymbolEntry[]; imports: string[]; mined: Array<[string, string]> }
     >();
     const entryByPath = new Map(this.fileIndex.map((e) => [e.path, e]));
 
@@ -2040,7 +2107,7 @@ export class ContextEngine {
           if (!entry) continue;
           let slot = byFile.get(sym.file);
           if (!slot) {
-            slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [] };
+            slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [], mined: [] };
             byFile.set(sym.file, slot);
           }
           if (slot.symbols.length < MAX_PERSIST_SYMBOLS_PER_FILE) {
@@ -2064,10 +2131,28 @@ export class ContextEngine {
       importSeen.add(path);
       let slot = byFile.get(path);
       if (!slot) {
-        slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [] };
+        slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [], mined: [] };
         byFile.set(path, slot);
       }
       slot.imports = imports.slice(0, MAX_PERSIST_IMPORTS_PER_FILE);
+    }
+
+    // V5.42 挖掘同义对：本次会话挖掘（LRU）∪ 历史种子（仍存活于当前文件索引的）。
+    const minedSources: Array<[string, Array<[string, string]>]> = [
+      ...this.minedSynCache.entries(),
+      ...this.persistedMined.entries(),
+    ];
+    const minedSeen = new Set<string>();
+    for (const [path, pairs] of minedSources) {
+      const entry = entryByPath.get(path);
+      if (!entry || minedSeen.has(path) || pairs.length === 0) continue;
+      minedSeen.add(path);
+      let slot = byFile.get(path);
+      if (!slot) {
+        slot = { size: entry.size, mtime: entry.modifiedAt.getTime(), symbols: [], imports: [], mined: [] };
+        byFile.set(path, slot);
+      }
+      slot.mined = pairs.slice(0, MAX_PERSIST_MINED_PER_FILE);
     }
 
     const roots = this.multiRoots
@@ -2089,6 +2174,8 @@ export class ContextEngine {
         mtime: s.mtime,
         symbols: s.symbols.map((sym) => ({ name: sym.name, kind: sym.kind, line: sym.line, exported: sym.exported })),
         imports: s.imports,
+        // V5.42 注释-标识符共现挖掘对（格式 v3 内可选字段：早期 v3 缓存缺省为空）
+        mined: s.mined,
       })),
     };
     return JSON.stringify(payload);
@@ -2128,6 +2215,7 @@ export class ContextEngine {
           mtime: number;
           symbols: Array<{ name: string; kind: SymbolKind; line: number; exported?: boolean }>;
           imports?: unknown;
+          mined?: unknown;
         }>;
       };
       if (data.version !== 3 || data.workingDir !== this.persistKey) return;
@@ -2156,6 +2244,14 @@ export class ContextEngine {
         }
         if (structureOk && Array.isArray(f.imports)) {
           this.persistedImports.set(f.path, f.imports.filter((p) => typeof p === 'string'));
+        }
+        // V5.42 挖掘同义对种子（格式 v3 可选字段；结构无关，指纹同符号种子门控）
+        if (Array.isArray(f.mined)) {
+          const pairs = f.mined.filter(
+            (p): p is [string, string] =>
+              Array.isArray(p) && p.length === 2 && typeof p[0] === 'string' && typeof p[1] === 'string',
+          );
+          if (pairs.length > 0) this.persistedMined.set(f.path, pairs);
         }
       }
     } catch {
@@ -2281,7 +2377,7 @@ export class ContextEngine {
 
     return {
       keywords,
-      expansions: expandQuery(query).sources,
+      expansions: expandQuery(query, this.getMinedSynonyms()).sources,
       symbols,
       semantic,
       keywordsHits: keywordChunks,
@@ -2564,6 +2660,8 @@ export class ContextEngine {
         weights: { cwdSubtree: 15, cwdSameRoot: 8, gitRecent: 10, sessionActivity: 12 },
         gitRecentFiles,
         sessionActivityFiles: this.getSessionActivity(),
+        // V5.42 注释-标识符共现挖掘的词典规模（跨语言召回的代码库自适应信号）
+        minedSynonymPairs: this.getMinedSynonymsSize(),
       },
     };
   }

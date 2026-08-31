@@ -1391,6 +1391,9 @@ async function handleContext(args: string[]): Promise<void> {
   console.log(
     `  会话活动: ${sig.sessionActivityFiles.length} 文件（独立 stats 恒为空；对话中由工具读写实时填充）`,
   );
+  console.log(
+    `  V5.42 挖掘词典: ${sig.minedSynonymPairs} 对（注释-标识符共现：中文口语 → 英文命名的代码库专属同义对）`,
+  );
 
   // 7) 符号 top-5
   if (report.topFiles.length > 0) {

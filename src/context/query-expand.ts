@@ -139,6 +139,12 @@ const WORD_GROUP_SIZE: ReadonlyMap<string, number> = (() => {
 export const EXPANSION_DISCOUNT_EXACT = 0.6;
 /** 多对多组的扩展折扣：任一配对只是"可能" */
 export const EXPANSION_DISCOUNT_AMBIGUOUS = 0.3;
+/**
+ * V5.42 挖掘词典折扣：注释-标识符共现证据（代码作者亲写的中英对照）。
+ * 置信度介于精确映射（0.6）与多对多（0.3）之间——对本代码库是确定的，
+ * 但注释可能过时，保守一档。
+ */
+export const EXPANSION_DISCOUNT_MINED = 0.5;
 
 /**
  * V5.41 逐对精确映射：显式声明"原词 → 扩展词"的确定配对。
@@ -187,17 +193,80 @@ export function expansionDiscountOf(word: string): number {
 export interface QueryExpansion {
   /** 原查询 token（含驼峰子词拆分） */
   tokens: string[];
-  /** 扩展 token → 权重折扣（V5.38 分级：一一对应 0.6 / 多对多 0.3） */
+  /** 扩展 token → 权重折扣（V5.38 分级：一一对应 0.6 / 多对多 0.3 / V5.42 挖掘 0.5） */
   expansions: Map<string, number>;
   /** 扩展来源（可观测：哪个词触发了哪些扩展 + 置信度） */
   sources: Array<{ from: string; to: string[]; discount: number }>;
 }
 
 /**
+ * V5.42 挖掘词典：中文短语 → 英文 token（代码库专属同义对）。
+ * 键值来自注释-标识符共现挖掘（mineCommentSynonyms），静态词典查不到的
+ * 领域词（每个仓库自己的业务术语）靠它补足。聚合视图只读。
+ */
+export type MinedDictionary = ReadonlyMap<string, ReadonlyArray<string>>;
+
+/**
+ * V5.42 注释-标识符共现挖掘：`/** 支付网关 *​/` 紧邻 `export class PayGateway`
+ * → 作者亲写的中英对照（"支付网关" ↔ paygateway/pay/gateway）。
+ *
+ * 规则：
+ * - 声明行（TS 的 class/function/const/let/var/interface/type · PY 的 def/class）
+ *   上方**紧邻**的注释块（连续注释行，最多回看 5 行）；
+ * - 注释里的 CJK 连续段（2-8 字）配对标识符全名（小写）与驼峰/下划线子词（≥3 字符）；
+ * - 纯函数、与符号提取同一趟行扫描语义——可在 extractSymbols 调用点复用。
+ */
+export function mineCommentSynonyms(content: string, lang: 'ts' | 'py'): Array<[string, string]> {
+  const lines = content.split('\n');
+  const declRe =
+    lang === 'py'
+      ? /^\s*(async\s+)?def\s+([A-Za-z_]\w*)|^\s*class\s+([A-Za-z_]\w*)/
+      : /^\s*(export\s+)?(default\s+)?(abstract\s+)?(async\s+)?(class|function|const|let|var|interface|type|enum)\s+([A-Za-z_$][\w$]*)/;
+  const commentTest =
+    lang === 'py' ? /^\s*#/ : /^\s*(\/\*\*?|\/\/|\*|'''|""")/;
+
+  const pairs = new Map<string, true>();
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(declRe);
+    const name = m ? (m[2] ?? m[3] ?? m[6] ?? m[7]) : null;
+    if (!name) continue;
+
+    // 上方紧邻注释块（连续注释行；最多 5 行，遇空行/代码行停）
+    const commentText: string[] = [];
+    for (let j = i - 1; j >= 0 && i - j <= 5 && commentTest.test(lines[j]); j--) {
+      commentText.unshift(lines[j]);
+    }
+    if (commentText.length === 0) continue;
+
+    // CJK 连续段（2-8 字）
+    const cjkRuns = (commentText.join(' ').match(/[\u4e00-\u9fa5]{2,8}/g) ?? []).slice(0, 4);
+    if (cjkRuns.length === 0) continue;
+
+    // 标识符子词（驼峰/下划线拆分）+ 全名小写
+    const subwords = name
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .split(/[_\s]+/)
+      .map((s) => s.toLowerCase())
+      .filter((s) => s.length >= 3);
+    const targets = [...new Set([name.toLowerCase(), ...subwords])];
+
+    for (const run of cjkRuns) {
+      for (const t of targets) pairs.set(`${run}\u0000${t}`, true);
+    }
+  }
+  return [...pairs.keys()].map((k) => {
+    const [cjk, token] = k.split('\u0000');
+    return [cjk, token] as [string, string];
+  });
+}
+
+/**
  * 查询扩展：提取 token（含子词拆分）+ 同义词扩展。
  * 纯函数、无状态——语义路每次查询调用，代价可忽略。
+ * V5.42：可选挖掘词典（代码库专属同义对）参与扩展——静态词典优先
+ * （同一 token 静态已扩展则不覆盖），挖掘词补静态盲区。
  */
-export function expandQuery(query: string): QueryExpansion {
+export function expandQuery(query: string, mined?: MinedDictionary): QueryExpansion {
   // 子词拆分复用引擎分词器语义：词 + camelCase/snake_case 拆分（无 trigram/bigram）
   const rawWords = query.match(/[A-Za-z0-9_$]+/g) ?? [];
   const tokens: string[] = [];
@@ -251,6 +320,27 @@ export function expandQuery(query: string): QueryExpansion {
     if (added.length > 0) {
       // 触发词级折扣 = 该词全部配对折扣的均值（可观测性：sources 保持单值）
       sources.push({ from: tok, to: added, discount: Number((pairSum / added.length).toFixed(2)) });
+    }
+  }
+
+  // V5.42 挖掘词典：代码库专属同义对（静态词典盲区的领域词）。
+  // 匹配语义同静态 CJK 扫描——挖掘短语作为子串出现在查询 CJK 段中即命中；
+  // 静态词典已扩展的 token 不覆盖（静态优先），查询已有词不扩展。
+  if (mined && mined.size > 0) {
+    const cjkRunsForMined = query.match(/[\u4e00-\u9fa5]{2,}/g) ?? [];
+    if (cjkRunsForMined.length > 0) {
+      for (const [phrase, targets] of mined) {
+        if (!cjkRunsForMined.some((run) => run.includes(phrase))) continue;
+        const added: string[] = [];
+        for (const t of targets) {
+          if (tokenSet.has(t) || expansions.has(t)) continue;
+          expansions.set(t, EXPANSION_DISCOUNT_MINED);
+          added.push(t);
+        }
+        if (added.length > 0) {
+          sources.push({ from: phrase, to: added, discount: EXPANSION_DISCOUNT_MINED });
+        }
+      }
     }
   }
 
