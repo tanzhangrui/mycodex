@@ -120,6 +120,19 @@ export interface ContextReport {
   } | null;
   /** 符号数 top-5 文件 */
   topFiles: Array<{ path: string; symbols: number; size: number }>;
+  /**
+   * V5.27 召回加权信号概览（`context stats` 第六段）。
+   * 三路排序加权（cwd 邻近 / git 最近变更 / 会话活动）的可观测面：
+   * 权重参数 + 当前生效的信号文件集合（键空间）。
+   */
+  signals: {
+    /** 排序加权参数（均只改排序不改召回集合） */
+    weights: { cwdSubtree: number; cwdSameRoot: number; gitRecent: number; sessionActivity: number };
+    /** git 最近变更映射到键空间后的文件（仅保留索引内；空 = 非 git 仓 / 无变更 / 采集失败） */
+    gitRecentFiles: string[];
+    /** 会话活动文件（最近操作在后；独立实例 stats 恒为空，共享实例对话中非空） */
+    sessionActivityFiles: string[];
+  };
 }
 
 /** V5.20 四路召回分解（`codex context query` 数据源） */
@@ -2311,6 +2324,12 @@ export class ContextEngine {
       .sort((a, b) => b.symbols - a.symbols)
       .slice(0, 5);
 
+    // V5.27 加权信号：git 最近变更（主根采集，与 agent-loop 接线一致）→ 键空间（仅索引内）
+    const primaryRoot = this.multiRoots ? this.multiRoots[0].abs : this.workingDir;
+    const gitRecentFiles = collectGitChangedFiles(primaryRoot)
+      .map((abs) => this.absToKey(abs))
+      .filter((k): k is string => !!k);
+
     return {
       mode: this.multiRoots ? 'multi' : 'single',
       roots,
@@ -2332,6 +2351,11 @@ export class ContextEngine {
           }
         : null,
       topFiles,
+      signals: {
+        weights: { cwdSubtree: 15, cwdSameRoot: 8, gitRecent: 10, sessionActivity: 12 },
+        gitRecentFiles,
+        sessionActivityFiles: this.getSessionActivity(),
+      },
     };
   }
 }

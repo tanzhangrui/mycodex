@@ -1151,7 +1151,20 @@ async function handleContext(args: string[]): Promise<void> {
   console.log('[规则]');
   console.log(`  规则文件: ${report.ruleCount} 条（项目级 CODEX.md 每根独立 + 用户级）`);
 
-  // 6) 符号 top-5
+  // 6) 召回加权信号（V5.27：三路排序加权可观测——参数 + 当前生效集合）
+  console.log('[召回加权信号]');
+  const sig = report.signals;
+  console.log(
+    `  权重: cwd 子树 +${sig.weights.cwdSubtree} / 多根同根 +${sig.weights.cwdSameRoot} / git 变更 +${sig.weights.gitRecent} / 会话活动 +${sig.weights.sessionActivity}（均只改排序不改召回集合）`,
+  );
+  console.log(
+    `  git 最近变更: ${sig.gitRecentFiles.length} 文件${sig.gitRecentFiles.length > 0 ? `（${sig.gitRecentFiles.slice(0, 3).join(', ')}${sig.gitRecentFiles.length > 3 ? ' …' : ''}）` : '（非 git 仓 / 工作区干净 / 采集失败）'}`,
+  );
+  console.log(
+    `  会话活动: ${sig.sessionActivityFiles.length} 文件（独立 stats 恒为空；对话中由工具读写实时填充）`,
+  );
+
+  // 7) 符号 top-5
   if (report.topFiles.length > 0) {
     console.log('[符号数 top-5]');
     for (const f of report.topFiles) {

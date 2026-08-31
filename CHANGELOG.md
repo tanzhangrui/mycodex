@@ -5,6 +5,54 @@
 
 ***
 
+## V5.28 — 2026-08-31 — 召回质量回归基准
+
+> 召回链路调参（阈值 / IDF / 权重 / n-gram）没有任何质量护栏——
+> 回归只能等用户在真实对话里踩坑后靠 `context why` 排障。
+
+### A. 固定语料 + 期望命中集（tests/recall-benchmark.test.ts）
+
+* 7 文件语料（类/函数/barrel/import 图/中文注释语义信号），三类断言：
+
+  * **召回**：期望文件必须出现在组装结果（符号+语义混合 / 中文口语 / 关键词 / 多符号使用点穿透 barrel）
+
+  * **排序**：期望文件进 top-3（加权回归的代理指标）；定义文件排在无关命中之前
+
+  * **不变量**：无信号查询零召回（阈值+IDF 防线）/ 结果全为索引内文件且行区间合法 / **预算裁剪只截断不重排**（窄预算结果 = 宽预算前缀）
+
+### 验收
+
+* 新增 9 项基准测试（23ms 级，无 IO 依赖）；
+
+* typecheck 零错误 / **364 测试全绿**（353 + 11，含 V5.27 的 2 项）
+
+***
+
+## V5.27 — 2026-08-31 — `context stats` 召回加权信号概览
+
+> V5.13/V5.24/V5.25 三路排序加权（cwd / git 变更 / 会话活动）上线后，
+> `context stats` 对它们只字未提——加权是否生效、生效到哪些文件，诊断无门。
+
+### A. `ContextReport.signals`（context-engine.ts）
+
+* `weights`：四路权重参数（cwd 子树 +15 / 多根同根 +8 / git 变更 +10 / 会话活动 +12）
+
+* `gitRecentFiles`：主根实时采集（与 agent-loop 接线同源）映射到键空间，仅保留索引内文件；非 git 仓 → 空数组
+
+* `sessionActivityFiles`：会话活动镜像（独立实例 stats 恒为空，共享实例对话中非空）
+
+### B. CLI `context stats` 第六段
+
+* 权重一览 + git 变更文件数（前 3 预览）+ 会话活动文件数及语义说明
+
+### 验收
+
+* 新增 2 项测试：非 git 目录（权重参数齐全 + 空降级 + 活动镜像）/ 真实 git 仓（变更映射键空间，未变更文件不在集合）
+
+* CLI 冒烟：本仓库 stats 正确呈现 7 个 git 变更文件；typecheck 零错误 / 364 测试全绿
+
+***
+
 ## V5.26 — 2026-08-31 — `codex context why --json`
 
 > 诊断数据只有人读格式——CI / 脚本想消费"这个文件为什么没被召回"得解析中文文本。
@@ -37,13 +85,13 @@
 
 ### B. agent-loop 接线
 
-* `toolContext.readFile / writeFile` 包装记录触达文件（相对路径按主根 resolve）——所有读写工具（read_file / write_file / edit_file…）统一挂点，无需逐工具解析参数
+* `toolContext.readFile / writeFile` 包装记录触达文件（相对路径按主根 resolve）——所有读写工具（read\_file / write\_file / edit\_file…）统一挂点，无需逐工具解析参数
 
 * 与 `buildSystemPrompt` 共享同一引擎实例：本轮工具活动在**下一轮**会话组装时生效（systemPrompt 每轮会话构建一次，循环内不重组装）；记录失败静默降级，绝不阻断工具执行
 
 ### 验收
 
-* 新增 5 项测试：+12 反超排序（召回集合不变量）/ 越界路径拒绝 / 重复移队尾 + 清空 / FIFO 55→50 淘汰最旧 / **agent-loop 真实接线**（MockProvider 触发 read_file → 共享引擎会话活动含目标文件）
+* 新增 5 项测试：+12 反超排序（召回集合不变量）/ 越界路径拒绝 / 重复移队尾 + 清空 / FIFO 55→50 淘汰最旧 / **agent-loop 真实接线**（MockProvider 触发 read\_file → 共享引擎会话活动含目标文件）
 
 * typecheck 零错误 / 353 测试全绿
 

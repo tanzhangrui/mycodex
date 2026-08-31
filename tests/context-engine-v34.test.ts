@@ -1075,6 +1075,45 @@ describe('V5.25 会话活动加权（recordSessionActivity）', () => {
   });
 });
 
+// ---- V5.27 加权信号概览 ----
+
+describe('V5.27 getContextReport signals（三路加权信号可观测）', () => {
+  it('非 git 目录：权重参数齐全 + gitRecentFiles 空 + 会话活动镜像', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v527-'));
+    writeFileSync(join(r, 'svc.ts'), 'export class Svc {}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+    e.recordSessionActivity(join(r, 'svc.ts'));
+
+    const report = e.getContextReport();
+    expect(report.signals.weights).toEqual({ cwdSubtree: 15, cwdSameRoot: 8, gitRecent: 10, sessionActivity: 12 });
+    expect(report.signals.gitRecentFiles).toEqual([]); // 非 git 仓静默降级
+    expect(report.signals.sessionActivityFiles).toEqual(['svc.ts']); // 活动镜像（键空间）
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('git 仓：变更文件映射到键空间（仅索引内）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v527git-'));
+    const sh = (cmd: string) => execSync(cmd, { cwd: r, stdio: 'ignore' });
+    sh('git init');
+    sh('git config user.email t@t.t');
+    sh('git config user.name t');
+    writeFileSync(join(r, 'committed.ts'), 'export const a = 1;\n');
+    sh('git add .');
+    sh('git commit -m init');
+    writeFileSync(join(r, 'changed.ts'), 'export const b = 2;\n'); // 未跟踪 → git recent
+
+    const e = new ContextEngine();
+    await e.index(r);
+    const report = e.getContextReport();
+    expect(report.signals.gitRecentFiles).toContain('changed.ts'); // 键空间映射成功
+    expect(report.signals.gitRecentFiles).not.toContain('committed.ts'); // 无变更不在集合
+
+    rmSync(r, { recursive: true, force: true });
+  });
+});
+
 // ---- V5.25 agent-loop 接线 ----
 
 describe('V5.25 agent-loop 会话活动接线（工具 read/write 反馈召回）', () => {
