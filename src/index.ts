@@ -40,7 +40,7 @@ import { createSandbox } from './sandbox/sandbox.js';
 import { createLogger } from './utils/logger.js';
 import { toolRegistry } from './tools/registry.js';
 import { ContextEngine, collectGitChangedFiles } from './context/context-engine.js';
-import { runBench, saveBaseline, loadBaseline, compareWithBaseline, evalGate, type BenchCompare } from './context/bench.js';
+import { runBench, saveBaseline, loadBaseline, compareWithBaseline, evalGate, checkBaselineHealth, type BenchCompare } from './context/bench.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import {
   loadMarketplaceIndex,
@@ -810,6 +810,22 @@ async function handleDoctor(): Promise<void> {
     }
   }
 
+  // 6) V5.35 bench 基线健康（提示级——missing/stale 不算体检失败，召回质量靠 --compare 门禁把关）
+  console.log('[召回基线]');
+  const benchRoot = process.cwd();
+  const baseline = checkBaselineHealth(benchRoot);
+  if (baseline.status === 'ok') {
+    ok(
+      `基线健康（${baseline.ageDays} 天前 · Recall@3 ${baseline.recallAt3Pct}% · ${baseline.file}）`,
+    );
+  } else if (baseline.status === 'stale') {
+    console.log(`  ! 基线已 ${baseline.ageDays} 天未更新（${baseline.file}）`);
+    console.log(`    → ${baseline.hint}`);
+  } else {
+    console.log(`  ! 无召回质量基线（${baseline.file}）`);
+    console.log(`    → ${baseline.hint}`);
+  }
+
   console.log('');
   if (failures === 0) {
     console.log('体检结果: 全部通过 ✔');
@@ -994,6 +1010,7 @@ async function handleContextQuery(args: string[]): Promise<void> {
           query: q,
           cwd: cwdKey ?? null,
           keywords: bd.keywords,
+          expansions: bd.expansions,
           symbols: bd.symbols,
           semantic: bd.semantic,
           keywordHits: bd.keywordsHits,
@@ -1011,6 +1028,11 @@ async function handleContextQuery(args: string[]): Promise<void> {
   console.log(`Codex v${VERSION} 召回分解`);
   console.log(`  查询: ${q}`);
   console.log(`  关键词: ${bd.keywords.length > 0 ? bd.keywords.join(', ') : '（无）'}${cwdKey ? `  cwd 加权: ${cwdKey}` : ''}`);
+  // V5.34 同义词扩展（仅语义路）：中文口语 ↔ 英文命名
+  if (bd.expansions.length > 0) {
+    const parts = bd.expansions.map((e) => `${e.from} → ${e.to.join('/')}`);
+    console.log(`  同义词扩展: ${parts.join('；')}`);
+  }
   console.log('');
 
   // 1) 符号

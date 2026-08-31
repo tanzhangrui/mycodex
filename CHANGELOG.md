@@ -5,6 +5,68 @@
 
 ***
 
+## V5.35 — 2026-08-31 — doctor 集成 bench 基线健康检测
+
+> 基线落盘后没人看——过期/缺失只有主动跑 `--compare` 才知道，
+> 召回质量水位成了"暗状态"。
+
+### A. `checkBaselineHealth`（bench.ts，doctor 数据源）
+
+* 四态：missing（无文件/损坏 JSON）/ ok / stale（超 7 天）+ Recall\@3 百分比、ageDays
+
+* 每态带修复命令 hint（`--save` 建基线 / 刷新 / `--compare` 对比水位）
+
+### B. `codex doctor` 新增 \[召回基线] 段
+
+* 提示级（! 标记）而非体检失败——missing/stale 是流程提醒，召回回退由 `--compare` 门禁把关（职责分离）
+
+### 验收
+
+* 新增 5 项测试：missing / ok（Recall\@3% 与 savedAt）/ stale（超期天数+刷新提示）/ 损坏 JSON 按 missing / runBench→save→health 契约联动
+
+* CLI 冒烟：doctor 正确渲染无基线提示
+
+***
+
+## V5.34 — 2026-08-31 — 查询语义扩展（跨语言召回 + 驼峰子词）
+
+> 中文口语查询（"支付扣款怎么实现的"）与英文命名代码
+> （PaymentGateway.charge）零词面交集——语义路只能靠 CJK bigram 落空。
+
+### A. 中英技术同义词典（src/context/query-expand.ts）
+
+* \~80 组双向同义词（登录↔login、支付↔pay/payment/charge、购物车↔cart/basket…）覆盖通用后端/前端/工具链词汇
+
+* CJK 连续段子串扫描："支付扣款怎么实现的" 整段非词典词，但命中 "支付"/"扣款" 子串
+
+* 扩展 token 权重打 0.4 折（原词主导，扩展只补位）；**只进语义路**——符号/关键词路不扩展（误扩展代价是假阳性窗口，语义路有 IDF+阈值双重防线）
+
+* df=0 跳过（V5.33）保证词典词库内无命中时零权重不误召回
+
+### B. tokenizeForEmbedding 子词拆分（查询与文件对称）
+
+* camelCase：UserRepository → user/repository（整词保留）；snake\_case 同理
+
+* 在原始大小写文本上取词（先 lower 会丢驼峰信息）
+
+* 口语查询 "user repository" 由此命中 camelCase 命名符号所在文件
+
+### C. 可观测：召回分解暴露扩展来源
+
+* `RecallBreakdown.expansions`（`{from, to[]}`）+ `context query` 显示 `同义词扩展: 支付 → pay/payment/charge`；`--json` 同步输出
+
+### 验收
+
+* 新增 19 项测试：词典双向/子串/去重/负例零扩展 / 子词拆分对称性+回归 / 引擎级中文口语召回英文文件 / 驼峰口语命中 / 分解暴露 / 负例零召回 / 基线健康五态
+
+* 修复实现 bug：seenMatch 含完整 CJK 段导致子串扫描被短路（"支付扣款"扩展为空）
+
+* CLI 冒烟：`context query 支付扣款` 扩展来源+语义命中正确渲染
+
+* typecheck 零错误 / **409 测试全绿**（390 + 19）/ bench 回归 PASS（负例 0 误召回——词典不破坏负例防线）
+
+***
+
 ## V5.33 — 2026-08-31 — 语义路 IDF df=0 归零 + 覆盖率显示修复
 
 > 查询混入未收录 token（口语词 / 拼错词）时，旧 IDF 公式
@@ -15,6 +77,7 @@
 ### A. IDF df=0 权重归零（context-engine.ts semanticScores）
 
 * `df=0` 的 token 跳过：不贡献权重、**也不稀释分母**——查询混入垃圾词不再压低真实命中覆盖率
+
 * 副产物（负例更硬）：全部 token 未收录 → totalIdfWeight=0 → 语义路直接空返回
 
 ### B. `context query` 覆盖率显示修复（index.ts）
@@ -24,8 +87,11 @@
 ### 验收
 
 * 新增 3 项测试：混入未收录词覆盖率不降（relevance 恒等）/ 全未收录零召回 / 组装链路口语混拼错词仍召回正确文件
-* 既有 V5.4 IDF 测试（4 项）零改动通过；bench 回归：本仓库 Recall@3 95%、MRR 0.885、负例 0 误召回 PASS
-* 修 1 项测试脆弱性：索引持久化断言不再依赖 `readdir` 顺序（多引擎落盘后 cacheFiles[0] 不保证是本工作区）
+
+* 既有 V5.4 IDF 测试（4 项）零改动通过；bench 回归：本仓库 Recall\@3 95%、MRR 0.885、负例 0 误召回 PASS
+
+* 修 1 项测试脆弱性：索引持久化断言不再依赖 `readdir` 顺序（多引擎落盘后 cacheFiles\[0] 不保证是本工作区）
+
 * typecheck 零错误 / **390 测试全绿**（387 + 3）
 
 ***
@@ -38,20 +104,27 @@
 ### A. bench 核心模块化（src/context/bench.ts，CLI 与逻辑解耦）
 
 * `runBench`：抽样 + 指标计算（原 V5.31 CLI 内联逻辑迁移，行为不变）
+
 * `saveBaseline` / `loadBaseline`：基线 JSON v1 落盘（点文件名，索引器天然跳过，不污染语料）
-* `compareWithBaseline`：Recall@3/@10/MRR 任一低于基线即回退（耗时噪声大不入门禁）
+
+* `compareWithBaseline`：Recall\@3/@10/MRR 任一低于基线即回退（耗时噪声大不入门禁）
+
 * `evalGate`：负例误召回 + `--min-r3 <百分比>` 下限 + 基线回退三路聚合门禁，空索引 + min-r3 也算 FAIL
 
 ### B. CLI `codex context bench … [--save [文件]] [--compare [文件]] [--min-r3 <百分比>]`
 
 * `--save` 落盘基线（缺省 `<主根>/.codex-bench.json`）；`--compare` 逐指标对比并打印增量（`Recall@3 +1` 式）
+
 * 任一门禁红灯 → exit 1（CI 可感知）；`--json` 输出含 baseline / compare / gate 三段
+
 * 自指污染修复：负例探针改 `repeat` 构造——语义路是字符 trigram 匹配，探针字面量（含注释里的字样）会命中 bench.ts 自身导致负例全误召回
 
 ### 验收
 
 * 新增 12 项测试：指标正确性 / 抽样确定性 / 基线 roundtrip / 损坏降级 / 对比持平·回退·改善 / 门禁达标·下限·空索引·负例·基线聚合
+
 * CLI 冒烟：本仓库 `--save` → `--compare --min-r3 90` 全链路 PASS（exit 0）
+
 * typecheck 零错误 / **387 测试全绿**（375 + 12）
 
 ***
@@ -64,20 +137,27 @@
 ### A. `listSymbols()`（context-engine.ts）
 
 * 全量符号清单公共 API：触发全局符号索引构建（惰性），返回按（名称大小写不敏感, 文件, 行号）稳定排序的扁平列表
+
 * bench 的抽样源——符号名即查询、所在文件即 ground truth，无需人工标注
 
 ### B. CLI `codex context bench [目录...] [--json] [--queries N] [--max-tokens T]`
 
-* 查询自动生成：符号池（名称 ≥3 字符，name@file 去重）**分层抽样** N 个（默认 20）——确定性，同库同参数必得同样本集
-* 指标：Recall@1/3/10、MRR、平均组装耗时 / chunk 数 / token 估算；未召回样本前 5 条明示
+* 查询自动生成：符号池（名称 ≥3 字符，name\@file 去重）**分层抽样** N 个（默认 20）——确定性，同库同参数必得同样本集
+
+* 指标：Recall\@1/3/10、MRR、平均组装耗时 / chunk 数 / token 估算；未召回样本前 5 条明示
+
 * 负例防线：3 个固定乱码查询，任一非空组装即 **FAIL + exit 1**（CI 可感知）；召回指标不设硬阈值（不同库基线不同，供回归对比）
+
 * `--json`：机器可读输出（含逐样本排名，与 context query/why --json 同约定）
 
 ### 验收
 
 * 新增 4 项测试：全量符号与排序不变量 / 确定性复现 / 抽样符号 top-3 召回不变量 / 空工作区
-* CLI 冒烟：本仓库 src（24 文件 / 1593 符号）Recall@3 100%、MRR 0.911、负例 0 误召回、PASS
+
+* CLI 冒烟：本仓库 src（24 文件 / 1593 符号）Recall\@3 100%、MRR 0.911、负例 0 误召回、PASS
+
 * typecheck 零错误 / **375 测试全绿**（371 + 4）
+
 * 补记：修复上一提交误删的 V5.13–V5.28 条目（自 V5.12 版本恢复）
 
 ***

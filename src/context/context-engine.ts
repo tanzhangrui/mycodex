@@ -22,6 +22,7 @@ import { writeFile } from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { join, relative, resolve, dirname, normalize, sep, basename } from 'node:path';
 import { getConfigDir } from '../config/config.js';
+import { expandQuery } from './query-expand.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
 import { WorkspaceResolver, type WorkspaceRoot } from '../core/workspace.js';
 
@@ -139,6 +140,8 @@ export interface ContextReport {
 export interface RecallBreakdown {
   /** 查询提取的关键词 */
   keywords: string[];
+  /** V5.34 同义词扩展（中文口语 ↔ 英文命名；仅语义路生效） */
+  expansions: Array<{ from: string; to: string[] }>;
   /** 符号召回：定义位置 */
   symbols: SymbolEntry[];
   /** 语义召回：token 覆盖率命中 */
@@ -413,9 +416,26 @@ const LEADING_SLASH_RE = /^\//;
 export function tokenizeForEmbedding(text: string): string[] {
   const tokens: string[] = [];
   const lower = text.toLowerCase();
-  const words = lower.match(/[a-z0-9_$]+/g) ?? [];
-  for (const w of words) {
+  // V5.34：在原始大小写文本上取词（驼峰拆分需要大小写信息，先 lower 会丢失）
+  const rawWords = text.match(/[A-Za-z0-9_$]+/g) ?? [];
+  const words: string[] = [];
+  for (const raw of rawWords) {
+    const w = raw.toLowerCase();
+    words.push(w);
     tokens.push(w);
+    // V5.34 子词拆分（查询与文件对称）：
+    // - camelCase：UserRepository → user / repository
+    // - snake_case：create_user → create / user（整词也保留）
+    // 口语查询 "user repository" 由此命中 camelCase 命名的符号所在文件
+    const subwords = raw
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .split(/[_\s]+/)
+      .map((s) => s.toLowerCase())
+      .filter((s) => s.length >= 2 && s !== w);
+    for (const sw of subwords) {
+      words.push(sw);
+      tokens.push(sw);
+    }
     // 字符 trigram：词形变体/拼写容错的模糊信号
     if (w.length >= 4) {
       for (let i = 0; i + 3 <= w.length; i++) tokens.push(w.slice(i, i + 3));
@@ -1467,6 +1487,11 @@ export class ContextEngine {
       const weight = 1 / Math.log2(idx + 2);
       queryWeights.set(tok, (queryWeights.get(tok) || 0) + weight);
     });
+    // V5.34 同义词扩展：中文口语词 ↔ 英文命名（低权重补位；df=0 时零权重不误召回）
+    const { expansions } = expandQuery(query);
+    for (const [tok, discount] of expansions) {
+      queryWeights.set(tok, (queryWeights.get(tok) || 0) + discount);
+    }
     const totalQueryWeight = [...queryWeights.values()].reduce((a, b) => a + b, 0);
     if (totalQueryWeight === 0) return new Map();
 
@@ -2194,6 +2219,7 @@ export class ContextEngine {
 
     return {
       keywords,
+      expansions: expandQuery(query).sources,
       symbols,
       semantic,
       keywordsHits: keywordChunks,

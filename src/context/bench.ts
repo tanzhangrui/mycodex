@@ -15,6 +15,7 @@
  */
 
 import { writeFileSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { ContextEngine } from './context-engine.js';
 
 /**
@@ -208,4 +209,62 @@ export function evalGate(m: BenchMetrics, opts: GateOptions = {}): GateResult {
   }
   if (opts.compare && !opts.compare.pass) reasons.push(...opts.compare.regressions);
   return { pass: reasons.length === 0, reasons };
+}
+
+// ---- V5.35 doctor 集成：bench 基线健康检测 ----
+
+export interface BaselineHealth {
+  status: 'missing' | 'ok' | 'stale' | 'corrupted';
+  /** 基线文件绝对路径 */
+  file: string;
+  /** 保存时间（ISO；missing/corrupted 为 null） */
+  savedAt: string | null;
+  /** 距今天数（missing/corrupted 为 null） */
+  ageDays: number | null;
+  /** 基线 Recall@3 百分比（corrupted 为 null） */
+  recallAt3Pct: number | null;
+  /** 人读建议（doctor 展示；missing/corrupted/stale 各有修复命令） */
+  hint: string;
+}
+
+/** 基线视为过期的天数上限（跨版本召回水位应常跑常新） */
+export const BASELINE_STALE_DAYS = 7;
+
+/**
+ * V5.35 检查主根 bench 基线健康度（`codex doctor` 数据源）。
+ * 纯读操作：missing / corrupted / stale（超 7 天）/ ok 四态。
+ */
+export function checkBaselineHealth(rootDir: string, baselineFile?: string): BaselineHealth {
+  const file = baselineFile ?? join(rootDir, '.codex-bench.json');
+  const b = loadBaseline(file);
+  if (!b) {
+    return {
+      status: 'missing',
+      file,
+      savedAt: null,
+      ageDays: null,
+      recallAt3Pct: null,
+      hint: `跑 codex context bench ${rootDir} --save 建立召回质量基线`,
+    };
+  }
+  const ageDays = (Date.now() - new Date(b.savedAt).getTime()) / 86_400_000;
+  const pct = b.metrics.queries === 0 ? 0 : (b.metrics.recall.at3 / b.metrics.queries) * 100;
+  if (ageDays > BASELINE_STALE_DAYS) {
+    return {
+      status: 'stale',
+      file,
+      savedAt: b.savedAt,
+      ageDays: Math.floor(ageDays),
+      recallAt3Pct: Number(pct.toFixed(1)),
+      hint: `基线已 ${Math.floor(ageDays)} 天未更新，跑 codex context bench ${rootDir} --save 刷新`,
+    };
+  }
+  return {
+    status: 'ok',
+    file,
+    savedAt: b.savedAt,
+    ageDays: Math.floor(ageDays),
+    recallAt3Pct: Number(pct.toFixed(1)),
+    hint: `codex context bench ${rootDir} --compare 对比当前召回水位`,
+  };
 }
