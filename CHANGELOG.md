@@ -5,6 +5,100 @@
 
 ***
 
+## V5.20 — 2026-08-31 — 召回分解调试（codex context query）
+
+> "为什么没召回这个文件"——四路召回是黑盒，排障只能靠猜。
+> 把 assembleContext 的召回链路逐路拆开，一条命令看全每一路的命中明细。
+
+### A. `debugRecall`（context-engine.ts）
+
+* `RecallBreakdown`：keywords / symbols / semantic / keywordsHits / related / usageSites / assembled 七路明细——与 assembleContext 完全相同的召回链路，但不合并，逐路展示
+
+* `assembled` 字段内部调用 `assembleContext(query, opts)` 同参透传（含 cwd 加权与预算裁剪），保证分解结果与真实组装一致
+
+### B. CLI `codex context query <查询> [目录...] [--cwd <路径>]`
+
+* 六段输出：符号命中（名称/种类/位置）/ 语义召回（token 覆盖率）/ 关键词召回（内容窗口得分）/ import 图 1 跳 / 使用点（V5.19 re-export 链穿透 barrel）/ 最终组装（relevance + 行区间）
+
+* `--cwd` 模拟邻近加权（与 agent-loop 接线一致：absToKey 转键空间路径）；缺省查询给用法提示
+
+### 验收
+
+* 新增 5 项测试：分解字段齐全（混合查询逐路断言）/ related 种子差集语义（已被其他路召回的文件不重复出现）/ usageSites 穿透 barrel / assembled 与 assembleContext 同参一致 / 无命中查询各路为空不抛错
+
+* CLI 冒烟：本仓库真实符号（ContextEngine）符号命中 + 使用点（agent-loop.ts）正确呈现
+
+* typecheck 零错误 / **333 测试全绿**（320 + 13，含 V5.19 的 8 项）/ 构建产物 127.1KB
+
+***
+
+## V5.19 — 2026-08-31 — 反向依赖索引 + re-export 链追踪
+
+> "改这个函数会影响谁"是高频上下文需求——只有正向依赖图回答不了。
+> 且真实消费者 import 的常是 barrel（index.ts）而非源文件，直接反查会漏。
+
+### A. 反向依赖索引（imported-by）
+
+* `reverseIndex`：文件 → 直接 import 它的文件列表；惰性构建（首次反向查询触发），与符号索引同边界（源码扩展名 + 512KB + 3000 文件上限），refresh 时置空重建
+
+* `getImportedBy(relPath)`：直接一级 importer；`getRelatedFiles` 增加 `direction` 参数（'deps' 默认旧行为 / 'importers' 反向 / 'both' 双向）
+
+### B. re-export 链追踪（穿透 barrel）
+
+* `reExportIndex`：被 re-export 的文件 → 转发它的 barrel 集合（`export * from` / `export * as ns from` / `export { … } from`，TS/JS）
+
+* `getImportedByExpanded(relPath, maxHops=3)`：BFS 穿透 barrel 找真实消费者——`widget.ts ← index.ts（re-export）← consumer.ts`，直接反查只见 index.ts，expanded 连带 consumer.ts；**穿透条件严格限定 re-export 边**（普通 import 不穿透，防"传递依赖全算使用点"的过度扩散）
+
+### C. 接线
+
+* `assembleContext` 使用点召回（relevance 20，低于定义 100、高于依赖扩展 5）改走 expanded：定义处 + 真实使用处一并注入
+
+### 验收
+
+* 新增 8 项测试：直接 importer / 穿透 barrel 找消费者 / 普通 import 不穿透（过度扩散防线）/ 多跳混合 re-export 链（`export {…} from` 与 `export * from` 嵌套两层）/ maxHops 截断 / refresh 后 re-export 边重建（删 barrel 链断）/ assembleContext 使用点含 barrel 消费者 / getRelatedFiles 'both' 两跳穿到消费者
+
+* typecheck 零错误 / 320 测试全绿（V5.17/V5.18 之后）
+
+***
+
+## V5.18 — 2026-08-30 — 上下文引擎体检（codex context stats）+ TS ESM import 解析修复
+
+> 索引规模/别名表/缓存命中期盼可观测；TS ESM `.js` 后缀约定导致 import 边缺失。
+
+### A. `codex context stats [目录...]`
+
+* 五段体检：工作区（多根元数据 + 按根文件数）/ 索引（文件/源码/符号数 + import 边 + 懒加载模式）/ 别名（包名跨根互引 + tsconfig paths）/ 持久化缓存（版本/结构指纹门控/种子命中）/ 符号 top-5 文件
+
+* 异常给告警（如"未发现源码文件"）；目录参数缺省 cwd，多目录 = 多根工作区
+
+### B. TS ESM `.js` 后缀 import 解析修复
+
+* `resolveImport`：`./x.js` 探测失败时剥离 `.js/.mjs/.cjs` 后缀再探测（tsc emit 约定——源里写 `.js` 实指 `.ts`）；真实 `.js` 文件仍优先命中（原样候选在前）
+
+* `IMPORT_RESOLVER_VERSION` 纳入结构指纹——解析逻辑升级后旧持久化 import 种子整体弃用重建，杜绝陈旧边
+
+### 验收
+
+* 新增测试：TS ESM 后缀解析（.js→.ts / 目录 index.js / 真实 .js 优先）/ 解析器版本门控 / context stats 多根报告；typecheck 零错误 / 320 测试全绿（310 + 10）
+
+***
+
+## V5.17 — 2026-08-30 — 多根 CODEX.md 规则合并
+
+> 多根工作区只有主根的 CODEX.md 生效——其余根的项目规则全部静默丢失。
+
+### A. `loadCodexRules`（agent-loop.ts）
+
+* 多根逐根加载 CODEX.md，标签标注根名（`[项目规则 — CODEX.md（backend）]`），Agent 可区分规则归属根
+
+* 用户级 `~/.codex/CODEX.md` 兜底不变；单根行为与旧版完全一致（标签无根名）
+
+### 验收
+
+* 新增 workspace-wiring 测试：多根规则合并注入系统提示词 / 单根向后兼容；typecheck 零错误
+
+***
+
 ## V5.16 — 2026-08-30 — 索引持久化格式 v2（imports 种子 + 多根/别名元数据）
 
 > v1 只持久化符号——import 图每次冷启动都要逐文件读盘重解析；

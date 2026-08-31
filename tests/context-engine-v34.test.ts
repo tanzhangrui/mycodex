@@ -606,3 +606,162 @@ describe('getSharedContextEngine（内核唯一）', () => {
     expect(a).not.toBe(b);
   });
 });
+
+// ---- V5.19 反向依赖 + re-export 链 ----
+
+describe('V5.19 反向依赖索引 + re-export 链追踪', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v519-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    // widget.ts ← index.ts（barrel：export * from）← consumer.ts（真实消费者）
+    writeFileSync(join(r, 'src', 'widget.ts'), 'export class WidgetService {\n  mount(): void {}\n}\n');
+    writeFileSync(join(r, 'src', 'index.ts'), "export * from './widget';\nexport * from './helper';\n");
+    writeFileSync(join(r, 'src', 'consumer.ts'), "import { WidgetService } from './index';\nexport function render(): void {\n  new WidgetService().mount();\n}\n");
+    // 普通 import 链（非 re-export）：helper.ts ← a.ts ← b.ts
+    writeFileSync(join(r, 'src', 'helper.ts'), 'export function helperFn(): void {}\n');
+    writeFileSync(join(r, 'src', 'a.ts'), "import { helperFn } from './helper';\nexport const a = 1;\n");
+    writeFileSync(join(r, 'src', 'b.ts'), "import { a } from './a';\nexport const b = 2;\n");
+    // 多跳 barrel 链：deep.ts ← mid.ts（re-export）← top.ts（re-export）← app.ts（消费者）
+    mkdirSync(join(r, 'src', 'deep'), { recursive: true });
+    writeFileSync(join(r, 'src', 'deep', 'deep.ts'), 'export class DeepService {}\n');
+    writeFileSync(join(r, 'src', 'mid.ts'), "export { DeepService } from './deep/deep';\n");
+    writeFileSync(join(r, 'src', 'top.ts'), "export * from './mid';\n");
+    writeFileSync(join(r, 'src', 'app.ts'), "import { DeepService } from './top';\nexport const app = new DeepService();\n");
+
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('getImportedBy：直接一级 importer（barrel 转发源文件）', () => {
+    expect(e.getImportedBy('src/widget.ts')).toEqual(['src/index.ts']);
+    expect(e.getImportedBy('src/helper.ts').sort()).toEqual(['src/a.ts', 'src/index.ts']);
+    expect(e.getImportedBy('src/nonexistent.ts')).toEqual([]);
+  });
+
+  it('getImportedByExpanded：穿透 barrel 找到真实消费者', () => {
+    const expanded = e.getImportedByExpanded('src/widget.ts');
+    expect(expanded).toContain('src/index.ts'); // barrel 本身
+    expect(expanded).toContain('src/consumer.ts'); // 经 re-export 链的间接消费者
+  });
+
+  it('普通 import 不穿透（过度扩散防线）', () => {
+    // helper.ts ← a.ts 是普通 import：a.ts 的 importer b.ts 不算 helper 的使用点
+    const expanded = e.getImportedByExpanded('src/helper.ts');
+    expect(expanded).toContain('src/a.ts');
+    expect(expanded).not.toContain('src/b.ts');
+  });
+
+  it('多跳 re-export 链（export {…} from 与 export * from 混合）', () => {
+    const expanded = e.getImportedByExpanded('src/deep/deep.ts');
+    expect(expanded).toContain('src/mid.ts');
+    expect(expanded).toContain('src/top.ts');
+    expect(expanded).toContain('src/app.ts'); // 两跳 barrel 后的真实消费者
+  });
+
+  it('maxHops 截断：1 跳只见 barrel，穿不到消费者', () => {
+    const oneHop = e.getImportedByExpanded('src/deep/deep.ts', 1);
+    expect(oneHop).toContain('src/mid.ts');
+    expect(oneHop).not.toContain('src/app.ts');
+  });
+
+  it('refresh 后 re-export 边重建（删 barrel 后消费者不再穿透）', () => {
+    rmSync(join(r, 'src', 'index.ts'));
+    e.refresh();
+    expect(e.getImportedByExpanded('src/widget.ts')).toEqual([]); // barrel 没了，穿透链断
+    expect(e.getImportedBy('src/helper.ts')).toEqual(['src/a.ts']);
+    // 恢复现场，供后续用例
+    writeFileSync(join(r, 'src', 'index.ts'), "export * from './widget';\nexport * from './helper';\n");
+    e.refresh();
+  });
+
+  it('assembleContext：使用点召回含 barrel 消费者', () => {
+    const chunks = e.assembleContext('WidgetService', { maxTokens: 20_000 });
+    const paths = chunks.map((c) => c.path);
+    expect(paths).toContain('src/widget.ts'); // 定义（100）
+    expect(paths).toContain('src/consumer.ts'); // 真实使用点（≥20，可能叠加关键词/语义命中）
+    expect(paths).toContain('src/index.ts'); // barrel 使用点
+    expect(chunks.find((c) => c.path === 'src/consumer.ts')!.relevance).toBeGreaterThanOrEqual(20);
+  });
+
+  it('getRelatedFiles direction=both：源文件两跳穿到消费者', () => {
+    const related = e.getRelatedFiles(['src/widget.ts'], 2, 50, 'both');
+    expect(related).toContain('src/index.ts');
+    expect(related).toContain('src/consumer.ts');
+  });
+});
+
+// ---- V5.20 召回分解 ----
+
+describe('V5.20 debugRecall（四路召回分解）', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v520-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'order.ts'), 'export class OrderService {\n  refund(): void {}\n}\n');
+    writeFileSync(join(r, 'src', 'index.ts'), "export * from './order';\n");
+    writeFileSync(join(r, 'src', 'page.ts'), "import { OrderService } from './index';\nexport function renderRefund(o: OrderService): void {\n  o.refund();\n}\n");
+
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('分解字段齐全：逐路命中 + 最终组装', () => {
+    // 混合查询：order（文件名关键词 → 关键词召回）+ OrderService（符号前缀 → 符号召回）
+    const bd = e.debugRecall('order refund OrderService');
+    expect(bd.keywords.length).toBeGreaterThan(0);
+    expect(bd.symbols.some((s) => s.name === 'OrderService' && s.file === 'src/order.ts')).toBe(true);
+    expect(bd.semantic.length).toBeGreaterThan(0);
+    expect(bd.semantic.some((c) => c.path === 'src/index.ts')).toBe(true); // barrel 也被语义召回
+    expect(bd.keywordsHits.length).toBeGreaterThan(0);
+    expect(bd.keywordsHits.some((c) => c.path === 'src/order.ts')).toBe(true);
+    expect(bd.usageSites).toContain('src/page.ts'); // re-export 链穿透后的消费者
+    expect(bd.assembled.length).toBeGreaterThan(0);
+    expect(bd.assembled.some((c) => c.path === 'src/order.ts')).toBe(true);
+  });
+
+  it('related：种子文件 deps 1 跳（且排除已被其他路召回的种子）', () => {
+    // page render：命中 page.ts（符号前缀 + 文件名关键词），index.ts 不被其他路召回
+    const bd = e.debugRecall('page render');
+    expect(bd.symbols.some((s) => s.file === 'src/page.ts')).toBe(true);
+    expect(bd.related).toContain('src/index.ts'); // page.ts → deps 1 跳
+    // order 查询：semantic 已召回 index.ts → 它进种子集合，related 不重复出现
+    const bd2 = e.debugRecall('order refund OrderService');
+    expect(bd2.semantic.some((c) => c.path === 'src/index.ts')).toBe(true);
+    expect(bd2.related).not.toContain('src/index.ts');
+  });
+
+  it('usageSites 穿透 barrel（消费者经 index.ts 归位到真实使用点）', () => {
+    const bd = e.debugRecall('OrderService');
+    expect(bd.usageSites).toContain('src/index.ts');
+    expect(bd.usageSites).toContain('src/page.ts');
+  });
+
+  it('assembled 与 assembleContext 同参结果一致', () => {
+    const bd = e.debugRecall('OrderService refund', { maxTokens: 8_000 });
+    const direct = e.assembleContext('OrderService refund', { maxTokens: 8_000 });
+    expect(bd.assembled.map((c) => `${c.path}:${c.startLine}`)).toEqual(
+      direct.map((c) => `${c.path}:${c.startLine}`),
+    );
+  });
+
+  it('无命中查询：各路为空、组装为空（不抛错）', () => {
+    const bd = e.debugRecall('zzzqqqxxx');
+    expect(bd.symbols).toEqual([]);
+    expect(bd.semantic).toEqual([]);
+    expect(bd.usageSites).toEqual([]);
+    expect(bd.assembled).toEqual([]);
+  });
+});

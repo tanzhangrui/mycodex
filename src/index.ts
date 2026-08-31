@@ -817,6 +817,89 @@ async function handleDoctor(): Promise<void> {
   }
 }
 
+// ---- V5.20 召回分解调试 ----
+
+/**
+ * `codex context query <查询> [目录...] [--cwd <路径>]`
+ * 与 assembleContext 相同的召回链路，逐路展示命中明细 + 最终组装结果。
+ */
+async function handleContextQuery(args: string[]): Promise<void> {
+  // 参数解析：首参数为查询；其余非 flag 参数为目录；--cwd <路径> 可选
+  const positional = args.filter((a) => !a.startsWith('-'));
+  const q = positional[0];
+  const targets = positional.slice(1);
+  const cwdIdx = args.indexOf('--cwd');
+  const cwdArg = cwdIdx !== -1 ? args[cwdIdx + 1] : undefined;
+
+  if (!q) {
+    console.log('用法: codex context query <查询> [目录...]（--cwd <路径> 模拟邻近加权）');
+    return;
+  }
+
+  const workingDir: string | string[] =
+    targets.length > 1 ? targets.map((t) => resolve(t)) : resolve(targets[0] ?? '.');
+
+  const engine = new ContextEngine();
+  try {
+    await engine.index(workingDir);
+  } catch (err) {
+    console.error(`错误: 索引失败 — ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  // cwd → 键空间路径（与 agent-loop 接线一致）
+  let cwdKey: string | undefined;
+  if (cwdArg) {
+    const key = engine.absToKey(resolve(cwdArg));
+    if (key) cwdKey = key || undefined;
+  }
+
+  const bd = engine.debugRecall(q, { maxTokens: 8_000, cwd: cwdKey });
+
+  console.log(`Codex v${VERSION} 召回分解`);
+  console.log(`  查询: ${q}`);
+  console.log(`  关键词: ${bd.keywords.length > 0 ? bd.keywords.join(', ') : '（无）'}${cwdKey ? `  cwd 加权: ${cwdKey}` : ''}`);
+  console.log('');
+
+  // 1) 符号
+  console.log(`[符号命中]（${bd.symbols.length}）`);
+  if (bd.symbols.length === 0) console.log('  （无）');
+  for (const s of bd.symbols) {
+    console.log(`  ${s.name} — ${s.kind} — ${s.file}:${s.line}`);
+  }
+
+  // 2) 语义
+  console.log(`[语义召回]（${bd.semantic.length}，token 覆盖率）`);
+  if (bd.semantic.length === 0) console.log('  （无）');
+  for (const c of bd.semantic) {
+    console.log(`  ${c.path} — 覆盖率 ${(c.relevance * 100).toFixed(0)}% — L${c.startLine}-${c.endLine}`);
+  }
+
+  // 3) 关键词
+  console.log(`[关键词召回]（${bd.keywordsHits.length}，内容窗口）`);
+  if (bd.keywordsHits.length === 0) console.log('  （无）');
+  for (const c of bd.keywordsHits) {
+    console.log(`  ${c.path} — 得分 ${c.relevance} — L${c.startLine}-${c.endLine}`);
+  }
+
+  // 4) import 图
+  console.log(`[import 图 1 跳]（${bd.related.length}）`);
+  if (bd.related.length === 0) console.log('  （无）');
+  for (const f of bd.related) console.log(`  ${f}`);
+
+  // 5) 使用点
+  console.log(`[使用点]（${bd.usageSites.length}，符号定义文件的 importers，含 re-export 链穿透 barrel）`);
+  if (bd.usageSites.length === 0) console.log('  （无）');
+  for (const f of bd.usageSites) console.log(`  ${f}`);
+
+  // 6) 最终组装
+  console.log(`[最终组装]（${bd.assembled.length} 块，预算 8K tokens）`);
+  if (bd.assembled.length === 0) console.log('  （无——四路均未命中）');
+  bd.assembled.forEach((c, i) => {
+    console.log(`  ${i + 1}. ${c.path} — relevance ${c.relevance} — L${c.startLine}-${c.endLine}`);
+  });
+}
+
 // ---- V5.18 上下文引擎体检 ----
 
 /**
@@ -824,11 +907,21 @@ async function handleDoctor(): Promise<void> {
  * 索引/缓存/召回体检：多根元数据、文件与符号规模、import 边、别名表、
  * 持久化缓存命中状态（版本/结构指纹/种子数）、符号 top-5 文件。
  * 目录参数缺省 cwd；多个目录 = 多根工作区。
+ *
+ * V5.20 `codex context query <查询> [目录...] [--cwd <路径>]`
+ * 四路召回分解：符号/语义/关键词/import 图/使用点逐路展示命中明细 +
+ * 最终组装结果（含 cwd 邻近加权效果）——调试"为什么召回/没召回"。
  */
 async function handleContext(args: string[]): Promise<void> {
   const sub = args[0];
+  if (sub === 'query') {
+    await handleContextQuery(args.slice(1));
+    return;
+  }
   if (sub !== 'stats') {
-    console.log('用法: codex context stats [目录...]（缺省当前目录；多目录 = 多根工作区）');
+    console.log('用法:');
+    console.log('  codex context stats [目录...]        索引/缓存体检（缺省当前目录；多目录 = 多根）');
+    console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权）');
     return;
   }
 

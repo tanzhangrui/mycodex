@@ -115,6 +115,24 @@ export interface ContextReport {
   topFiles: Array<{ path: string; symbols: number; size: number }>;
 }
 
+/** V5.20 四路召回分解（`codex context query` 数据源） */
+export interface RecallBreakdown {
+  /** 查询提取的关键词 */
+  keywords: string[];
+  /** 符号召回：定义位置 */
+  symbols: SymbolEntry[];
+  /** 语义召回：token 覆盖率命中 */
+  semantic: ContextChunk[];
+  /** 关键词召回：内容窗口命中 */
+  keywordsHits: ContextChunk[];
+  /** import 图 1 跳扩展 */
+  related: string[];
+  /** V5.19 使用点：符号定义文件的 importers（re-export 链穿透 barrel） */
+  usageSites: string[];
+  /** 最终组装结果（含 cwd 加权 + 预算裁剪） */
+  assembled: ContextChunk[];
+}
+
 // ---- 常量 ----
 
 /** 单文件符号解析的大小上限（512KB） */
@@ -231,6 +249,16 @@ const TS_IMPORT_RES: RegExp[] = [
 const PY_IMPORT_RES: RegExp[] = [
   /from\s+([.\w]+)\s+import\s/g,
   /import\s+([\w.]+)/g,
+];
+
+/**
+ * V5.19 re-export 说明符（TS/JS barrel 形态）：
+ * `export * from './x'` / `export * as ns from './x'` / `export { a, b } from './x'`。
+ * 与 import 边分开维护——import 边用于依赖扩展，re-export 边用于"穿透 barrel 找真实消费者"。
+ */
+const TS_REEXPORT_RES: RegExp[] = [
+  /export\s+\*\s*(?:as\s+[\w$]+)?\s*from\s*['"]([^'"]+)['"]/g,
+  /export\s*\{[^}]*\}\s*from\s*['"]([^'"]+)['"]/g,
 ];
 
 /**
@@ -534,6 +562,7 @@ export class ContextEngine {
     this.persistedImports = new Map();
     this.persistedInfo = null;
     this.symbolIndex = null;
+    this.reverseIndex = null;
 
     const files: FileIndexEntry[] = [];
     this.scanAllRoots(files);
@@ -673,6 +702,8 @@ export class ContextEngine {
 
     this.applyFileList(files);
     this.symbolIndex = null;
+    this.reverseIndex = null; // V5.19：文件增删改会影响反向边，重建
+    this.reExportIndex = null; // V5.19：re-export 边同理，重建
   }
 
   /** 失效单文件的全部派生缓存 */
@@ -1100,9 +1131,17 @@ export class ContextEngine {
   }
 
   /**
-   * import 图 BFS：从种子文件出发收集相关文件（直接依赖优先）
+   * import 图 BFS：从种子文件出发收集相关文件（直接依赖优先）。
+   * V5.19 direction：'deps'（默认，文件 → 其 import，旧行为）/ 'importers'
+   * （文件 → 谁 import 它，反向）/ 'both'（双向合并）——barrel 场景 'both' 两跳
+   * 即可从源文件穿到 barrel 再穿到消费者（re-export 链路天然打通）。
    */
-  getRelatedFiles(seedFiles: string[], maxHops = 1, maxFiles = IMPORT_EXPAND_MAX_FILES): string[] {
+  getRelatedFiles(
+    seedFiles: string[],
+    maxHops = 1,
+    maxFiles = IMPORT_EXPAND_MAX_FILES,
+    direction: 'deps' | 'importers' | 'both' = 'deps',
+  ): string[] {
     if (!this.indexed) return [];
 
     const results: string[] = [];
@@ -1112,7 +1151,13 @@ export class ContextEngine {
     for (let hop = 0; hop < maxHops; hop++) {
       const next: string[] = [];
       for (const file of frontier) {
-        for (const dep of this.parseImports(file)) {
+        const edges =
+          direction === 'deps'
+            ? this.parseImports(file)
+            : direction === 'importers'
+              ? this.getImportedBy(file)
+              : [...this.parseImports(file), ...this.getImportedBy(file)];
+        for (const dep of edges) {
           if (!visited.has(dep)) {
             visited.add(dep);
             next.push(dep);
@@ -1124,6 +1169,123 @@ export class ContextEngine {
       if (results.length >= maxFiles) break;
     }
     return results.slice(0, maxFiles);
+  }
+
+  // ---- V5.19 反向依赖索引（imported-by） ----
+
+  /**
+   * 反向依赖索引：文件 → 直接 import 它的文件列表。
+   * 惰性构建（首次反向查询触发），全量解析源码文件 imports（含持久化种子），
+   * 与符号索引同一文件集边界（源码扩展名 + 512KB 上限 + 3000 文件上限）。
+   * refresh 时置空重建（任一文件 imports 变化都会影响反向边）。
+   */
+  private reverseIndex: Map<string, string[]> | null = null;
+
+  private buildReverseIndex(): Map<string, string[]> {
+    if (this.reverseIndex) return this.reverseIndex;
+
+    const index = new Map<string, string[]>();
+    let scanned = 0;
+    for (const entry of this.fileIndex) {
+      if (scanned >= SYMBOL_INDEX_MAX_FILES) break;
+      if (!SOURCE_EXTS.has(extOf(entry.path))) continue;
+      if (entry.size > SYMBOL_FILE_MAX_BYTES) continue;
+      scanned++;
+      for (const dep of this.parseImports(entry.path)) {
+        const list = index.get(dep);
+        if (list) {
+          if (!list.includes(entry.path)) list.push(entry.path);
+        } else {
+          index.set(dep, [entry.path]);
+        }
+      }
+    }
+    this.reverseIndex = index;
+    return index;
+  }
+
+  /** V5.19 谁 import 了此文件（直接一级，键空间路径） */
+  getImportedBy(relPath: string): string[] {
+    if (!this.indexed) return [];
+    return [...(this.buildReverseIndex().get(normalizeRelPath(relPath)) ?? [])];
+  }
+
+  /**
+   * V5.19 re-export 链索引：被 re-export 的文件 → 转发它的 barrel 文件集合。
+   * `index.ts` 里 `export * from './widget'` → widget.ts → { index.ts }。
+   * 惰性构建，refresh 时随 reverseIndex 一同置空重建。
+   */
+  private reExportIndex: Map<string, Set<string>> | null = null;
+
+  private buildReExportIndex(): Map<string, Set<string>> {
+    if (this.reExportIndex) return this.reExportIndex;
+
+    const index = new Map<string, Set<string>>();
+    let scanned = 0;
+    for (const entry of this.fileIndex) {
+      if (scanned >= SYMBOL_INDEX_MAX_FILES) break;
+      if (!SOURCE_EXTS.has(extOf(entry.path))) continue;
+      if (entry.size > SYMBOL_FILE_MAX_BYTES) continue;
+      scanned++;
+
+      const lang = this.langOf(entry.path);
+      if (lang !== 'ts') continue; // re-export 是 TS/JS barrel 语义（Python __init__ 转发由 import 边覆盖）
+
+      const content = this.getFileContent(entry.path);
+      if (!content) continue;
+
+      for (const re of TS_REEXPORT_RES) {
+        re.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(content)) !== null) {
+          const spec = m[1];
+          // 相对说明符恒解析；裸说明符走别名表（跨根 barrel）
+          const target = this.resolveImport(entry.path, spec, 'ts');
+          if (target && target !== entry.path) {
+            const set = index.get(target);
+            if (set) set.add(entry.path);
+            else index.set(target, new Set([entry.path]));
+          }
+        }
+      }
+    }
+    this.reExportIndex = index;
+    return index;
+  }
+
+  /** importer 是否对 target 做 re-export（barrel 转发判定） */
+  private isReExportOf(importer: string, target: string): boolean {
+    return (this.buildReExportIndex().get(target) ?? new Set()).has(normalizeRelPath(importer));
+  }
+
+  /**
+   * V5.19 re-export 链追踪：穿过 barrel 的间接 importer（真实消费者）。
+   * 链路：widget.ts ← index.ts（`export * from './widget'`）← consumer.ts
+   * `getImportedBy('widget.ts')` 只见 index.ts——消费者 import 的是 barrel 不是源文件；
+   * expanded 穿透 barrel 连带 consumer.ts。穿透条件严格限定 re-export 边
+   * （普通 import 不穿透，避免"传递依赖全算使用点"的过度扩散），默认 3 跳防环。
+   */
+  getImportedByExpanded(relPath: string, maxHops = 3): string[] {
+    if (!this.indexed) return [];
+    const start = normalizeRelPath(relPath);
+    const results = new Set<string>();
+    const visited = new Set<string>([start]);
+    let frontier = [start];
+
+    for (let hop = 0; hop < maxHops && frontier.length > 0; hop++) {
+      const next: string[] = [];
+      for (const file of frontier) {
+        for (const importer of this.getImportedBy(file)) {
+          results.add(importer);
+          if (!visited.has(importer) && this.isReExportOf(importer, file)) {
+            visited.add(importer);
+            next.push(importer); // barrel 转发：barrel 的消费者也是源文件的间接使用点
+          }
+        }
+      }
+      frontier = next;
+    }
+    return [...results];
   }
 
   // ---- 四路召回融合 ----
@@ -1283,6 +1445,23 @@ export class ContextEngine {
       const chunk = this.chunkAroundLine(file, 1, 60);
       if (chunk) {
         chunk.relevance = 5;
+        byPath.set(file, chunk);
+      }
+    }
+
+    // 4b) V5.19 使用点召回：符号定义文件的 importers（调用方/消费方），
+    // 经 re-export 链穿透 barrel（消费者 import 的常是 index.ts 而非源文件）。
+    // "改这个函数会影响谁"是高频上下文需求——定义处 + 使用处一并注入。
+    const usageSeeds = new Set<string>();
+    for (const sym of symbolHits) {
+      for (const importer of this.getImportedByExpanded(sym.file)) {
+        if (!byPath.has(importer)) usageSeeds.add(importer);
+      }
+    }
+    for (const file of usageSeeds) {
+      const chunk = this.chunkAroundLine(file, 1, 40);
+      if (chunk) {
+        chunk.relevance = 20; // 使用点：低于定义（100）高于普通依赖扩展（5）
         byPath.set(file, chunk);
       }
     }
@@ -1761,6 +1940,39 @@ export class ContextEngine {
    */
   fuzzySearchFile(query: string): string[] {
     return this.fileTrie.fuzzySearch(query);
+  }
+
+  /**
+   * V5.20 四路召回分解（`codex context query` 数据源）。
+   * 与 assembleContext 相同的召回链路，但不合并——逐路展示命中明细，
+   * 用于调试"为什么召回/没召回某个文件"。
+   */
+  debugRecall(query: string, opts: AssembleOptions = {}): RecallBreakdown {
+    const keywords = this.extractKeywords(query);
+    const symbols = this.resolveQuerySymbols(query);
+    const semantic = this.semanticRecall(query);
+    const keywordChunks = this.keywordRecall(keywords);
+
+    const seeds = [
+      ...symbols.map((s) => s.file),
+      ...keywordChunks.map((c) => c.path),
+      ...semantic.map((c) => c.path),
+      ...(opts.seedFiles ?? []).map(normalizeRelPath),
+    ].filter((p) => this.filePathSet.has(p));
+    const related = this.getRelatedFiles([...new Set(seeds)], 1, IMPORT_EXPAND_MAX_FILES);
+
+    // V5.19 使用点：符号定义文件的 importers（re-export 链穿透 barrel）
+    const usageSites = [...new Set(symbols.flatMap((s) => this.getImportedByExpanded(s.file)))];
+
+    return {
+      keywords,
+      symbols,
+      semantic,
+      keywordsHits: keywordChunks,
+      related,
+      usageSites,
+      assembled: this.assembleContext(query, opts),
+    };
   }
 
   /**
