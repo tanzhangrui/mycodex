@@ -821,13 +821,15 @@ async function handleDoctor(): Promise<void> {
 // ---- V5.23 单文件召回诊断 ----
 
 /**
- * `codex context why <文件> <查询> [目录...] [--cwd <路径>] [--recent]`
+ * `codex context why <文件> <查询> [目录...] [--cwd <路径>] [--recent] [--json]`
  * 单文件反查四路召回贡献：命中哪几路、每路得分、未召回的具体原因。
  * --recent：接入 git 最近变更加权（与 agent-loop 接线一致）。
+ * --json：机器可读输出（脚本/CI 消费，与 context query --json 同约定）。
  */
 async function handleContextWhy(args: string[]): Promise<void> {
   const cwdIdx = args.indexOf('--cwd');
   const useRecent = args.includes('--recent');
+  const useJson = args.includes('--json');
   const positional = args.filter((a, i) => !a.startsWith('-') && !(cwdIdx !== -1 && i === cwdIdx + 1));
   const file = positional[0];
   const q = positional[1];
@@ -835,7 +837,7 @@ async function handleContextWhy(args: string[]): Promise<void> {
   const cwdArg = cwdIdx !== -1 ? args[cwdIdx + 1] : undefined;
 
   if (!file || !q) {
-    console.log('用法: codex context why <文件> <查询> [目录...]（--cwd <路径> 邻近加权，--recent git 变更加权）');
+    console.log('用法: codex context why <文件> <查询> [目录...]（--cwd <路径> 邻近加权，--recent git 变更加权，--json 机器可读输出）');
     return;
   }
 
@@ -856,7 +858,10 @@ async function handleContextWhy(args: string[]): Promise<void> {
   if (!engine.getFileContent(fileKey)) {
     const fuzzy = engine.fuzzySearchFile(basename(fileKey));
     if (fuzzy.length > 0) {
-      console.log(`! 文件不在索引: ${fileKey}（近邻: ${fuzzy.slice(0, 3).join(', ')}）`);
+      // --json 模式提示走 stderr——stdout 必须是干净的单 JSON 文档
+      const line = `! 文件不在索引: ${fileKey}（近邻: ${fuzzy.slice(0, 3).join(', ')}）`;
+      if (useJson) console.error(line);
+      else console.log(line);
     }
   }
 
@@ -872,6 +877,12 @@ async function handleContextWhy(args: string[]): Promise<void> {
     : undefined;
 
   const why = engine.explainRecall(q, fileKey, { maxTokens: 8_000, cwd: cwdKey, recentFiles: recentKeys });
+
+  // V5.26 --json：单 JSON 文档（FileRecallExplanation 全字段），stdout 干净可管道
+  if (useJson) {
+    console.log(JSON.stringify({ version: VERSION, query: q, ...why }, null, 2));
+    return;
+  }
 
   console.log(`Codex v${VERSION} 单文件召回诊断`);
   console.log(`  文件: ${why.file}  查询: ${q}`);
@@ -1066,7 +1077,7 @@ async function handleContext(args: string[]): Promise<void> {
     console.log('用法:');
     console.log('  codex context stats [目录...]        索引/缓存体检（缺省当前目录；多目录 = 多根）');
     console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
-    console.log('  codex context why <文件> <查询> [目录...]  单文件召回诊断（--recent 接入 git 变更加权）');
+    console.log('  codex context why <文件> <查询> [目录...]  单文件召回诊断（--recent 接入 git 变更加权，--json 机器可读输出）');
     return;
   }
 

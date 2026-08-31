@@ -13,7 +13,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { join, resolve, basename } from 'node:path';
+import { join, resolve, basename, isAbsolute } from 'node:path';
 import type { AIProvider } from '../utils/ai-client.js';
 import { TOOL_SYSTEM_PROMPT } from '../utils/ai-client.js';
 import { toolRegistry, type ToolContext } from '../tools/registry.js';
@@ -212,10 +212,28 @@ export async function runAgentLoop(
   const conversationMessages: Message[] = [...messages];
 
   // 构建工具上下文（多根时工具相对路径以主根为基准）
+  // V5.25 会话活动记录：read/write 工具触达的文件反馈到下一轮召回加权
+  // （与 buildSystemPrompt 共享同一引擎实例；记录失败静默降级，绝不阻断工具）
+  const activityEngine = getSharedContextEngine(workingDir);
+  const primaryRoot = primaryRootOf(workingDir);
+  const recordActivity = (p: string): void => {
+    if (!activityEngine) return;
+    try {
+      activityEngine.recordSessionActivity(isAbsolute(p) ? p : resolve(primaryRoot, p));
+    } catch {
+      // 活动记录失败不影响工具执行
+    }
+  };
   const toolContext: ToolContext = {
-    workingDir: primaryRootOf(workingDir),
-    readFile: (path) => fs.read(path),
-    writeFile: (path, content) => fs.write(path, content),
+    workingDir: primaryRoot,
+    readFile: (path) => {
+      recordActivity(path);
+      return fs.read(path);
+    },
+    writeFile: (path, content) => {
+      recordActivity(path);
+      return fs.write(path, content);
+    },
     listFiles: (dir, depth) => fs.list(dir, depth),
     searchContent: (pattern, path, glob) => fs.search(pattern, path, glob),
     confirm: async () => true,

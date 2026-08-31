@@ -178,6 +178,8 @@ const KEYWORD_CANDIDATE_LIMIT = 20;
 const IMPORT_EXPAND_MAX_FILES = 3;
 /** LRU 缓存大小 */
 const LRU_SIZE = 200;
+/** V5.25 会话活动记录上限（FIFO，超出淘汰最旧） */
+const SESSION_ACTIVITY_MAX_FILES = 50;
 
 // ---- V3.4 语义检索（n-gram token 覆盖率匹配） ----
 
@@ -554,6 +556,13 @@ export class ContextEngine {
   private memoryStore: MemoryEntry[] = [];
   private rules: CodexRule[] = [];
   private indexed = false;
+
+  /**
+   * V5.25 会话活动记录（键空间路径，最近操作在后）。
+   * Agent 本会话内通过工具读过/改过的文件——"刚亲手操作过"比 git 变更更近的相关性信号。
+   * FIFO 上限 50：长会话防膨胀，淘汰最旧的活动；重复操作移到队尾（保"最近"语义）。
+   */
+  private sessionActivityKeys: string[] = [];
 
   /** V3.4 持久化写盘串行链 + 防重入标记 */
   private saveChain: Promise<void> = Promise.resolve();
@@ -1579,6 +1588,16 @@ export class ContextEngine {
       }
     }
 
+    // V5.25 会话活动加权：本会话刚通过工具读过/改过的文件 +12
+    // （略高于 git 变更 +10——"刚刚亲手操作"是比"最近一轮提交工作"更近的信号；
+    // 与 cwd/git recent 同一原则：只改排序不改召回集合）
+    if (this.sessionActivityKeys.length > 0) {
+      const activeSet = new Set(this.sessionActivityKeys);
+      for (const chunk of byPath.values()) {
+        if (activeSet.has(chunk.path)) chunk.relevance += 12;
+      }
+    }
+
     // 排序 + 预算裁剪
     const chunks = [...byPath.values()].sort((a, b) => b.relevance - a.relevance);
     let totalTokens = 0;
@@ -2073,6 +2092,33 @@ export class ContextEngine {
       usageSites,
       assembled: this.assembleContext(query, opts),
     };
+  }
+
+  /**
+   * V5.25 记录会话活动文件（绝对路径；Agent 工具 read/write/edit 的挂点）。
+   * 越界 / 未索引路径静默忽略；重复操作移到队尾（保"最近"语义）；
+   * FIFO 上限 50，超出淘汰最旧活动。返回是否成功入队。
+   */
+  recordSessionActivity(absPath: string): boolean {
+    const key = this.absToKey(absPath);
+    if (!key) return false;
+    const i = this.sessionActivityKeys.indexOf(key);
+    if (i !== -1) this.sessionActivityKeys.splice(i, 1);
+    this.sessionActivityKeys.push(key);
+    if (this.sessionActivityKeys.length > SESSION_ACTIVITY_MAX_FILES) {
+      this.sessionActivityKeys.splice(0, this.sessionActivityKeys.length - SESSION_ACTIVITY_MAX_FILES);
+    }
+    return true;
+  }
+
+  /** V5.25 当前会话活动文件（键空间路径，最近操作在后；快照拷贝） */
+  getSessionActivity(): string[] {
+    return [...this.sessionActivityKeys];
+  }
+
+  /** V5.25 清空会话活动（新会话 / 测试隔离用） */
+  clearSessionActivity(): void {
+    this.sessionActivityKeys = [];
   }
 
   /**

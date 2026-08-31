@@ -5,6 +5,50 @@
 
 ***
 
+## V5.26 — 2026-08-31 — `codex context why --json`
+
+> 诊断数据只有人读格式——CI / 脚本想消费"这个文件为什么没被召回"得解析中文文本。
+
+### A. CLI `codex context why <文件> <查询> [--json]`
+
+* stdout 输出单 JSON 文档（version/query + FileRecallExplanation 全字段），与 `context query --json` 同约定
+
+* "文件不在索引"的近邻提示走 stderr——**stdout 必须是干净的单 JSON 文档**（机器可读输出的红线，同 dotenv 横幅教训）
+
+### 验收
+
+* CLI 冒烟：正常文件与未索引文件两种路径均可被 `JSON.parse` 解析；typecheck 零错误 / **353 测试全绿**（348 + 5，含 V5.25 的 5 项）
+
+***
+
+## V5.25 — 2026-08-31 — 会话活动加权（session activity weighting）
+
+> git 变更是"最近一轮工作"——但 Agent 本会话刚通过工具读过/改过的文件
+> 是更近、更精准的相关性信号，此前没有反馈回路：工具读了一个文件，
+> 下一轮召回可能又把它排在无关文件后面。
+
+### A. 引擎 API（context-engine.ts）
+
+* `recordSessionActivity(absPath)`：绝对路径 → 键空间（越界静默拒绝）；重复操作移到队尾（保"最近"语义）；FIFO 上限 50（防长会话膨胀）
+
+* `getSessionActivity()` / `clearSessionActivity()`：诊断与隔离接口
+
+* `assembleContext` 排序前加权：活动文件 relevance **+12**（略高于 git 变更 +10——"刚刚亲手操作"是比"最近一轮提交工作"更近的信号；与 cwd/git recent 同一原则：只改排序不改召回集合）
+
+### B. agent-loop 接线
+
+* `toolContext.readFile / writeFile` 包装记录触达文件（相对路径按主根 resolve）——所有读写工具（read_file / write_file / edit_file…）统一挂点，无需逐工具解析参数
+
+* 与 `buildSystemPrompt` 共享同一引擎实例：本轮工具活动在**下一轮**会话组装时生效（systemPrompt 每轮会话构建一次，循环内不重组装）；记录失败静默降级，绝不阻断工具执行
+
+### 验收
+
+* 新增 5 项测试：+12 反超排序（召回集合不变量）/ 越界路径拒绝 / 重复移队尾 + 清空 / FIFO 55→50 淘汰最旧 / **agent-loop 真实接线**（MockProvider 触发 read_file → 共享引擎会话活动含目标文件）
+
+* typecheck 零错误 / 353 测试全绿
+
+***
+
 ## V5.24 — 2026-08-31 — git 最近变更加权（recent-change weighting）
 
 > "正在改的文件几乎总是相关上下文"——agent 每轮组装时用户工作区里躺着的

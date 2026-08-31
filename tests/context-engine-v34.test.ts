@@ -1004,3 +1004,127 @@ describe('V5.24 git 最近变更加权', () => {
 function isAbsoluteWinOrPosix(p: string): boolean {
   return /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('/');
 }
+
+// ---- V5.25 会话活动加权 ----
+
+describe('V5.25 会话活动加权（recordSessionActivity）', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v525-'));
+    writeFileSync(join(r, 'a-note.ts'), 'export const noteAlpha = 1;\n');
+    writeFileSync(join(r, 'b-note.ts'), 'export const noteBeta = 2;\n');
+    // 抹平 mtime：基线稳定排序（a 在前），加权后才能断言反超
+    const t = new Date();
+    utimesSync(join(r, 'a-note.ts'), t, t);
+    utimesSync(join(r, 'b-note.ts'), t, t);
+
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('活动文件 +12 反超排序（召回集合不变，只改排序）', () => {
+    const base = e.assembleContext('note', { maxTokens: 20_000 });
+    expect(base.map((c) => c.path)).toEqual(['a-note.ts', 'b-note.ts']); // 基线：a 在前
+
+    expect(e.recordSessionActivity(join(r, 'b-note.ts'))).toBe(true);
+    const boosted = e.assembleContext('note', { maxTokens: 20_000 });
+    expect(boosted[0].path).toBe('b-note.ts'); // +12 反超
+    expect(boosted[0].relevance).toBe(base.find((c) => c.path === 'b-note.ts')!.relevance + 12);
+    expect(new Set(boosted.map((c) => c.path))).toEqual(new Set(['a-note.ts', 'b-note.ts']));
+  });
+
+  it('越界路径拒绝（不污染活动记录）', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'codex-v525out-'));
+    expect(e.recordSessionActivity(join(outside, 'x.ts'))).toBe(false);
+    expect(e.getSessionActivity()).not.toContain('x.ts');
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('重复操作移到队尾（保"最近"语义）+ clearSessionActivity 清空', () => {
+    e.clearSessionActivity();
+    e.recordSessionActivity(join(r, 'a-note.ts'));
+    e.recordSessionActivity(join(r, 'b-note.ts'));
+    e.recordSessionActivity(join(r, 'a-note.ts')); // 重复
+    expect(e.getSessionActivity()).toEqual(['b-note.ts', 'a-note.ts']); // a 移到队尾
+    e.clearSessionActivity();
+    expect(e.getSessionActivity()).toEqual([]);
+  });
+
+  it('FIFO 上限：第 51 个挤掉最旧的（防长会话膨胀）', async () => {
+    const r2 = mkdtempSync(join(tmpdir(), 'codex-v525fifo-'));
+    const files: string[] = [];
+    for (let i = 0; i < 55; i++) {
+      const name = `f${String(i).padStart(3, '0')}.ts`;
+      files.push(name);
+      writeFileSync(join(r2, name), `export const v${i} = ${i};\n`);
+    }
+    const e2 = new ContextEngine();
+    await e2.index(r2);
+    for (const name of files) e2.recordSessionActivity(join(r2, name));
+    const activity = e2.getSessionActivity();
+    expect(activity).toHaveLength(50);
+    expect(activity[0]).toBe('f005.ts'); // 最旧的 5 个被淘汰
+    expect(activity[activity.length - 1]).toBe('f054.ts'); // 最新在队尾
+    rmSync(r2, { recursive: true, force: true });
+  });
+});
+
+// ---- V5.25 agent-loop 接线 ----
+
+describe('V5.25 agent-loop 会话活动接线（工具 read/write 反馈召回）', () => {
+  it('工具 readFile/writeFile 触达的文件进入共享引擎会话活动', async () => {
+    const { clearTools, registerBuiltinTools } = await import('../src/tools/builtin.js');
+    const { MockProvider } = await import('../src/utils/ai-client.js');
+    const { runAgentLoop } = await import('../src/core/agent-loop.js');
+    const { InMemoryFileSystem } = await import('../src/core/in-memory-fs.js');
+    const { getSharedContextEngine, resetSharedContextEngine } = await import(
+      '../src/context/context-engine.js'
+    );
+
+    const r = mkdtempSync(join(tmpdir(), 'codex-v525wire-'));
+    // MockProvider 脚本硬编码 read_file src/index.ts 与 src/config/config.ts——目录结构对齐
+    mkdirSync(join(r, 'src', 'config'), { recursive: true });
+    writeFileSync(join(r, 'src', 'index.ts'), 'export const wired = 1;\n');
+    writeFileSync(join(r, 'src', 'config', 'config.ts'), 'export const other = 2;\n');
+    process.env.CODEX_CONFIG_PATH = join(tmpdir(), `codex-v525cfg-${Date.now()}`);
+
+    clearTools();
+    registerBuiltinTools();
+    resetSharedContextEngine();
+
+    const fs = new InMemoryFileSystem();
+    await fs.snapshot(r);
+    const callbacks = {
+      onTextDelta: () => {},
+      onToolUse: () => {},
+      onToolResult: () => {},
+      onError: () => {},
+      onDone: () => {},
+    };
+    // MockProvider："读取 … 和 …"触发并行 read_file（见 ai-client MockProvider 脚本）
+    await runAgentLoop(
+      new MockProvider() as never,
+      [{ role: 'user', content: '读取 src/index.ts 和 config', timestamp: new Date().toISOString() }],
+      fs,
+      r,
+      callbacks,
+    );
+
+    const engine = getSharedContextEngine(r);
+    expect(engine).not.toBeNull();
+    const activity = engine!.getSessionActivity();
+    expect(activity.length).toBeGreaterThan(0); // 工具触达的文件被记录
+    expect(activity).toContain('src/index.ts');
+    expect(activity).toContain('src/config/config.ts');
+
+    rmSync(r, { recursive: true, force: true });
+    resetSharedContextEngine();
+    clearTools();
+  });
+});
