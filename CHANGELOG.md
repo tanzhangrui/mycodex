@@ -5,6 +5,45 @@
 
 ***
 
+## V5.41 — 2026-08-31 — 符号分层召回指标 + 逐对精确映射 + 持久化格式 v3
+
+> 混合统计下 27% 的未召回样本几乎全是局部符号（函数内 const / 类内方法）——
+> 它们天然难召回却拉低整体水位且无从归因。分层让导出 API（产品主线召回目标）
+> 单独进门禁，局部符号仅观测。冒烟自测又揪出两个真缺陷：持久化缓存丢
+> `exported` 标记（旧 v2 缓存缺省 false → 全仓库被判局部符号）、`--json`
+> 输出漏 `layers` 字段。
+
+### A. 符号 `exported` 标记 + 分层指标（context-engine.ts / bench.ts）
+
+* `SymbolEntry.exported?: boolean`：TS/JS 按 `export` 前缀声明判定，Python 按顶层（无缩进）def/class 判定；导出类的方法继承类导出性（公开 API），顶层函数体内误报的"方法"无类上下文 → false
+* `BenchMetrics.layers: { exported: RecallLayer; local: RecallLayer }`——分层统计 queries/at1/at3/at10/mrr；一致性：exported + local = 总体
+* 基线对比新增门禁：**导出层 Recall@3 回退即 fail**（总体持平也拦——局部符号改善掩盖导出层回退的情形）
+
+### B. 逐对精确映射（query-expand.ts）
+
+* `EXACT_PAIRS`：显式声明高置信 1:1 配对（登录→login、支付→pay、缓存→cache 等主翻译）
+* `pairDiscountOf(from, to)`：精确配对 → 0.6 满折扣；否则回落组规模分级；**任一词不在词典 → 0**（修复 `Math.max` 误抬词典内单侧词折扣的假阳性）
+* 组规模分级（V5.38）对多词组内所有配对一视同仁——逐对声明打破组粒度：多词组内的主翻译拿满折扣，近义成员保持保守
+
+### C. 持久化格式 v3（修复 exported 标记丢失）
+
+* **缺陷**：`serializeIndex` 序列化符号只保留 name/kind/file/line，`exported` 落盘即丢；旧 v2 缓存加载时缺省 false → 整个仓库的导出 API 全被判成局部符号，分层指标失真（实测自测仓库 30 样本全 local、导出层 0/0）
+* **修复**：格式升版 v3（符号携带 exported）；v1/v2 一律拒载重建（宁重建勿陈旧）；`serializeIndex` 补写 `exported` 字段
+* 回归测试：跨实例加载后导出符号仍为导出层（`resolveQuerySymbols('beta')` → `exported === true`）
+
+### D. `context bench --json` 补全字段
+
+* JSON 输出补 `layers`（分层指标）与样本级 `exported` 标记——此前仅文本输出有，JSON 消费方（CI 解析）拿不到分层门禁数据
+
+### 验收
+
+* 自测仓库 `--seed 42`：R@3 30/30、MRR 0.781、**导出层 6/6 满分**、局部层 24/28（天然难例）、负例 0/3 误召回；跨进程两轮运行指标完全一致（稳定采样）
+* 持久化 roundtrip：v3 缓存落盘 → 新进程加载 → 分层指标不退化
+* 新增测试：样本 exported 标记 / 分层一致性 / 导出层回退检测（总体持平也拦）/ pairDiscountOf 逐对语义（精确配对满折扣 / 近义回落 / 词典外归零）/ 持久化 v3 roundtrip
+* typecheck 零错误 / **446 测试全绿**（436 + 10）
+
+***
+
 ## V5.40 — 2026-08-31 — 负例探针重设计 + lock 文件排除（修复负例防线 3/3 误召回）
 
 > 本仓库自测 `context bench` 连续 FAIL：三个乱码探针全部误召回。

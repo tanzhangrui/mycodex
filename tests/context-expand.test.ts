@@ -10,6 +10,7 @@ import {
   EXPANSION_DISCOUNT_EXACT,
   EXPANSION_DISCOUNT_AMBIGUOUS,
   expansionDiscountOf,
+  pairDiscountOf,
 } from '../src/context/query-expand.js';
 import { tokenizeForEmbedding, ContextEngine } from '../src/context/context-engine.js';
 import { checkBaselineHealth, saveBaseline, runBench, type BenchMetrics } from '../src/context/bench.js';
@@ -18,10 +19,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 describe('V5.34 expandQuery（同义词扩展）', () => {
-  it('中文词扩展出英文命名（登录 → login/signin）', () => {
+  it('中文词扩展出英文命名（登录 → login 精确映射 / signin 低置信）', () => {
     const { tokens, expansions, sources } = expandQuery('登录');
     expect(tokens).toContain('登录');
-    expect(expansions.get('login')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS); // 组规模 3 → 低置信
+    // V5.41 逐对精确映射：登录→login 是主翻译（高置信），signin 仅近义（低置信）
+    expect(expansions.get('login')).toBe(EXPANSION_DISCOUNT_EXACT);
     expect(expansions.get('signin')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
     expect(sources.some((s) => s.from === '登录' && s.to.includes('login'))).toBe(true);
   });
@@ -88,11 +90,69 @@ describe('V5.38 expansionDiscountOf（组规模分级）', () => {
     expect(expansions.get('user')).toBe(EXPANSION_DISCOUNT_EXACT);
   });
 
-  it('sources 携带置信度（可观测）', () => {
+  it('sources 携带置信度（可观测；触发词级 = 逐对折扣均值）', () => {
     const { sources } = expandQuery('支付');
     const src = sources.find((s) => s.from === '支付');
     expect(src).toBeDefined();
-    expect(src!.discount).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
+    // 支付组配对：pay（精确映射 0.6）/ payment（0.3）/ charge（0.3）→ 均值 0.4
+    expect(src!.discount).toBe(0.4);
+  });
+});
+
+// ---- V5.41 逐对精确映射 ----
+
+describe('V5.41 pairDiscountOf（逐对精确映射）', () => {
+  it('精确配对满折扣：登录→login 拿 EXACT（组规模 3 也不例外）', () => {
+    expect(pairDiscountOf('登录', 'login')).toBe(EXPANSION_DISCOUNT_EXACT);
+    expect(pairDiscountOf('支付', 'pay')).toBe(EXPANSION_DISCOUNT_EXACT);
+    expect(pairDiscountOf('保存', 'save')).toBe(EXPANSION_DISCOUNT_EXACT);
+  });
+
+  it('非精确配对回落组规模分级：登录→signin 仍是低置信', () => {
+    expect(pairDiscountOf('登录', 'signin')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
+    expect(pairDiscountOf('支付', 'payment')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS);
+  });
+
+  it('不在词典的词 → 0（不误抬）', () => {
+    expect(pairDiscountOf('xqz', 'login')).toBe(0);
+    expect(pairDiscountOf('登录', 'xqz')).toBe(0);
+  });
+
+  it('expandQuery 逐对生效：多词组内主翻译高置信、近义成员低置信', () => {
+    const { expansions } = expandQuery('保存');
+    expect(expansions.get('save')).toBe(EXPANSION_DISCOUNT_EXACT); // 精确映射
+    expect(expansions.get('persist')).toBe(EXPANSION_DISCOUNT_AMBIGUOUS); // 近义
+    expect(expansions.get('store')).toBe(EXPANSION_DISCOUNT_EXACT); // 精确映射
+  });
+
+  it('符号分层标记：导出符号与局部符号区分（bench 分层指标基础）', async () => {
+    process.env.CODEX_CONFIG_PATH = join(tmpdir(), `codex-v541-cfg-${Date.now()}`);
+    const dir = mkdtempSync(join(tmpdir(), 'codex-v541-exp-'));
+    try {
+      writeFileSync(
+        join(dir, 'mod.ts'),
+        [
+          'export const exportedConst = 1;',
+          'const localConst = 2;',
+          'export function exportedFn() {',
+          '  const inner = 3;',
+          '  return inner;',
+          '}',
+          'function localFn() { return 4; }',
+        ].join('\n'),
+      );
+      const eng = new ContextEngine();
+      await eng.index(dir);
+      const syms = eng.listSymbols();
+      const byName = new Map(syms.map((s) => [s.name, s]));
+      expect(byName.get('exportedConst')!.exported).toBe(true);
+      expect(byName.get('exportedFn')!.exported).toBe(true);
+      expect(byName.get('localConst')!.exported).toBe(false);
+      expect(byName.get('localFn')!.exported).toBe(false);
+      expect(byName.get('inner')!.exported).toBe(false); // 函数内局部变量
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -207,6 +267,10 @@ describe('V5.35 checkBaselineHealth（doctor 数据源）', () => {
     queries,
     recall: { at1: at3, at3, at10: at3, mrr: 0.9 },
     crossLingual: { queries: 4, at3: 4, at10: 4, mrr: 1 },
+    layers: {
+      exported: { queries: 6, at1: 6, at3: 6, at10: 6, mrr: 1 },
+      local: { queries: 4, at1: 3, at3: 4, at10: 4, mrr: 0.9 },
+    },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],

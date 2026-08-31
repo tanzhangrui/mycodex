@@ -58,6 +58,8 @@ export interface BenchSample {
   symbol: string;
   kind: string;
   file: string;
+  /** V5.41 导出符号（TS/JS export 前缀 / Python 顶层声明；false = 局部符号） */
+  exported: boolean;
   /** 定义文件在组装结果中的排名（1 起始；null = 未召回） */
   rank: number | null;
   /** V5.36 跨语言查询（符号子词反查词典的中文同义词；null = 无词典命中） */
@@ -69,11 +71,26 @@ export interface BenchSample {
   tokens: number;
 }
 
+/** V5.41 符号分层召回指标（导出 API vs 局部符号） */
+export interface RecallLayer {
+  queries: number;
+  at1: number;
+  at3: number;
+  at10: number;
+  mrr: number;
+}
+
 export interface BenchMetrics {
   queries: number;
   recall: { at1: number; at3: number; at10: number; mrr: number };
   /** V5.36 跨语言召回（中文口语查询 → 英文命名代码；queries=有词典命中的样本数） */
   crossLingual: { queries: number; at3: number; at10: number; mrr: number };
+  /**
+   * V5.41 符号分层：导出符号是产品主线召回目标（用户查 API），局部符号
+   * （函数内 const、方法）是长尾——混合统计会让指标失真（局部符号固有
+   * 难例拉低水位且无从归因）。分层后 exported 层进门禁，local 层仅观测。
+   */
+  layers: { exported: RecallLayer; local: RecallLayer };
   perf: { avgMs: number; avgChunks: number; avgTokens: number };
   negatives: { probes: number; falsePositives: string[] };
   samples: BenchSample[];
@@ -118,11 +135,11 @@ function fnv1a(text: string): number {
  * 池增删成员不改既有成员的选中状态（跨代码变更基线可比）。
  * rate = queries/pool.length（样本数期望 ≈ queries）。
  */
-export function stableSample(
-  pool: Array<{ name: string; kind: string; file: string }>,
+export function stableSample<T extends { name: string; kind: string; file: string }>(
+  pool: Array<T>,
   count: number,
   seed: number,
-): Array<{ name: string; kind: string; file: string }> {
+): Array<T> {
   const rate = Math.min(1, count / Math.max(1, pool.length));
   return pool.filter((s) => fnv1a(`${s.name}@${s.file}#${seed}`) / 0xffffffff < rate);
 }
@@ -132,17 +149,17 @@ export function stableSample(
  * 缺省均匀索引采样（确定性）；--seed 哈希过滤稳定采样（跨代码变更可比）。
  */
 export function runBench(engine: ContextEngine, params: BenchParams): BenchMetrics {
-  const pool: Array<{ name: string; kind: string; file: string }> = [];
+  const pool: Array<{ name: string; kind: string; file: string; exported: boolean }> = [];
   const seen = new Set<string>();
   for (const s of engine.listSymbols()) {
     if (s.name.length < 3) continue;
     const k = `${s.name}@${s.file}`;
     if (seen.has(k)) continue;
     seen.add(k);
-    pool.push({ name: s.name, kind: s.kind, file: s.file });
+    pool.push({ name: s.name, kind: s.kind, file: s.file, exported: s.exported ?? false });
   }
 
-  let samples: Array<{ name: string; kind: string; file: string }>;
+  let samples: Array<{ name: string; kind: string; file: string; exported: boolean }>;
   if (params.seed !== undefined && pool.length > params.queries) {
     samples = stableSample(pool, params.queries, params.seed);
   } else {
@@ -169,6 +186,7 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
       symbol: s.name,
       kind: s.kind,
       file: s.file,
+      exported: s.exported,
       rank: idx === -1 ? null : idx + 1,
       crossQuery,
       crossRank,
@@ -194,6 +212,22 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
   const crossMrr =
     crossTotal === 0 ? 0 : crossSamples.reduce((n, r) => n + (r.crossRank !== null ? 1 / r.crossRank : 0), 0) / crossTotal;
 
+  // V5.41 符号分层指标：导出 API（产品主线目标）vs 局部符号（长尾难例）
+  const layerOf = (rows: BenchSample[]): RecallLayer => {
+    const n = rows.length;
+    return {
+      queries: n,
+      at1: n === 0 ? 0 : rows.filter((r) => (r.rank ?? Infinity) <= 1).length,
+      at3: n === 0 ? 0 : rows.filter((r) => (r.rank ?? Infinity) <= 3).length,
+      at10: n === 0 ? 0 : rows.filter((r) => (r.rank ?? Infinity) <= 10).length,
+      mrr: n === 0 ? 0 : Number((rows.reduce((s2, r) => s2 + (r.rank !== null ? 1 / r.rank : 0), 0) / n).toFixed(4)),
+    };
+  };
+  const layers = {
+    exported: layerOf(results.filter((r) => r.exported)),
+    local: layerOf(results.filter((r) => !r.exported)),
+  };
+
   return {
     queries: total,
     recall: {
@@ -208,6 +242,7 @@ export function runBench(engine: ContextEngine, params: BenchParams): BenchMetri
       at10: crossHitAt(10),
       mrr: Number(crossMrr.toFixed(4)),
     },
+    layers,
     perf: {
       avgMs: Number(avg((r) => r.ms).toFixed(1)),
       avgChunks: Number(avg((r) => r.chunks).toFixed(1)),
@@ -244,24 +279,28 @@ export function loadBaseline(file: string): BenchBaseline | null {
 export interface BenchCompare {
   pass: boolean;
   /** 相对基线的增量（当前 - 基线；正 = 改善） */
-  deltas: { at3: number; at10: number; mrr: number; crossAt3: number };
+  deltas: { at3: number; at10: number; mrr: number; crossAt3: number; exportedAt3: number };
   /** 逐条回退说明（空 = 无回退） */
   regressions: string[];
 }
 
 /**
- * 与基线对比：Recall@3 / Recall@10 / MRR / 跨语言 Recall@3 任一低于基线即回退。
+ * 与基线对比：Recall@3 / Recall@10 / MRR / 跨语言 Recall@3 / 导出层 Recall@3 任一低于基线即回退。
  * 耗时不入对比（机器噪声大，且性能回退有 perf 指标可观察非门禁）。
- * 跨语言指标仅在两边样本数一致且 >0 时对比（词典扩容会改变样本集，无可比性）。
+ * 跨语言指标仅在两边样本数一致且 >0 时对比（词典扩容会改变样本集，无可比性）；
+ * V5.41 导出层（exported）同样要求样本数一致（局部/导出比例随抽样漂移）。
  */
 export function compareWithBaseline(current: BenchMetrics, baseline: BenchMetrics): BenchCompare {
   const crossComparable =
     current.crossLingual.queries === baseline.crossLingual.queries && current.crossLingual.queries > 0;
+  const exportedComparable =
+    current.layers.exported.queries === baseline.layers.exported.queries && current.layers.exported.queries > 0;
   const deltas = {
     at3: current.recall.at3 - baseline.recall.at3,
     at10: current.recall.at10 - baseline.recall.at10,
     mrr: Number((current.recall.mrr - baseline.recall.mrr).toFixed(4)),
     crossAt3: crossComparable ? current.crossLingual.at3 - baseline.crossLingual.at3 : 0,
+    exportedAt3: exportedComparable ? current.layers.exported.at3 - baseline.layers.exported.at3 : 0,
   };
   const regressions: string[] = [];
   if (current.recall.at3 < baseline.recall.at3) {
@@ -275,6 +314,11 @@ export function compareWithBaseline(current: BenchMetrics, baseline: BenchMetric
   }
   if (crossComparable && current.crossLingual.at3 < baseline.crossLingual.at3) {
     regressions.push(`跨语言 Recall@3 回退: ${current.crossLingual.at3} < 基线 ${baseline.crossLingual.at3}`);
+  }
+  if (exportedComparable && current.layers.exported.at3 < baseline.layers.exported.at3) {
+    regressions.push(
+      `导出符号 Recall@3 回退: ${current.layers.exported.at3} < 基线 ${baseline.layers.exported.at3}`,
+    );
   }
   return { pass: regressions.length === 0, deltas, regressions };
 }

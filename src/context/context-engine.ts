@@ -76,6 +76,12 @@ export interface SymbolEntry {
   file: string;
   /** 1 起始行号 */
   line: number;
+  /**
+   * V5.41 导出标记：TS/JS 的 export 前缀声明 / Python 顶层 def·class。
+   * 局部符号（函数内 const、缩进 def 等）为 false——召回优先级天然低于
+   * 导出 API（bench 分层指标的基础）。可选字段：旧持久化数据缺省 false。
+   */
+  exported?: boolean;
 }
 
 export interface AssembleOptions {
@@ -265,6 +271,8 @@ export function extractSymbols(content: string, lang: 'ts' | 'py'): SymbolEntry[
   const symbols: SymbolEntry[] = [];
   const lines = content.split('\n');
   const patterns = lang === 'py' ? PY_SYMBOL_PATTERNS : TS_SYMBOL_PATTERNS;
+  // V5.41 方法导出性：导出类的方法是公开 API——继承最近顶层 class 的导出标记
+  let classExported: boolean | null = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -274,7 +282,12 @@ export function extractSymbols(content: string, lang: 'ts' | 'py'): SymbolEntry[
     for (const { kind, re } of patterns) {
       const m = line.match(re);
       if (m && m[1]) {
-        symbols.push({ name: m[1], kind, file: '', line: i + 1 });
+        // V5.41 导出标记：TS/JS 有 export 前缀 / Python 顶层（无缩进）声明
+        const exported = lang === 'py' ? /^(async\s+)?(def|class)\b/.test(line) : /^\s*export\b/.test(line);
+        symbols.push({ name: m[1], kind, file: '', line: i + 1, exported });
+        // 顶层 class 声明记录导出性（方法继承）；其他顶层声明结束类作用域
+        if (kind === 'class' && !/^\s/.test(line)) classExported = exported;
+        else if (!/^\s/.test(line)) classExported = null;
         matched = true;
         break;
       }
@@ -286,7 +299,8 @@ export function extractSymbols(content: string, lang: 'ts' | 'py'): SymbolEntry[
       if (m && m[1]) {
         const name = m[1].replace(/\*\s*/, '').trim();
         if (name && !METHOD_EXCLUDE.has(name)) {
-          symbols.push({ name, kind: 'method', file: '', line: i + 1 });
+          // V5.41 方法继承所属类的导出性（顶层函数体内误报的"方法"无类上下文 → false）
+          symbols.push({ name, kind: 'method', file: '', line: i + 1, exported: classExported ?? false });
         }
       }
     }
@@ -2030,7 +2044,8 @@ export class ContextEngine {
             byFile.set(sym.file, slot);
           }
           if (slot.symbols.length < MAX_PERSIST_SYMBOLS_PER_FILE) {
-            slot.symbols.push({ name: sym.name, kind: sym.kind, file: sym.file, line: sym.line });
+            // V5.41 exported 标记随缓存持久化（缺失会在回载时误判为局部符号）
+            slot.symbols.push({ name: sym.name, kind: sym.kind, file: sym.file, line: sym.line, exported: sym.exported });
           }
         }
       }
@@ -2059,7 +2074,9 @@ export class ContextEngine {
       ? this.multiRoots.map((r) => ({ name: r.name, abs: r.abs }))
       : [{ name: '', abs: this.workingDir }];
     const payload = {
-      version: 2 as const,
+      // V5.41 格式 v3：符号携带 exported 标记。v1/v2 缓存的符号缺该字段，
+      // 加载时缺省 false 会把导出 API 全判成局部符号、分层指标失真——升版拒载。
+      version: 3 as const,
       workingDir: this.persistKey,
       savedAt: new Date().toISOString(),
       // V5.16 多根/别名元数据：根清单 + 别名清单指纹 + 结构指纹（imports 种子门控）
@@ -2070,7 +2087,7 @@ export class ContextEngine {
         path,
         size: s.size,
         mtime: s.mtime,
-        symbols: s.symbols.map((sym) => ({ name: sym.name, kind: sym.kind, line: sym.line })),
+        symbols: s.symbols.map((sym) => ({ name: sym.name, kind: sym.kind, line: sym.line, exported: sym.exported })),
         imports: s.imports,
       })),
     };
@@ -2085,11 +2102,13 @@ export class ContextEngine {
 
   /**
    * 加载持久化符号/import 缓存。
-   * - 符号种子（v1/v2 通用）：逐文件校验 size+mtime 指纹，不匹配即弃。
-   * - import 种子（仅 v2）：额外要求工作区结构指纹一致（路径集 + 别名清单
-   *   未变）——imports 依赖解析时刻的文件集与别名表，结构变化即整体弃用
+   * - 符号种子：逐文件校验 size+mtime 指纹，不匹配即弃。
+   * - import 种子：额外要求工作区结构指纹一致（路径集 + 别名清单未变）——
+   *   imports 依赖解析时刻的文件集与别名表，结构变化即整体弃用
    *   （宁重读勿陈旧：新增文件可能让原本未解析的 import 变为可解析）。
-   * - v1 缓存仍可加载（无 imports 字段，行为与旧版一致）；损坏/不可读整体弃用。
+   * - V5.41 只加载 v3（符号带 exported 标记）：v1/v2 的符号缺该字段，缺省
+   *   false 会把导出 API 全判成局部符号、分层指标失真——升版整体拒载。
+   * - 损坏/不可读整体弃用。
    */
   private loadPersistedIndex(): void {
     const cacheFile = this.cacheFilePath();
@@ -2107,17 +2126,15 @@ export class ContextEngine {
           path: string;
           size: number;
           mtime: number;
-          symbols: Array<{ name: string; kind: SymbolKind; line: number }>;
+          symbols: Array<{ name: string; kind: SymbolKind; line: number; exported?: boolean }>;
           imports?: unknown;
         }>;
       };
-      if ((data.version !== 1 && data.version !== 2) || data.workingDir !== this.persistKey) return;
+      if (data.version !== 3 || data.workingDir !== this.persistKey) return;
 
-      // V5.16 imports 种子门控：结构指纹一致才启用（v1 无此字段 → 恒不启用）
+      // V5.16 imports 种子门控：结构指纹一致才启用
       const structureOk =
-        data.version === 2 && typeof data.structureHash === 'string'
-          ? data.structureHash === this.structureFingerprint()
-          : false;
+        typeof data.structureHash === 'string' ? data.structureHash === this.structureFingerprint() : false;
 
       // V5.18 记录缓存诊断（context stats 展示；savedAt 可选字段容错）
       this.persistedInfo = {
@@ -2134,7 +2151,7 @@ export class ContextEngine {
         if (Array.isArray(f.symbols) && f.symbols.length > 0) {
           this.persistedSymbols.set(
             f.path,
-            f.symbols.map((s) => ({ name: s.name, kind: s.kind, file: f.path, line: s.line })),
+            f.symbols.map((s) => ({ name: s.name, kind: s.kind, file: f.path, line: s.line, exported: s.exported ?? false })),
           );
         }
         if (structureOk && Array.isArray(f.imports)) {

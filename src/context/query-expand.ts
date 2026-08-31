@@ -140,6 +140,43 @@ export const EXPANSION_DISCOUNT_EXACT = 0.6;
 /** 多对多组的扩展折扣：任一配对只是"可能" */
 export const EXPANSION_DISCOUNT_AMBIGUOUS = 0.3;
 
+/**
+ * V5.41 逐对精确映射：显式声明"原词 → 扩展词"的确定配对。
+ * 组规模分级（V5.38）对多词组内所有配对一视同仁——但 `登录→login`
+ * 是主翻译（高置信），`登录→signin` 只是近义（低置信）。逐对声明
+ * 打破组粒度限制：多词组内的主翻译拿满折扣，近义成员保持保守。
+ */
+const EXACT_PAIRS: ReadonlySet<string> = new Set([
+  '登录→login', '注销→logout', '注册→register', '用户→user', '密码→password',
+  '会话→session', '令牌→token', '凭据→token',
+  '支付→pay', '退款→refund', '订单→order', '购物车→cart', '结算→checkout',
+  '数据库→database', '查询→query', '创建→create', '删除→delete', '更新→update',
+  '保存→save', '保存→store', '缓存→cache', '索引→index', '事务→transaction',
+  '配置→config', '日志→log', '重试→retry', '超时→timeout',
+  '上传→upload', '下载→download', '导入→import', '导出→export', '队列→queue',
+  '路由→route', '请求→request', '响应→response', '页面→page', '组件→component',
+  '渲染→render', '表单→form', '邮件→email', '消息→message', '通知→notify',
+  '测试→test', '插件→plugin', '工具→tool', '文档→doc', '版本→version',
+  '仓库→repo', '存储→store', '回滚→rollback',
+  '召回→recall', '上下文→context', '语义→semantic', '关键词→keyword',
+  '符号→symbol', '文件→file', '目录→directory', '文件夹→directory',
+  '权重→weight', '阈值→threshold', '预算→budget', '窗口→window',
+  '沙箱→sandbox', '提供者→provider', '模型→model',
+]);
+
+/**
+ * V5.41 逐对折扣：显式精确配对 → EXACT；
+ * 否则回落组规模分级（触发词/目标词折扣取大——V5.38 语义）。
+ * 任一词不在词典 → 0（无配对可言，max 会误抬词典内单侧词的折扣）。
+ */
+export function pairDiscountOf(from: string, to: string): number {
+  if (EXACT_PAIRS.has(`${from}→${to}`)) return EXPANSION_DISCOUNT_EXACT;
+  const fromD = expansionDiscountOf(from);
+  const toD = expansionDiscountOf(to);
+  if (fromD === 0 || toD === 0) return 0;
+  return Math.max(fromD, toD);
+}
+
 /** 按组规模取折扣（词不在词典 → 0） */
 export function expansionDiscountOf(word: string): number {
   const size = WORD_GROUP_SIZE.get(word) ?? 0;
@@ -201,16 +238,20 @@ export function expandQuery(query: string): QueryExpansion {
   for (const tok of matchWords) {
     const synonyms = SYNONYM_MAP.get(tok);
     if (!synonyms) continue;
-    const discount = expansionDiscountOf(tok);
     const added: string[] = [];
+    let pairSum = 0;
     for (const syn of synonyms) {
       if (tokenSet.has(syn) || expansions.has(syn)) continue; // 已有词不重复扩展
-      // V5.38 分级折扣：取触发词与目标词折扣的较大值
-      //（触发词所在连通集大但目标词一一对应 → 目标词置信度仍高）
-      expansions.set(syn, Math.max(discount, expansionDiscountOf(syn)));
+      // V5.41 逐对折扣：显式精确配对满折扣，其余回落组规模分级（V5.38 max 语义）
+      const d = pairDiscountOf(tok, syn);
+      expansions.set(syn, d);
       added.push(syn);
+      pairSum += d;
     }
-    if (added.length > 0) sources.push({ from: tok, to: added, discount });
+    if (added.length > 0) {
+      // 触发词级折扣 = 该词全部配对折扣的均值（可观测性：sources 保持单值）
+      sources.push({ from: tok, to: added, discount: Number((pairSum / added.length).toFixed(2)) });
+    }
   }
 
   return { tokens: uniqueTokens, expansions, sources };

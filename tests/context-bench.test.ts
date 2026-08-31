@@ -100,6 +100,10 @@ describe('V5.32 基线对比（compareWithBaseline）', () => {
     queries: 10,
     recall: { at1: at3, at3, at10, mrr },
     crossLingual: { queries: 5, at3: 5, at10: 5, mrr: 1 },
+    layers: {
+      exported: { queries: 6, at1: 6, at3: 6, at10: 6, mrr: 1 },
+      local: { queries: 4, at1: 3, at3: 4, at10: 4, mrr: 0.9 },
+    },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],
@@ -133,6 +137,10 @@ describe('V5.32 CI 门禁（evalGate）', () => {
     queries: 10,
     recall: { at1: 9, at3: 10, at10: 10, mrr: 0.95 },
     crossLingual: { queries: 5, at3: 5, at10: 5, mrr: 1 },
+    layers: {
+      exported: { queries: 6, at1: 6, at3: 6, at10: 6, mrr: 1 },
+      local: { queries: 4, at1: 3, at3: 4, at10: 4, mrr: 0.9 },
+    },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],
@@ -153,6 +161,11 @@ describe('V5.32 CI 门禁（evalGate）', () => {
     const empty: BenchMetrics = {
       queries: 0,
       recall: { at1: 0, at3: 0, at10: 0, mrr: 0 },
+      crossLingual: { queries: 0, at3: 0, at10: 0, mrr: 0 },
+      layers: {
+        exported: { queries: 0, at1: 0, at3: 0, at10: 0, mrr: 0 },
+        local: { queries: 0, at1: 0, at3: 0, at10: 0, mrr: 0 },
+      },
       perf: { avgMs: 0, avgChunks: 0, avgTokens: 0 },
       negatives: { probes: 3, falsePositives: [] },
       samples: [],
@@ -184,6 +197,10 @@ function mkMetrics(at3: number, at10: number, mrr: number): BenchMetrics {
     queries: 10,
     recall: { at1: at3, at3, at10, mrr },
     crossLingual: { queries: 0, at3: 0, at10: 0, mrr: 0 },
+    layers: {
+      exported: { queries: 6, at1: 6, at3: 6, at10: 6, mrr: 1 },
+      local: { queries: 4, at1: 3, at3: 4, at10: 4, mrr: 0.9 },
+    },
     perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
     negatives: { probes: 3, falsePositives: [] },
     samples: [],
@@ -240,6 +257,10 @@ describe('V5.36 runBench 跨语言指标', () => {
       queries: 10,
       recall: { at1: 10, at3: 10, at10: 10, mrr: 1 },
       crossLingual: { queries: 5, at3: clAt3, at10: 5, mrr: 0.9 },
+      layers: {
+        exported: { queries: 6, at1: 6, at3: 6, at10: 6, mrr: 1 },
+        local: { queries: 4, at1: 4, at3: 4, at10: 4, mrr: 1 },
+      },
       perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
       negatives: { probes: 3, falsePositives: [] },
       samples: [],
@@ -257,6 +278,10 @@ describe('V5.36 runBench 跨语言指标', () => {
       queries: 10,
       recall: { at1: 10, at3: 10, at10: 10, mrr: 1 },
       crossLingual: { queries: 8, at3: 0, at10: 0, mrr: 0 }, // 样本数变了
+      layers: {
+        exported: { queries: 6, at1: 6, at3: 6, at10: 6, mrr: 1 },
+        local: { queries: 4, at1: 4, at3: 4, at10: 4, mrr: 1 },
+      },
       perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
       negatives: { probes: 3, falsePositives: [] },
       samples: [],
@@ -328,7 +353,58 @@ describe('V5.39 stableSample（哈希过滤稳定采样）', () => {
   });
 });
 
-// ---- V5.40 负例探针重设计 + lock 文件排除 ----
+// ---- V5.41 符号分层指标 ----
+
+describe('V5.41 runBench 符号分层指标', () => {
+  it('样本携带 exported 标记（语料符号全部导出）', () => {
+    const m = runBench(engine, { queries: 10, maxTokens: 20_000 });
+    expect(m.samples.length).toBeGreaterThan(0);
+    for (const s of m.samples) expect(s.exported).toBe(true);
+  });
+
+  it('分层指标一致性：exported + local = 总体', () => {
+    const m = runBench(engine, { queries: 10, maxTokens: 20_000 });
+    expect(m.layers.exported.queries + m.layers.local.queries).toBe(m.queries);
+    expect(m.layers.exported.at3 + m.layers.local.at3).toBe(m.recall.at3);
+    expect(m.layers.local.queries).toBe(0); // 语料只有导出符号
+  });
+});
+
+describe('V5.41 基线对比：导出层回退检测', () => {
+  const mk = (exAt3: number): BenchMetrics => ({
+    queries: 10,
+    recall: { at1: 10, at3: 10, at10: 10, mrr: 1 },
+    crossLingual: { queries: 0, at3: 0, at10: 0, mrr: 0 },
+    layers: {
+      exported: { queries: 6, at1: 6, at3: exAt3, at10: 6, mrr: 1 },
+      local: { queries: 4, at1: 4, at3: 4, at10: 4, mrr: 1 },
+    },
+    perf: { avgMs: 1, avgChunks: 1, avgTokens: 1 },
+    negatives: { probes: 3, falsePositives: [] },
+    samples: [],
+  });
+
+  it('导出层 Recall@3 回退 → fail（总体持平也拦）', () => {
+    const c = compareWithBaseline(mk(5), mk(6));
+    expect(c.pass).toBe(false);
+    expect(c.regressions.some((r) => r.includes('导出符号 Recall@3 回退'))).toBe(true);
+    expect(c.deltas.exportedAt3).toBe(-1);
+  });
+
+  it('导出层样本数变化 → 跳过对比不回退（导出/局部比例漂移，无可比性）', () => {
+    const cur = mk(4);
+    const base = { ...mk(6), layers: { ...mk(6).layers, exported: { ...mk(6).layers.exported, queries: 8 } } };
+    const c = compareWithBaseline(cur, base);
+    expect(c.pass).toBe(true);
+    expect(c.deltas.exportedAt3).toBe(0);
+  });
+
+  it('持平 → pass', () => {
+    expect(compareWithBaseline(mk(6), mk(6)).pass).toBe(true);
+  });
+});
+
+// ---- V5.41 负例探针重设计 + lock 文件排除 ----
 
 describe('V5.40 负例探针设计不变量', () => {
   it('探针词全部 < 4 字符（不触发字符 trigram 提取）', () => {

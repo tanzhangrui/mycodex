@@ -340,7 +340,7 @@ describe('V5.16 持久化格式 v2（imports 种子 + 多根/别名元数据）'
 
     const cache = readCacheFor(resolve(r));
     expect(cache).not.toBeNull();
-    expect(cache!.version).toBe(2);
+    expect(cache!.version).toBe(3);
     expect(Array.isArray(cache!.roots)).toBe(true);
     expect(typeof cache!.structureHash).toBe('string');
     const aEntry = (cache!.files as Array<{ path: string; imports: string[] }>).find((f) => f.path === 'src/a.ts');
@@ -401,7 +401,7 @@ describe('V5.16 持久化格式 v2（imports 种子 + 多根/别名元数据）'
     rmSync(r, { recursive: true, force: true });
   });
 
-  it('v1 缓存向后兼容：旧格式仍加载符号种子', async () => {
+  it('V5.41 旧格式缓存拒载：v1/v2 升版后整体弃用（exported 缺失会污染分层指标）', async () => {
     const r = mkdtempSync(join(tmpdir(), 'codex-v516-v1-'));
     mkdirSync(join(r, 'src'), { recursive: true });
     writeFileSync(join(r, 'src', 's.ts'), `export function realFn(): void {}\n`);
@@ -420,23 +420,23 @@ describe('V5.16 持久化格式 v2（imports 种子 + 多根/别名元数据）'
         return false;
       }
     })!;
-    const v2 = JSON.parse(readFileSync(join(dir, target), 'utf-8')) as {
+    const v3 = JSON.parse(readFileSync(join(dir, target), 'utf-8')) as {
       files: Array<{ path: string; size: number; mtime: number; symbols: Array<{ name: string; kind: string; line: number }> }>;
     };
-    const ghostEntry = v2.files.find((f) => f.path === 'src/s.ts')!;
+    const ghostEntry = v3.files.find((f) => f.path === 'src/s.ts')!;
     ghostEntry.symbols.push({ name: 'GhostSymbol', kind: 'function', line: 99 });
     const v1 = {
       version: 1,
       workingDir: resolve(r),
-      files: v2.files.map((f) => ({ path: f.path, size: f.size, mtime: f.mtime, symbols: f.symbols })),
+      files: v3.files.map((f) => ({ path: f.path, size: f.size, mtime: f.mtime, symbols: f.symbols })),
     };
     writeFileSync(join(dir, target), JSON.stringify(v1), 'utf-8');
 
-    // v1 缓存被接受：幽灵符号可见（证明种子来自持久化而非读盘）
+    // V5.41 v3 只认格式 v3：v1 拒载 → 幽灵符号不可见（重建自读盘，无污染）
     const second = new ContextEngine();
     await second.index(r);
     const hits = second.resolveQuerySymbols('GhostSymbol');
-    expect(hits.some((s) => s.name === 'GhostSymbol')).toBe(true);
+    expect(hits.some((s) => s.name === 'GhostSymbol')).toBe(false);
     rmSync(r, { recursive: true, force: true });
   });
 
@@ -517,11 +517,14 @@ describe('V5.18 getContextReport（codex context stats 数据源）', () => {
     await second.index(r);
     const report = second.getContextReport();
     expect(report.persisted).not.toBeNull();
-    expect(report.persisted!.version).toBe(2);
+    expect(report.persisted!.version).toBe(3);
     expect(report.persisted!.structureOk).toBe(true);
     expect(report.persisted!.symbolSeeds).toBeGreaterThan(0);
     expect(report.persisted!.importSeeds).toBeGreaterThan(0);
     expect(report.persisted!.savedAt).toBeTruthy();
+    // V5.41 exported 标记持久化 roundtrip：跨实例加载后导出符号仍为导出层
+    const hits = second.resolveQuerySymbols('beta');
+    expect(hits.some((s) => s.name === 'beta' && s.exported === true)).toBe(true);
     rmSync(r, { recursive: true, force: true });
   });
 
@@ -539,7 +542,7 @@ describe('V5.18 getContextReport（codex context stats 数据源）', () => {
     const second = new ContextEngine();
     await second.index(r);
     const report = second.getContextReport();
-    expect(report.persisted!.version).toBe(2);
+    expect(report.persisted!.version).toBe(3);
     expect(report.persisted!.structureOk).toBe(false);
     expect(report.persisted!.importSeeds).toBe(0);
     // 符号种子不受结构指纹影响（逐文件指纹校验）

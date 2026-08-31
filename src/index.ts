@@ -1168,6 +1168,7 @@ async function handleContextBench(args: string[]): Promise<void> {
           maxTokens,
           recall: metrics.recall,
           crossLingual: metrics.crossLingual,
+          layers: metrics.layers,
           perf: metrics.perf,
           negatives: metrics.negatives,
           samples: metrics.samples.map((r) => ({
@@ -1175,6 +1176,7 @@ async function handleContextBench(args: string[]): Promise<void> {
             kind: r.kind,
             file: r.file,
             rank: r.rank,
+            exported: r.exported,
             crossQuery: r.crossQuery,
             crossRank: r.crossRank,
           })),
@@ -1221,6 +1223,15 @@ async function handleContextBench(args: string[]): Promise<void> {
       const clMissed = metrics.samples.filter((r) => r.crossQuery !== null && r.crossRank === null);
       for (const m of clMissed.slice(0, 3)) console.log(`  ! 中文未召回: ${m.symbol} ← "${m.crossQuery}"`);
     }
+    // V5.41 符号分层：导出 API（产品主线目标，进门禁）vs 局部符号（长尾观测）
+    const { exported: ex, local: lc } = metrics.layers;
+    if (ex.queries + lc.queries > 0) {
+      console.log('');
+      console.log('[符号分层]（导出 API vs 局部符号）');
+      const pct = (hit: number, n: number): string => (n === 0 ? '—' : `${((hit / n) * 100).toFixed(1)}%（${hit}/${n}）`);
+      console.log(`  导出符号: Recall@3 ${pct(ex.at3, ex.queries)}  Recall@10 ${pct(ex.at10, ex.queries)}  MRR ${ex.queries === 0 ? '—' : ex.mrr.toFixed(3)}`);
+      console.log(`  局部符号: Recall@3 ${pct(lc.at3, lc.queries)}  Recall@10 ${pct(lc.at10, lc.queries)}  MRR ${lc.queries === 0 ? '—' : lc.mrr.toFixed(3)}`);
+    }
     console.log('');
     console.log('[性能]');
     console.log(`  平均组装耗时: ${metrics.perf.avgMs}ms`);
@@ -1244,7 +1255,7 @@ async function handleContextBench(args: string[]): Promise<void> {
       console.log(`  基线: ${baselineInfo.file}${baselineInfo.savedAt ? `（${baselineInfo.savedAt}）` : ''}`);
       const d = compare.deltas;
       const fmt = (label: string, v: number): string => `${label}: ${v >= 0 ? '+' : ''}${v}`;
-      console.log(`  ${fmt('Recall@3', d.at3)}  ${fmt('Recall@10', d.at10)}  ${fmt('MRR', d.mrr)}  ${fmt('跨语言@3', d.crossAt3)}`);
+      console.log(`  ${fmt('Recall@3', d.at3)}  ${fmt('Recall@10', d.at10)}  ${fmt('MRR', d.mrr)}  ${fmt('跨语言@3', d.crossAt3)}  ${fmt('导出@3', d.exportedAt3)}`);
       for (const r of compare.regressions) console.log(`  ! ${r}`);
     }
     if (minR3 !== undefined) {
