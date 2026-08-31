@@ -4,6 +4,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, utimesSync, readdirSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
 import {
@@ -11,6 +12,7 @@ import {
   tokenizeForEmbedding,
   getSharedContextEngine,
   resetSharedContextEngine,
+  collectGitChangedFiles,
 } from '../src/context/context-engine.js';
 
 // V3.4：隔离配置目录，持久化缓存绝不污染真实用户 home
@@ -871,3 +873,134 @@ describe('V5.22 Python __init__.py re-export 穿透', () => {
     expect(byFile.get('consumer.py')).toBe(2);
   });
 });
+
+// ---- V5.23 单文件召回诊断 ----
+
+describe('V5.23 explainRecall（单文件四路贡献诊断）', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v523-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src', 'order.ts'), 'export class OrderService {\n  refund(): void {}\n}\n');
+    writeFileSync(join(r, 'src', 'index.ts'), "export * from './order';\n");
+    writeFileSync(join(r, 'src', 'page.ts'), "import { OrderService } from './index';\nexport function renderRefund(o: OrderService): void {\n  o.refund();\n}\n");
+    mkdirSync(join(r, 'misc'), { recursive: true });
+    writeFileSync(join(r, 'misc', 'noise.ts'), 'export function unrelatedGeometry(): number {\n  return 42;\n}\n');
+
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('未索引文件：indexed false + 单一原因（不抛错）', () => {
+    const why = e.explainRecall('OrderService', 'src/nope.ts');
+    expect(why.indexed).toBe(false);
+    expect(why.reasons).toHaveLength(1);
+    expect(why.reasons[0]).toContain('不在索引内');
+    expect(why.assembledChunk).toBeNull();
+    expect(why.symbolDefs).toEqual([]);
+  });
+
+  it('符号命中文件：symbolDefs + assembledChunk + 已召回原因（含 relevance）', () => {
+    const why = e.explainRecall('OrderService refund', 'src/order.ts');
+    expect(why.indexed).toBe(true);
+    expect(why.symbolDefs.some((s) => s.name === 'OrderService' && s.kind === 'class')).toBe(true);
+    expect(why.assembledChunk).not.toBeNull();
+    expect(why.reasons.some((x) => x.includes('已召回'))).toBe(true);
+    expect(why.reasons.some((x) => x.includes('符号路'))).toBe(true);
+  });
+
+  it('使用点文件：usageOf 记录定义文件与 hop（barrel 消费者 hop 2）', () => {
+    const why = e.explainRecall('OrderService refund', 'src/page.ts');
+    const usage = why.usageOf.find((u) => u.defFile === 'src/order.ts');
+    expect(usage).toBeDefined();
+    expect(usage!.hop).toBe(2); // page → index（barrel）→ order
+    expect(why.assembledChunk).not.toBeNull();
+  });
+
+  it('低相关文件：未召回原因逐路给出（符号/关键词/图/使用点）', () => {
+    const why = e.explainRecall('OrderService refund', 'misc/noise.ts');
+    expect(why.indexed).toBe(true);
+    expect(why.assembledChunk).toBeNull();
+    expect(why.reasons.some((x) => x.includes('符号路未命中'))).toBe(true);
+    expect(why.reasons.some((x) => x.includes('关键词路未命中'))).toBe(true);
+    expect(why.reasons.some((x) => x.includes('import 图路'))).toBe(true);
+    expect(why.reasons.some((x) => x.includes('使用点路'))).toBe(true);
+  });
+});
+
+// ---- V5.24 git 最近变更加权 ----
+
+describe('V5.24 git 最近变更加权', () => {
+  it('recentFiles：+10 改变排序（召回集合不变，与 cwd 加权同一原则）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v524-'));
+    writeFileSync(join(r, 'a-report.ts'), 'export const reportAlpha = 1;\n');
+    writeFileSync(join(r, 'b-report.ts'), 'export const reportBeta = 2;\n');
+    // 抹平 mtime 差：保证基线是稳定排序（a 在前），加权后才能断言反超
+    const t = new Date();
+    utimesSync(join(r, 'a-report.ts'), t, t);
+    utimesSync(join(r, 'b-report.ts'), t, t);
+
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const base = e.assembleContext('report', { maxTokens: 20_000 });
+    const basePaths = base.map((c) => c.path);
+    expect(basePaths).toContain('a-report.ts');
+    expect(basePaths).toContain('b-report.ts');
+    expect(basePaths.indexOf('a-report.ts')).toBeLessThan(basePaths.indexOf('b-report.ts')); // 基线：a 在前
+
+    const boosted = e.assembleContext('report', { maxTokens: 20_000, recentFiles: ['b-report.ts'] });
+    expect(boosted[0].path).toBe('b-report.ts'); // +10 反超
+    expect(boosted[0].relevance).toBe(base.find((c) => c.path === 'b-report.ts')!.relevance + 10);
+    // 只改排序不改召回集合
+    expect(new Set(boosted.map((c) => c.path))).toEqual(new Set(basePaths));
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('collectGitChangedFiles：porcelain（修改/暂存/未跟踪/rename 取新路径）∪ diff HEAD', () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v524git-'));
+    const sh = (cmd: string) => execSync(cmd, { cwd: r, stdio: 'ignore' });
+    sh('git init');
+    sh('git config user.email test@test.test');
+    sh('git config user.name test');
+    writeFileSync(join(r, 'committed.ts'), 'export const a = 1;\n');
+    writeFileSync(join(r, 'renamed-old.ts'), 'export const b = 2;\n');
+    sh('git add .');
+    sh('git commit -m init');
+    // 工作区变更：修改 / 未跟踪 / 暂存新增 / 重命名
+    writeFileSync(join(r, 'committed.ts'), 'export const a = 2;\n');
+    writeFileSync(join(r, 'untracked.ts'), 'export const c = 3;\n');
+    writeFileSync(join(r, 'staged.ts'), 'export const d = 4;\n');
+    sh('git add staged.ts');
+    sh('git mv renamed-old.ts renamed-new.ts');
+
+    const changed = collectGitChangedFiles(r).map((p) => basename(p));
+    expect(changed).toContain('committed.ts'); // 修改（diff HEAD + porcelain 双源）
+    expect(changed).toContain('untracked.ts'); // porcelain -uall
+    expect(changed).toContain('staged.ts'); // 暂存
+    expect(changed).toContain('renamed-new.ts'); // rename 取箭头右侧（新路径）
+    expect(changed).not.toContain('renamed-old.ts');
+    // 返回绝对路径（调用方 absToKey 直接消费）
+    expect(collectGitChangedFiles(r).every((p) => isAbsoluteWinOrPosix(p))).toBe(true);
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('collectGitChangedFiles：非 git 目录 → 空数组（静默降级，绝不阻断召回）', () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v524nogit-'));
+    writeFileSync(join(r, 'x.ts'), 'export const x = 1;\n');
+    expect(collectGitChangedFiles(r)).toEqual([]);
+    rmSync(r, { recursive: true, force: true });
+  });
+});
+
+function isAbsoluteWinOrPosix(p: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('/');
+}

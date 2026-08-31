@@ -22,7 +22,7 @@ import type { Message } from './message-manager.js';
 import type { Sandbox } from '../sandbox/sandbox.js';
 import { createCommandExecutor, createCodeExecutor } from '../sandbox/sandbox.js';
 import { runSubAgents, type SubAgentTask } from './sub-agent.js';
-import { getSharedContextEngine } from '../context/context-engine.js';
+import { getSharedContextEngine, collectGitChangedFiles } from '../context/context-engine.js';
 
 // ---- 类型定义 ----
 
@@ -140,7 +140,16 @@ function buildSystemPrompt(workingDir: WorkingDirInput, userQuery: string, sessi
         const key = engine.absToKey(sessionCwd);
         if (key) cwdKey = key || undefined; // 单根根目录本身（''）不加权
       }
-      const chunks = engine.assembleContext(userQuery, { maxTokens: 8_000, cwd: cwdKey });
+      // V5.24 git 最近变更 → 键空间路径集合（排序加权 +10；采集失败静默降级）
+      const primaryRoot = primaryRootOf(workingDir);
+      const recentKeys = collectGitChangedFiles(primaryRoot)
+        .map((abs) => engine.absToKey(abs))
+        .filter((k): k is string => !!k);
+      const chunks = engine.assembleContext(userQuery, {
+        maxTokens: 8_000,
+        cwd: cwdKey,
+        recentFiles: recentKeys,
+      });
       if (chunks.length > 0) {
         const ctx = chunks
           .map((c) => `[${c.path}:${c.startLine}-${c.endLine}]\n\`\`\`\n${c.content}\n\`\`\``)

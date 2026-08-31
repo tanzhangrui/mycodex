@@ -5,6 +5,64 @@
 
 ***
 
+## V5.24 — 2026-08-31 — git 最近变更加权（recent-change weighting）
+
+> "正在改的文件几乎总是相关上下文"——agent 每轮组装时用户工作区里躺着的
+> 暂存/未暂存/未跟踪变更，是最强的相关性信号之一，此前完全没接入召回。
+
+### A. `collectGitChangedFiles`（context-engine.ts）
+
+* 数据源：`git status --porcelain -uall`（暂存/未暂存/未跟踪）∪ `git diff --name-only HEAD`（与最近提交的差）；rename 行取箭头右侧（新路径）
+
+* 护栏：单命令 3 秒超时 + 4MB 输出上限；非 git 仓 / git 不可用 → 空数组（**静默降级，绝不阻断召回**）
+
+* 返回绝对路径（调用方 `absToKey` 直接消费）
+
+### B. `AssembleOptions.recentFiles`（assembleContext）
+
+* 排序前加权：变更集合内文件 relevance +10（与 V5.13 cwd 邻近加权同一原则——只改排序不改召回集合，召回逻辑与阈值零变动）
+
+### C. 接线
+
+* agent-loop `buildSystemPrompt`：主根采集 git 变更 → `absToKey` 转键空间路径传入组装；采集失败静默降级
+
+* CLI `codex context query --recent` / `context why --recent`：诊断命令同参模拟，排障时可复现主循环行为
+
+### 验收
+
+* 新增 3 项测试：+10 加权反超排序（召回集合不变量）/ 真实 git 仓采集（修改/暂存/未跟踪/rename 新路径 + 绝对路径）/ 非 git 目录空数组降级
+
+* typecheck 零错误 / **348 测试全绿**（341 + 7，含 V5.23 的 4 项）
+
+***
+
+## V5.23 — 2026-08-31 — 单文件召回诊断（codex context why）
+
+> V5.20 的 `context query` 回答"召回了什么"——但排障时真正的问题是
+> "**这个**文件为什么没被召回 / 为什么被召回"。逐文件反查四路贡献。
+
+### A. `explainRecall`（context-engine.ts）
+
+* `FileRecallExplanation`：indexed / symbolDefs / semanticCoverage（含阈值）/ keywordScore / importsSeeds / importedBySeeds / usageOf（定义文件 + hop）/ assembledChunk / reasons 九段
+
+* 未召回时逐路给出**具体原因**：符号路未命中 / 语义路未过阈值（差多少个百分点）/ 关键词路未命中 / import 图路无邻接边（多跳不覆盖）/ 使用点路不是 importer / 四路有命中但被排序预算挤出
+
+* 顺带重构：`semanticRecall` 抽出 `semanticScores`（逐文件 IDF 加权覆盖率）供诊断复用；**修复重构引入的阈值过滤遗漏**（低于 SEMANTIC\_THRESHOLD 的文件不再混入召回）
+
+### B. CLI `codex context why <文件> <查询> [目录...] [--cwd] [--recent]`
+
+* 六段输出：符号路 / 语义路（覆盖率 vs 阈值）/ 关键词路 / import 图路（双向邻接边）/ 使用点路（hop）/ 最终组装 + 诊断结论
+
+* 文件参数宽容：绝对路径走 `absToKey`，相对路径直接当键；不在索引时模糊匹配提示近邻文件
+
+### 验收
+
+* 新增 4 项测试：未索引文件不抛错 / 符号命中文件全字段 / 使用点 hop 记录（barrel 消费者 hop 2）/ 低相关文件未召回原因逐路给出（阈值过滤修复回归由既有语义测试覆盖）
+
+* CLI 冒烟：本仓库真实文件（agent-loop.ts）诊断输出正确呈现
+
+***
+
 ## V5.22 — 2026-08-31 — Python `__init__.py` re-export 穿透 + 相对导入解析修复
 
 > V5.19 的 re-export 链只认 TS barrel——Python 侧同构场景（包入口转发）完全缺失；

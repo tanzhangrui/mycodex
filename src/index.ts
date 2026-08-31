@@ -35,11 +35,11 @@ import { initConfig, loadConfig, saveConfig, getConfigDir, getProviderDisplayNam
 import { loadMessages, saveMessages } from './core/message-manager.js';
 import { createProvider } from './utils/ai-client.js';
 import { InMemoryFileSystem } from './core/in-memory-fs.js';
-import { getSessionTokenUsage, resetSessionTokenUsage } from './core/agent-loop.js';
+import { getSessionTokenUsage, resetSessionTokenUsage, primaryRootOf } from './core/agent-loop.js';
 import { createSandbox } from './sandbox/sandbox.js';
 import { createLogger } from './utils/logger.js';
 import { toolRegistry } from './tools/registry.js';
-import { ContextEngine } from './context/context-engine.js';
+import { ContextEngine, collectGitChangedFiles } from './context/context-engine.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import {
   loadMarketplaceIndex,
@@ -818,26 +818,131 @@ async function handleDoctor(): Promise<void> {
   }
 }
 
+// ---- V5.23 单文件召回诊断 ----
+
+/**
+ * `codex context why <文件> <查询> [目录...] [--cwd <路径>] [--recent]`
+ * 单文件反查四路召回贡献：命中哪几路、每路得分、未召回的具体原因。
+ * --recent：接入 git 最近变更加权（与 agent-loop 接线一致）。
+ */
+async function handleContextWhy(args: string[]): Promise<void> {
+  const cwdIdx = args.indexOf('--cwd');
+  const useRecent = args.includes('--recent');
+  const positional = args.filter((a, i) => !a.startsWith('-') && !(cwdIdx !== -1 && i === cwdIdx + 1));
+  const file = positional[0];
+  const q = positional[1];
+  const targets = [...new Set(positional.slice(2))];
+  const cwdArg = cwdIdx !== -1 ? args[cwdIdx + 1] : undefined;
+
+  if (!file || !q) {
+    console.log('用法: codex context why <文件> <查询> [目录...]（--cwd <路径> 邻近加权，--recent git 变更加权）');
+    return;
+  }
+
+  const workingDir: string | string[] =
+    targets.length > 1 ? targets.map((t) => resolve(t)) : resolve(targets[0] ?? '.');
+  const primaryRoot = primaryRootOf(workingDir);
+
+  const engine = new ContextEngine();
+  try {
+    await engine.index(workingDir);
+  } catch (err) {
+    console.error(`错误: 索引失败 — ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  // 文件参数 → 键空间：绝对路径走 absToKey；相对路径直接当键（找不到时模糊匹配提示近邻）
+  let fileKey = isAbsolute(file) ? (engine.absToKey(file) ?? file) : file.replace(/\\/g, '/');
+  if (!engine.getFileContent(fileKey)) {
+    const fuzzy = engine.fuzzySearchFile(basename(fileKey));
+    if (fuzzy.length > 0) {
+      console.log(`! 文件不在索引: ${fileKey}（近邻: ${fuzzy.slice(0, 3).join(', ')}）`);
+    }
+  }
+
+  let cwdKey: string | undefined;
+  if (cwdArg) {
+    const key = engine.absToKey(resolve(cwdArg));
+    if (key) cwdKey = key || undefined;
+  }
+  const recentKeys = useRecent
+    ? collectGitChangedFiles(primaryRoot)
+        .map((abs) => engine.absToKey(abs))
+        .filter((k): k is string => !!k)
+    : undefined;
+
+  const why = engine.explainRecall(q, fileKey, { maxTokens: 8_000, cwd: cwdKey, recentFiles: recentKeys });
+
+  console.log(`Codex v${VERSION} 单文件召回诊断`);
+  console.log(`  文件: ${why.file}  查询: ${q}`);
+  console.log('');
+
+  if (!why.indexed) {
+    console.log('[结论]');
+    for (const r of why.reasons) console.log(`  × ${r}`);
+    return;
+  }
+
+  console.log('[符号路]');
+  if (why.symbolDefs.length === 0) console.log('  （未命中）');
+  for (const s of why.symbolDefs) console.log(`  ${s.name} — ${s.kind} — L${s.line}`);
+
+  console.log('[语义路]');
+  if (why.semanticCoverage === null) console.log('  （未入候选池）');
+  else {
+    const pct = (why.semanticCoverage * 100).toFixed(1);
+    const thr = (why.semanticThreshold * 100).toFixed(0);
+    console.log(`  覆盖率 ${pct}%（阈值 ${thr}%）${why.semanticCoverage > why.semanticThreshold ? '✔ 过阈值' : '✘ 未过'}`);
+  }
+
+  console.log('[关键词路]');
+  console.log(`  窗口得分: ${why.keywordScore ?? '（无）'}`);
+
+  console.log('[import 图路]');
+  if (why.importsSeeds.length === 0 && why.importedBySeeds.length === 0) {
+    console.log('  （与召回种子无直接邻接边）');
+  } else {
+    for (const dep of why.importsSeeds) console.log(`  此文件 import 种子: ${dep}`);
+    for (const imp of why.importedBySeeds) console.log(`  种子 import 此文件: ${imp}`);
+  }
+
+  console.log('[使用点路]');
+  if (why.usageOf.length === 0) console.log('  （不是任何命中符号定义文件的 importer）');
+  for (const u of why.usageOf) console.log(`  ${u.defFile} 的 hop-${u.hop} importer`);
+
+  console.log('[最终组装]');
+  if (why.assembledChunk) {
+    console.log(`  ✔ 已召回 — relevance ${why.assembledChunk.relevance} — L${why.assembledChunk.startLine}-${why.assembledChunk.endLine}`);
+  } else {
+    console.log('  ✘ 未进入最终结果');
+  }
+
+  console.log('[诊断]');
+  for (const r of why.reasons) console.log(`  - ${r}`);
+}
+
 // ---- V5.20 召回分解调试 ----
 
 /**
- * `codex context query <查询> [目录...] [--cwd <路径>] [--json]`
+ * `codex context query <查询> [目录...] [--cwd <路径>] [--json] [--recent]`
  * 与 assembleContext 相同的召回链路，逐路展示命中明细 + 最终组装结果。
  * V5.21 --json：机器可读输出（脚本/CI 消费）；修复 --cwd 的值泄漏进目录参数
  * （旧解析会把 cwd 路径当目录，产生重复根——键空间出现 src-2/ 前缀）。
+ * V5.24 --recent：接入 git 最近变更加权（与 agent-loop 接线一致）。
  */
 async function handleContextQuery(args: string[]): Promise<void> {
   // 参数解析：首参数为查询；其余非 flag 参数为目录。
   // 带值 flag（--cwd <路径>）的值不算位置参数——否则 cwd 路径会被误当目录。
   const cwdIdx = args.indexOf('--cwd');
   const jsonOut = args.includes('--json');
+  const useRecent = args.includes('--recent');
   const positional = args.filter((a, i) => !a.startsWith('-') && !(cwdIdx !== -1 && i === cwdIdx + 1));
   const q = positional[0];
   const targets = [...new Set(positional.slice(1))];
   const cwdArg = cwdIdx !== -1 ? args[cwdIdx + 1] : undefined;
 
   if (!q) {
-    console.log('用法: codex context query <查询> [目录...]（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
+    console.log('用法: codex context query <查询> [目录...]（--cwd <路径> 模拟邻近加权，--json 机器可读输出，--recent git 变更加权）');
     return;
   }
 
@@ -859,7 +964,14 @@ async function handleContextQuery(args: string[]): Promise<void> {
     if (key) cwdKey = key || undefined;
   }
 
-  const bd = engine.debugRecall(q, { maxTokens: 8_000, cwd: cwdKey });
+  // V5.24 git 最近变更 → 键空间路径（与 agent-loop 接线一致）
+  const recentKeys = useRecent
+    ? collectGitChangedFiles(primaryRootOf(workingDir))
+        .map((abs) => engine.absToKey(abs))
+        .filter((k): k is string => !!k)
+    : undefined;
+
+  const bd = engine.debugRecall(q, { maxTokens: 8_000, cwd: cwdKey, recentFiles: recentKeys });
 
   // V5.21 --json：机器可读输出（stdout 单 JSON 文档，脚本/CI 可直接解析）
   if (jsonOut) {
@@ -946,10 +1058,15 @@ async function handleContext(args: string[]): Promise<void> {
     await handleContextQuery(args.slice(1));
     return;
   }
+  if (sub === 'why') {
+    await handleContextWhy(args.slice(1));
+    return;
+  }
   if (sub !== 'stats') {
     console.log('用法:');
     console.log('  codex context stats [目录...]        索引/缓存体检（缺省当前目录；多目录 = 多根）');
     console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
+    console.log('  codex context why <文件> <查询> [目录...]  单文件召回诊断（--recent 接入 git 变更加权）');
     return;
   }
 

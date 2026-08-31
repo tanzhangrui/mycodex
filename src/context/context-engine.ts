@@ -19,6 +19,7 @@
 
 import { readFileSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
+import { execSync } from 'node:child_process';
 import { join, relative, resolve, dirname, normalize, sep, basename } from 'node:path';
 import { getConfigDir } from '../config/config.js';
 import { isSensitivePath } from '../core/privacy-guard.js';
@@ -87,6 +88,12 @@ export interface AssembleOptions {
    * 用户正在看的区域优先于语义等价但远处的命中。
    */
   cwd?: string;
+  /**
+   * V5.24 最近变更文件（键空间路径，来自 git status/diff）。
+   * 排序前 relevance +10——正在改的文件几乎总是相关上下文；
+   * 只影响排序不改召回集合（与 cwd 加权同一原则）。
+   */
+  recentFiles?: string[];
 }
 
 /** V5.18 索引体检报告（`codex context stats` 数据源） */
@@ -131,6 +138,30 @@ export interface RecallBreakdown {
   usageSites: string[];
   /** 最终组装结果（含 cwd 加权 + 预算裁剪） */
   assembled: ContextChunk[];
+}
+
+/** V5.23 单文件召回诊断（`codex context why` 数据源） */
+export interface FileRecallExplanation {
+  file: string;
+  /** 是否在索引内 */
+  indexed: boolean;
+  /** 符号路：此文件中被查询命中的符号定义 */
+  symbolDefs: SymbolEntry[];
+  /** 语义路：IDF 加权覆盖率（不过阈值也返回——诊断需要知道差多少）；未入候选池为 null */
+  semanticCoverage: number | null;
+  /** 语义阈值（诊断参照） */
+  semanticThreshold: number;
+  /** 关键词路：最优窗口命中数（0 = 内容无关键词；null = 未入候选池） */
+  keywordScore: number | null;
+  /** import 图路：此文件 import 的种子 / import 此文件的种子（双向 1 跳） */
+  importsSeeds: string[];
+  importedBySeeds: string[];
+  /** 使用点路：此文件是哪些符号定义文件的 hop-N importer（re-export 链穿透） */
+  usageOf: Array<{ defFile: string; hop: number }>;
+  /** 最终组装：命中块（null = 未进入最终结果） */
+  assembledChunk: ContextChunk | null;
+  /** 人读诊断结论（召回路径 / 未召回原因） */
+  reasons: string[];
 }
 
 // ---- 常量 ----
@@ -1342,9 +1373,37 @@ export class ContextEngine {
    */
   semanticRecall(query: string, topK = SEMANTIC_TOP_K): ContextChunk[] {
     if (!this.indexed) return [];
+    const keywords = this.extractKeywords(query);
+
+    const scored = [...this.semanticScores(query).entries()]
+      .filter(([, coverage]) => coverage > SEMANTIC_THRESHOLD)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, topK);
+
+    const chunks: ContextChunk[] = [];
+    for (const [path, coverage] of scored) {
+      const content = this.getFileContent(path);
+      if (!content) continue;
+      // 窗口优先关键词命中处，否则文件头
+      const chunk = this.findBestChunk(content, keywords, path) ?? this.chunkAroundLine(path, 1, 60);
+      if (chunk) {
+        // 语义相关性上限 80：低于符号精确命中（100），高于关键词（≤50）
+        chunk.relevance = Math.min(80, Math.max(1, Math.round(coverage * 100)));
+        chunks.push(chunk);
+      }
+    }
+    return chunks;
+  }
+
+  /**
+   * V5.23 语义路逐文件 IDF 加权覆盖率（semanticRecall / explainRecall 共用）。
+   * 返回全部候选文件（含未过阈值的——诊断"为什么没过阈值"需要知道差多少）。
+   */
+  private semanticScores(query: string): Map<string, number> {
+    if (!this.indexed) return new Map();
 
     const queryTokens = tokenizeForEmbedding(query);
-    if (queryTokens.length === 0) return [];
+    if (queryTokens.length === 0) return new Map();
 
     // 查询 token 权重（类 TF：越靠前的 token 越重要）
     const queryWeights = new Map<string, number>();
@@ -1353,7 +1412,7 @@ export class ContextEngine {
       queryWeights.set(tok, (queryWeights.get(tok) || 0) + weight);
     });
     const totalQueryWeight = [...queryWeights.values()].reduce((a, b) => a + b, 0);
-    if (totalQueryWeight === 0) return [];
+    if (totalQueryWeight === 0) return new Map();
 
     const keywords = this.extractKeywords(query);
 
@@ -1385,7 +1444,7 @@ export class ContextEngine {
       }
     }
     const N = tokenSets.length;
-    if (N === 0) return [];
+    if (N === 0) return new Map();
 
     // IDF 加权查询权重（df=0 的 token 无文件命中，仅稀释分母，与旧版语义一致）
     const idfWeights = new Map<string, number>();
@@ -1397,32 +1456,17 @@ export class ContextEngine {
       idfWeights.set(tok, weight);
       totalIdfWeight += weight;
     }
-    if (totalIdfWeight <= 0) return [];
+    if (totalIdfWeight <= 0) return new Map();
 
-    const scored: Array<{ entry: FileIndexEntry; coverage: number }> = [];
+    const scores = new Map<string, number>();
     for (const { entry, tokens } of tokenSets) {
       let hitWeight = 0;
       for (const [tok, weight] of idfWeights) {
         if (tokens.has(tok)) hitWeight += weight;
       }
-      const coverage = hitWeight / totalIdfWeight;
-      if (coverage > SEMANTIC_THRESHOLD) scored.push({ entry, coverage });
+      scores.set(entry.path, hitWeight / totalIdfWeight);
     }
-    scored.sort((a, b) => b.coverage - a.coverage);
-
-    const chunks: ContextChunk[] = [];
-    for (const { entry, coverage } of scored.slice(0, topK)) {
-      const content = this.getFileContent(entry.path);
-      if (!content) continue;
-      // 窗口优先关键词命中处，否则文件头
-      const chunk = this.findBestChunk(content, keywords, entry.path) ?? this.chunkAroundLine(entry.path, 1, 60);
-      if (chunk) {
-        // 语义相关性上限 80：低于符号精确命中（100），高于关键词（≤50）
-        chunk.relevance = Math.min(80, Math.max(1, Math.round(coverage * 100)));
-        chunks.push(chunk);
-      }
-    }
-    return chunks;
+    return scores;
   }
 
   /** 文件 token 集（路径 + 内容截断分词，LRU 缓存；未索引/不可读返回 null） */
@@ -1524,6 +1568,14 @@ export class ContextEngine {
         } else if (cwdRoot && this.multiRoots && chunk.path.startsWith(cwdRoot + '/')) {
           chunk.relevance += 8; // 多根模式下同根
         }
+      }
+    }
+
+    // V5.24 最近变更加权：正在改的文件几乎总是相关上下文（仅影响排序，与 cwd 加权同一原则）
+    if (opts.recentFiles && opts.recentFiles.length > 0) {
+      const recentSet = new Set(opts.recentFiles.map(normalizeRelPath));
+      for (const chunk of byPath.values()) {
+        if (recentSet.has(chunk.path)) chunk.relevance += 10;
       }
     }
 
@@ -2024,6 +2076,138 @@ export class ContextEngine {
   }
 
   /**
+   * V5.23 单文件召回诊断（`codex context why` 数据源）：
+   * 对指定文件逐路检查四路召回的贡献——命中哪几路、每路的得分细节、
+   * 最终是否进入组装结果、未召回的具体原因（阈值差多少 / 图上多远）。
+   */
+  explainRecall(query: string, file: string, opts: AssembleOptions = {}): FileRecallExplanation {
+    const key = normalizeRelPath(file);
+    const indexed = this.filePathSet.has(key);
+    const reasons: string[] = [];
+
+    if (!indexed) {
+      return {
+        file: key,
+        indexed: false,
+        symbolDefs: [],
+        semanticCoverage: null,
+        semanticThreshold: SEMANTIC_THRESHOLD,
+        keywordScore: null,
+        importsSeeds: [],
+        importedBySeeds: [],
+        usageOf: [],
+        assembledChunk: null,
+        reasons: ['文件不在索引内（路径拼错 / 被 IGNORE 忽略 / 非 tracked 文件）'],
+      };
+    }
+
+    // ---- 逐路检查（与 assembleContext 相同链路） ----
+    const symbols = this.resolveQuerySymbols(query);
+    const symbolDefs = symbols.filter((s) => s.file === key);
+
+    const semanticScore = this.semanticScores(query).get(key) ?? null;
+
+    const keywords = this.extractKeywords(query);
+    const keywordChunk = this.keywordRecall(keywords).find((c) => c.path === key) ?? null;
+
+    // import 图路：种子集合（符号 + 关键词 + 语义 + 显式种子）
+    const keywordChunks = this.keywordRecall(keywords);
+    const semantic = this.semanticRecall(query);
+    const seedSet = new Set(
+      [
+        ...symbols.map((s) => s.file),
+        ...keywordChunks.map((c) => c.path),
+        ...semantic.map((c) => c.path),
+        ...(opts.seedFiles ?? []).map(normalizeRelPath),
+      ].filter((p) => this.filePathSet.has(p)),
+    );
+    const importsSeeds = this.parseImports(key).filter((dep) => seedSet.has(dep));
+    const importedBySeeds = this.getImportedBy(key).filter((imp) => seedSet.has(imp));
+
+    // 使用点路：此文件是哪些命中符号定义文件的 hop-N importer
+    const usageOf: Array<{ defFile: string; hop: number }> = [];
+    for (const sym of symbols) {
+      const layered = this.getImportedByLayered(sym.file).find((x) => x.file === key);
+      if (layered) usageOf.push({ defFile: sym.file, hop: layered.hop });
+    }
+
+    // 最终组装结果
+    const assembled = this.assembleContext(query, opts);
+    const assembledChunk = assembled.find((c) => c.path === key) ?? null;
+
+    // ---- 人读诊断 ----
+    const hitWays: string[] = [];
+    if (symbolDefs.length > 0) {
+      hitWays.push(`符号路（${symbolDefs.map((s) => s.name).join(', ')}，relevance 100）`);
+    }
+    if (semanticScore !== null && semanticScore > SEMANTIC_THRESHOLD) {
+      hitWays.push(`语义路（覆盖率 ${(semanticScore * 100).toFixed(0)}% > 阈值）`);
+    }
+    if (keywordChunk) {
+      hitWays.push(`关键词路（窗口得分 ${keywordChunk.relevance}）`);
+    }
+    if (importsSeeds.length > 0 || importedBySeeds.length > 0) {
+      hitWays.push(`import 图路（${importsSeeds.length + importedBySeeds.length} 条种子邻接边）`);
+    }
+    if (usageOf.length > 0) {
+      hitWays.push(`使用点路（${usageOf.map((u) => `${u.defFile} 的 hop-${u.hop} importer`).join('; ')}）`);
+    }
+
+    if (assembledChunk) {
+      reasons.push(
+        hitWays.length > 0
+          ? `已召回（relevance ${assembledChunk.relevance}）：${hitWays.join('；')}`
+          : `已召回（relevance ${assembledChunk.relevance}）`,
+      );
+    } else {
+      // 未进入最终结果：逐路给出未命中原因
+      const miss: string[] = [];
+      if (symbolDefs.length === 0) {
+        miss.push('符号路未命中（查询 token 未匹配此文件符号）');
+      }
+      if (semanticScore === null) {
+        miss.push('语义路未入候选池（大仓未进名称相关性 top-30）');
+      } else if (semanticScore <= SEMANTIC_THRESHOLD) {
+        miss.push(
+          `语义路未过阈值（覆盖率 ${(semanticScore * 100).toFixed(1)}% ≤ ${(SEMANTIC_THRESHOLD * 100).toFixed(0)}%）`,
+        );
+      }
+      if (!keywordChunk) {
+        miss.push(
+          keywords.length === 0
+            ? '关键词路无关键词可查'
+            : `关键词路未命中（名称不含关键词且内容无窗口命中）`,
+        );
+      }
+      if (importsSeeds.length === 0 && importedBySeeds.length === 0) {
+        miss.push('import 图路：与召回种子无直接邻接边（多跳可达不被 1 跳扩展覆盖）');
+      }
+      if (usageOf.length === 0) {
+        miss.push('使用点路：不是任何命中符号定义文件的 importer');
+      }
+      // 四路有命中但没进组装 → 排序/预算挤出
+      if (miss.length < 5) {
+        miss.push('四路有命中但被排序/预算裁剪挤出最终组装（降低 token 预算占用或提高相关性）');
+      }
+      reasons.push(...miss);
+    }
+
+    return {
+      file: key,
+      indexed: true,
+      symbolDefs,
+      semanticCoverage: semanticScore,
+      semanticThreshold: SEMANTIC_THRESHOLD,
+      keywordScore: keywordChunk ? keywordChunk.relevance : 0,
+      importsSeeds,
+      importedBySeeds,
+      usageOf,
+      assembledChunk,
+      reasons,
+    };
+  }
+
+  /**
    * 获取文件索引统计
    */
   getStats(): { fileCount: number; memoryCount: number; ruleCount: number; symbolCount: number; lazy: boolean } {
@@ -2121,6 +2305,48 @@ function extOf(path: string): string {
 function extractIdentifierTokens(query: string): string[] {
   const tokens = query.match(/[A-Za-z_$][\w$]*/g) ?? [];
   return [...new Set(tokens)].filter((t) => t.length >= 2);
+}
+
+// ---- V5.24 git 最近变更采集 ----
+
+/**
+ * V5.24 采集 git 工作区最近变更文件（绝对路径，去重）。
+ * 数据源：`git status --porcelain`（暂存/未暂存/未跟踪）∪ `git diff --name-only HEAD`（与最近提交的差）。
+ * 非 git 仓 / git 不可用 → 空数组（调用方静默降级，绝不阻断召回）。
+ * 超时护栏：3 秒——巨型仓的 status 不应拖慢上下文组装。
+ */
+export function collectGitChangedFiles(rootDir: string): string[] {
+  const run = (args: string[]): string => {
+    try {
+      return execSync(`git ${args.join(' ')}`, {
+        cwd: rootDir,
+        encoding: 'utf-8',
+        timeout: 3_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        maxBuffer: 4 * 1024 * 1024,
+      });
+    } catch {
+      return '';
+    }
+  };
+
+  const paths = new Set<string>();
+
+  // porcelain：XY 路径（含 rename 的 ORIG → NEW 形态，取箭头右侧）
+  for (const line of run(['status', '--porcelain', '--untracked-files=all']).split('\n')) {
+    if (!line.trim()) continue;
+    const pathPart = line.slice(3).trim();
+    const renamed = pathPart.match(/^"?.*? -> (.*?)"?$/);
+    const p = (renamed ? renamed[1] : pathPart).replace(/^"|"$/g, '');
+    if (p) paths.add(p);
+  }
+
+  // 与最近提交的差（最近一轮工作的信号）
+  for (const p of run(['diff', '--name-only', 'HEAD']).split('\n')) {
+    if (p.trim()) paths.add(p.trim());
+  }
+
+  return [...paths].map((p) => resolve(rootDir, p));
 }
 
 // ---- V3.4 模块级共享单例 ----
