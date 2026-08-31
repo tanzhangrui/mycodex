@@ -2233,6 +2233,26 @@ export class ContextEngine {
   }
 
   /**
+   * V5.31 全量符号清单（`codex context bench` 查询抽样源）。
+   * 触发全局符号索引构建（惰性），返回按（name, file, line）稳定排序的
+   * 扁平列表——外部基准据此分层抽样生成查询，符号所在文件即 ground truth。
+   */
+  listSymbols(): SymbolEntry[] {
+    const index = this.buildSymbolIndex();
+    const all: SymbolEntry[] = [];
+    for (const list of index.values()) all.push(...list);
+    // 名称大小写不敏感排序（camelCase/PascalCase 混排自然有序），同名单文件内按行号
+    all.sort((a, b) => {
+      const la = a.name.toLowerCase();
+      const lb = b.name.toLowerCase();
+      if (la !== lb) return la < lb ? -1 : 1;
+      if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+      return a.line - b.line;
+    });
+    return all;
+  }
+
+  /**
    * V5.23 单文件召回诊断（`codex context why` 数据源）：
    * 对指定文件逐路检查四路召回的贡献——命中哪几路、每路的得分细节、
    * 最终是否进入组装结果、未召回的具体原因（阈值差多少 / 图上多远）。

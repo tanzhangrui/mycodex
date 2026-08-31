@@ -1145,6 +1145,74 @@ describe('V5.30 同文件多符号窗口合并', () => {
   });
 });
 
+// ---- V5.31 全量符号清单（codex context bench 抽样源） ----
+
+describe('V5.31 listSymbols（bench 查询抽样源）', () => {
+  it('返回全量符号（类/方法/函数），带 file/line，按名称稳定排序', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v531list-'));
+    writeFileSync(
+      join(r, 'svc.ts'),
+      'export class ZetaService {\n  zeta(): void {}\n}\nexport function alphaHelper(): void {}\n',
+    );
+    writeFileSync(join(r, 'util.ts'), 'export interface BetaShape {\n  id: string;\n}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const syms = e.listSymbols();
+    const names = syms.map((s) => s.name);
+    // 排序不变量：名称升序（alphaHelper < BetaShape 大小写不敏感 < ZetaService…）
+    const lower = names.map((n) => n.toLowerCase());
+    expect([...lower]).toEqual([...lower].sort());
+
+    const zeta = syms.find((s) => s.name === 'ZetaService');
+    expect(zeta).toBeDefined();
+    expect(zeta!.kind).toBe('class');
+    expect(zeta!.file).toBe('svc.ts');
+    expect(zeta!.line).toBe(1);
+    expect(syms.some((s) => s.name === 'zeta' && s.kind === 'method')).toBe(true);
+    expect(syms.some((s) => s.name === 'BetaShape' && s.file === 'util.ts')).toBe(true);
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('确定性：两次调用返回完全一致的清单', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v531det-'));
+    writeFileSync(join(r, 'a.ts'), 'export class Aaa {}\n');
+    writeFileSync(join(r, 'b.ts'), 'export class Bbb {}\nexport function ccc(): void {}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+    expect(e.listSymbols()).toEqual(e.listSymbols());
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('bench 核心不变量：抽样符号查询 → 定义文件在组装结果 top-3', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v531inv-'));
+    writeFileSync(
+      join(r, 'pay.ts'),
+      '/** 支付网关 */\nexport class PayGateway {\n  charge(): void {}\n}\n',
+    );
+    writeFileSync(join(r, 'cart.ts'), 'export class CartBasket {\n  add(): void {}\n}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+
+    for (const s of e.listSymbols()) {
+      const paths = e.assembleContext(s.name, { maxTokens: 20_000 }).map((c) => c.path);
+      const rank = paths.indexOf(s.file) + 1;
+      expect(rank).toBeGreaterThanOrEqual(1);
+      expect(rank).toBeLessThanOrEqual(3);
+    }
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('空工作区：返回空数组', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v531empty-'));
+    const e = new ContextEngine();
+    await e.index(r);
+    expect(e.listSymbols()).toEqual([]);
+    rmSync(r, { recursive: true, force: true });
+  });
+});
+
 // ---- V5.25 会话活动加权 ----
 
 describe('V5.25 会话活动加权（recordSessionActivity）', () => {

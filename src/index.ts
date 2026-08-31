@@ -109,7 +109,7 @@ Codex — 顶级 CLI AI 编程工具 v${VERSION}
   codex update    检查更新
   codex doctor    环境体检（配置 / 运行时 / 插件健康）
   codex plugin    插件市场（list / search / install / update / outdated / remove）
-  codex context   上下文引擎（stats — 索引/缓存/召回体检）
+  codex context   上下文引擎（stats / query / why / bench — 体检 / 召回调试 / 质量基准）
   codex --help    显示此帮助
   codex --version 显示版本号
 
@@ -1051,6 +1051,160 @@ async function handleContextQuery(args: string[]): Promise<void> {
   });
 }
 
+// ---- V5.31 召回质量基准 ----
+
+/**
+ * `codex context bench [目录...] [--json] [--queries N] [--max-tokens T]`
+ * 对任意目录跑召回质量基准（V5.28 固定语料基准的通用版）：
+ * - 查询自动生成：从全局符号索引分层抽样 N 个符号，符号名即查询、
+ *   所在文件即 ground truth——无需人工标注即可在任意代码库上复跑。
+ * - 指标：Recall@1/3/10、MRR、平均组装耗时 / chunk 数 / token 估算。
+ * - 负例防线：固定乱码查询误召回即红灯（exit 1，CI 可感知）；
+ *   召回指标本身不设硬阈值（不同代码库基线不同，供观察与回归对比）。
+ * - --json：机器可读输出（与 context query/why --json 同约定）。
+ */
+async function handleContextBench(args: string[]): Promise<void> {
+  const jsonOut = args.includes('--json');
+  const queriesIdx = args.indexOf('--queries');
+  const tokensIdx = args.indexOf('--max-tokens');
+  const positional = args.filter(
+    (a, i) =>
+      !a.startsWith('-') &&
+      !(queriesIdx !== -1 && i === queriesIdx + 1) &&
+      !(tokensIdx !== -1 && i === tokensIdx + 1),
+  );
+  const targets = [...new Set(positional)];
+  const queryCount = Math.max(1, Number(queriesIdx !== -1 ? args[queriesIdx + 1] : 20) || 20);
+  const maxTokens = Math.max(500, Number(tokensIdx !== -1 ? args[tokensIdx + 1] : 12_000) || 12_000);
+
+  const workingDir: string | string[] =
+    targets.length > 1 ? targets.map((t) => resolve(t)) : resolve(targets[0] ?? '.');
+
+  const engine = new ContextEngine();
+  try {
+    await engine.index(workingDir);
+  } catch (err) {
+    console.error(`错误: 索引失败 — ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  const report = engine.getContextReport();
+
+  // 抽样池：全量符号 → 名称≥3字符 → 按 name@file 去重（同名同文件只测一次）
+  const pool: Array<{ name: string; kind: string; file: string }> = [];
+  const seen = new Set<string>();
+  for (const s of engine.listSymbols()) {
+    if (s.name.length < 3) continue;
+    const k = `${s.name}@${s.file}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    pool.push({ name: s.name, kind: s.kind, file: s.file });
+  }
+
+  // 分层抽样：排序后的池均匀取 N 个（确定性——同代码库同参数必得同样本集）
+  const samples =
+    pool.length <= queryCount
+      ? pool
+      : Array.from({ length: queryCount }, (_, i) => pool[Math.floor((i * pool.length) / queryCount)]);
+
+  // 逐查询测召回排名 + 耗时
+  const results: Array<{ name: string; kind: string; file: string; rank: number; ms: number; chunks: number; tokens: number }> = [];
+  for (const s of samples) {
+    const t0 = Date.now();
+    const chunks = engine.assembleContext(s.name, { maxTokens });
+    const ms = Date.now() - t0;
+    const idx = chunks.findIndex((c) => c.path === s.file);
+    results.push({
+      ...s,
+      rank: idx === -1 ? Number.POSITIVE_INFINITY : idx + 1,
+      ms,
+      chunks: chunks.length,
+      tokens: Math.round(chunks.reduce((n, c) => n + c.content.length, 0) / 4),
+    });
+  }
+
+  // 负例防线：固定乱码查询（跨库稳定）——任何非空组装都是误召回
+  const NEG_PROBES = ['zzzqqq wvvv', 'qqqzzz yyxx', 'aaabbb cccddd'];
+  const falsePositives = NEG_PROBES.filter((q) => engine.assembleContext(q, { maxTokens }).length > 0);
+
+  const total = results.length;
+  const hitAt = (k: number) => results.filter((r) => r.rank <= k).length;
+  const mrr = total === 0 ? 0 : results.reduce((n, r) => n + (Number.isFinite(r.rank) ? 1 / r.rank : 0), 0) / total;
+  const avg = (f: (r: (typeof results)[number]) => number) => (total === 0 ? 0 : results.reduce((n, r) => n + f(r), 0) / total);
+  const missed = results.filter((r) => !Number.isFinite(r.rank));
+
+  const pass = falsePositives.length === 0;
+
+  if (jsonOut) {
+    console.log(
+      JSON.stringify(
+        {
+          version: VERSION,
+          root: Array.isArray(workingDir) ? workingDir : [workingDir],
+          fileCount: report.fileCount,
+          symbolCount: report.symbolCount,
+          queries: total,
+          maxTokens,
+          recall: {
+            at1: hitAt(1),
+            at3: hitAt(3),
+            at10: hitAt(10),
+            mrr: Number(mrr.toFixed(4)),
+          },
+          perf: {
+            avgMs: Number(avg((r) => r.ms).toFixed(1)),
+            avgChunks: Number(avg((r) => r.chunks).toFixed(1)),
+            avgTokens: Math.round(avg((r) => r.tokens)),
+          },
+          negatives: { probes: NEG_PROBES.length, falsePositives },
+          samples: results.map((r) => ({
+            symbol: r.name,
+            kind: r.kind,
+            file: r.file,
+            rank: Number.isFinite(r.rank) ? r.rank : null,
+          })),
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(`Codex v${VERSION} 召回质量基准`);
+    console.log(
+      `  目录: ${report.roots.map((r) => r.abs).join(' + ')}（${report.fileCount} 文件 / ${report.symbolCount} 符号）`,
+    );
+    console.log(`  查询: ${total} 个（符号分层抽样，确定性复现）  预算: ${maxTokens} tokens`);
+    console.log('');
+    console.log('[召回质量]');
+    if (total === 0) {
+      console.log('  （无可测符号——索引为空或全部短于 3 字符）');
+    } else {
+      console.log(`  Recall@1:  ${((hitAt(1) / total) * 100).toFixed(1)}%（${hitAt(1)}/${total}）`);
+      console.log(`  Recall@3:  ${((hitAt(3) / total) * 100).toFixed(1)}%（${hitAt(3)}/${total}）`);
+      console.log(`  Recall@10: ${((hitAt(10) / total) * 100).toFixed(1)}%（${hitAt(10)}/${total}）`);
+      console.log(`  MRR: ${mrr.toFixed(3)}`);
+      for (const m of missed.slice(0, 5)) console.log(`  ! 未召回: ${m.name}（${m.kind}）— ${m.file}`);
+      if (missed.length > 5) console.log(`  ! …另有 ${missed.length - 5} 个未召回`);
+    }
+    console.log('');
+    console.log('[性能]');
+    console.log(`  平均组装耗时: ${avg((r) => r.ms).toFixed(1)}ms`);
+    console.log(`  平均 chunk 数: ${avg((r) => r.chunks).toFixed(1)}`);
+    console.log(`  平均 token 估算: ${Math.round(avg((r) => r.tokens))}`);
+    console.log('');
+    console.log('[负例防线]');
+    console.log(
+      pass
+        ? `  乱码查询误召回: 0/${NEG_PROBES.length} ✔`
+        : `  乱码查询误召回: ${falsePositives.length}/${NEG_PROBES.length} ✘ — ${falsePositives.join(' | ')}`,
+    );
+    console.log('');
+    console.log(pass ? '结果: PASS' : '结果: FAIL（负例误召回——召回阈值/IDF 防线被突破）');
+  }
+
+  if (!pass) process.exit(1);
+}
+
 // ---- V5.18 上下文引擎体检 ----
 
 /**
@@ -1073,11 +1227,16 @@ async function handleContext(args: string[]): Promise<void> {
     await handleContextWhy(args.slice(1));
     return;
   }
+  if (sub === 'bench') {
+    await handleContextBench(args.slice(1));
+    return;
+  }
   if (sub !== 'stats') {
     console.log('用法:');
     console.log('  codex context stats [目录...]        索引/缓存体检（缺省当前目录；多目录 = 多根）');
     console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
     console.log('  codex context why <文件> <查询> [目录...]  单文件召回诊断（--recent 接入 git 变更加权，--json 机器可读输出）');
+    console.log('  codex context bench [目录...]         召回质量基准（符号抽样自动生成查询，--json / --queries N / --max-tokens T）');
     return;
   }
 
