@@ -214,6 +214,51 @@ describe('semanticRecall IDF 加权（V5.4）', () => {
   });
 });
 
+// ---- V5.33 语义路 IDF df=0 权重归零 ----
+
+describe('V5.33 IDF df=0 归零（未收录 token 不稀释覆盖率）', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v533-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(
+      join(r, 'src', 'user-service.ts'),
+      `export const createUser = (name: string) => {\n  // 创建用户 记录审计日志\n  return { id: 1, name };\n};\n`,
+    );
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(join(r, 'src', `filler-${i}.ts`), `export const value${i} = ${i};\n`);
+    }
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('真实词混入未收录词：目标文件覆盖率不降（不被稀释到阈值下）', () => {
+    const clean = e.semanticRecall('createUser 创建用户');
+    const mixed = e.semanticRecall('createUser 创建用户 完全未收录的口语拼错词xyzq');
+    expect(clean.length).toBeGreaterThan(0);
+    expect(mixed.length).toBeGreaterThan(0);
+    expect(mixed[0].path).toBe('src/user-service.ts');
+    // df=0 权重归零：混入垃圾 token 后目标文件 relevance 不变（旧版被稀释会降低）
+    expect(mixed[0].relevance).toBe(clean[0].relevance);
+  });
+
+  it('全部 token 未收录：零权重 → 空结果（负例防线更硬）', () => {
+    expect(e.semanticRecall('xyzq werdz cccvvv')).toEqual([]);
+  });
+
+  it('组装链路：口语查询混拼错词仍召回正确文件', () => {
+    const chunks = e.assembleContext('creatUser 创建用户 拼错的辅助词zzx');
+    const paths = chunks.map((c) => c.path);
+    expect(paths).toContain('src/user-service.ts');
+  });
+});
+
 // ---- 索引持久化 ----
 
 describe('索引持久化', () => {
@@ -225,9 +270,13 @@ describe('索引持久化', () => {
     expect(existsSync(cacheDir)).toBe(true);
     const cacheFiles = readdirSync(cacheDir);
     expect(cacheFiles.length).toBeGreaterThan(0);
-    const content = readFileSync(join(cacheDir, cacheFiles[0]), 'utf-8');
-    expect(content).toContain('src/auth-service.ts');
-    expect(content).toContain('AuthService');
+    // V5.33：其他 describe 的引擎也会落盘（readdir 顺序不定）——
+    // 遍历找本工作区的缓存文件，不再依赖 cacheFiles[0]
+    const hit = cacheFiles
+      .map((f) => readFileSync(join(cacheDir, f), 'utf-8'))
+      .find((c) => c.includes('src/auth-service.ts'));
+    expect(hit).toBeDefined();
+    expect(hit).toContain('AuthService');
   });
 
   it('跨实例复用：新引擎同目录索引后符号查询等价（种子免读盘）', async () => {

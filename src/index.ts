@@ -1024,7 +1024,8 @@ async function handleContextQuery(args: string[]): Promise<void> {
   console.log(`[语义召回]（${bd.semantic.length}，token 覆盖率）`);
   if (bd.semantic.length === 0) console.log('  （无）');
   for (const c of bd.semantic) {
-    console.log(`  ${c.path} — 覆盖率 ${(c.relevance * 100).toFixed(0)}% — L${c.startLine}-${c.endLine}`);
+    // V5.33 显示修复：relevance 本身就是覆盖率百分数（1–80），旧版再乘 100 输出 "3100%"
+    console.log(`  ${c.path} — 覆盖率 ${c.relevance}% — L${c.startLine}-${c.endLine}`);
   }
 
   // 3) 关键词

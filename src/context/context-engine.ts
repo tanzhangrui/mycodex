@@ -1502,12 +1502,15 @@ export class ContextEngine {
     const N = tokenSets.length;
     if (N === 0) return new Map();
 
-    // IDF 加权查询权重（df=0 的 token 无文件命中，仅稀释分母，与旧版语义一致）
+    // V5.33 IDF 加权查询权重：df=0 的 token 权重归零——
+    // 旧版 Math.max(1, d) 给无命中 token 最大 IDF，纯稀释分母：
+    // 查询里混入未收录 token（口语词 / 拼错）会把真实命中的覆盖率压到阈值下。
     const idfWeights = new Map<string, number>();
     let totalIdfWeight = 0;
     for (const [tok, w] of queryWeights) {
       const d = df.get(tok) ?? 0;
-      const idf = Math.log(1 + N / Math.max(1, d));
+      if (d === 0) continue; // 无文件命中：不贡献权重也不稀释分母
+      const idf = Math.log(1 + N / d);
       const weight = w * idf;
       idfWeights.set(tok, weight);
       totalIdfWeight += weight;
