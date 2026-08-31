@@ -193,6 +193,14 @@ const IMPORT_EXPAND_MAX_FILES = 3;
 const LRU_SIZE = 200;
 /** V5.25 会话活动记录上限（FIFO，超出淘汰最旧） */
 const SESSION_ACTIVITY_MAX_FILES = 50;
+/** V5.29 组装结果缓存 TTL（多轮对话同问题短窗复用；文件变更走代际失效，TTL 只是兜底） */
+const ASSEMBLE_CACHE_TTL_MS = 5 * 60 * 1000;
+/** V5.29 组装缓存条目上限（FIFO 淘汰最旧） */
+const ASSEMBLE_CACHE_MAX = 32;
+/** V5.30 同文件窗口合并：邻近间隔阈值（行）——间隔 ≤ 此值的窗口视为同一片区域 */
+const WINDOW_MERGE_GAP = 5;
+/** V5.30 同文件窗口合并后跨度上限（行）——防"文件首尾各一个符号"合并成巨型 chunk 撑爆预算 */
+const WINDOW_MERGE_MAX_SPAN = 200;
 
 // ---- V3.4 语义检索（n-gram token 覆盖率匹配） ----
 
@@ -577,6 +585,14 @@ export class ContextEngine {
    */
   private sessionActivityKeys: string[] = [];
 
+  /**
+   * V5.29 组装结果缓存：查询+选项指纹（含会话活动）→ 组装结果。
+   * 文件增删改 → indexGeneration 代际失效（invalidateFile/applyFileList 递增）；
+   * TTL 5 分钟兜底；上限 32 条 FIFO。调用方拿到的是拷贝，篡改不污染缓存。
+   */
+  private assembleCache = new Map<string, { chunks: ContextChunk[]; generation: number; savedAt: number }>();
+  private indexGeneration = 0;
+
   /** V3.4 持久化写盘串行链 + 防重入标记 */
   private saveChain: Promise<void> = Promise.resolve();
   private savePending = false;
@@ -767,13 +783,31 @@ export class ContextEngine {
     this.tokenCache.delete(relPath);
     this.persistedSymbols.delete(relPath);
     this.persistedImports.delete(relPath);
+    this.indexGeneration++; // V5.29 文件内容/存在性变化 → 组装缓存代际失效
   }
 
   private applyFileList(files: FileIndexEntry[]): void {
+    // V5.29 文件集真变化才递增代际（agent-loop 每轮 refresh，无变化时不得让组装缓存永久 miss）
+    const nextSet = new Set(files.map((f) => f.path));
+    const changed =
+      this.filePathSet.size !== nextSet.size || [...nextSet].some((p) => !this.filePathSet.has(p));
     this.fileIndex = files;
-    this.filePathSet = new Set(files.map((f) => f.path));
+    this.filePathSet = nextSet;
     this.fileTrie = new FileTrie();
     for (const f of files) this.fileTrie.insert(f.path);
+    if (changed) this.indexGeneration++;
+  }
+
+  /** V5.29 组装缓存键：查询 + 全部影响结果的选项 + 会话活动（任一变化即天然 miss） */
+  private assembleCacheKey(query: string, opts: AssembleOptions, maxTokens: number): string {
+    return JSON.stringify([
+      query,
+      maxTokens,
+      opts.cwd ?? null,
+      opts.seedFiles ?? [],
+      opts.recentFiles ?? [],
+      this.sessionActivityKeys,
+    ]);
   }
 
   /**
@@ -1514,14 +1548,26 @@ export class ContextEngine {
     if (!this.indexed) return [];
     const maxTokens = opts.maxTokens ?? 20_000;
 
+    // V5.29 组装缓存：同查询+同选项（含会话活动）且代际未变 → 直接复用
+    const cacheKey = this.assembleCacheKey(query, opts, maxTokens);
+    const hit = this.assembleCache.get(cacheKey);
+    if (hit && hit.generation === this.indexGeneration && Date.now() - hit.savedAt < ASSEMBLE_CACHE_TTL_MS) {
+      return hit.chunks.map((c) => ({ ...c })); // 拷贝返回，调用方篡改不污染缓存
+    }
+
     const keywords = this.extractKeywords(query);
     const byPath = new Map<string, ContextChunk>();
 
     // 1) 符号命中：定义处 ±20 行（相关性 100+，远高于其他召回）
+    // V5.30：同文件全部符号窗口先收集（稍后合并去重）
     const symbolHits = this.resolveQuerySymbols(query);
+    const symWindows = new Map<string, Array<[number, number]>>();
     for (const sym of symbolHits) {
       const chunk = this.chunkAroundLine(sym.file, sym.line, 20);
       if (chunk) {
+        const list = symWindows.get(chunk.path) ?? [];
+        list.push([chunk.startLine, chunk.endLine]);
+        symWindows.set(chunk.path, list);
         const existing = byPath.get(chunk.path);
         chunk.relevance = 100;
         if (!existing || existing.relevance < chunk.relevance) byPath.set(chunk.path, chunk);
@@ -1580,6 +1626,26 @@ export class ContextEngine {
       }
     }
 
+    // 4c) V5.30 组装去重：同文件多符号窗口重叠/邻近（间隔 ≤ WINDOW_MERGE_GAP）时
+    // 合并成一个 chunk 覆盖全部命中符号——此前同文件第二个符号的窗口会在
+    // byPath 竞争中整体丢失，Agent 看不到第二个定义。跨度上限防首尾符号合并成巨型 chunk。
+    for (const [path, windows] of symWindows) {
+      const winner = byPath.get(path);
+      if (!winner || windows.length < 2) continue;
+      const merged = mergeLineRanges(
+        windows.map(([s, e]) => [s, e] as [number, number]).concat([[winner.startLine, winner.endLine]]),
+        WINDOW_MERGE_GAP,
+      );
+      // 合并后仍是单一区间（全部窗口聚成一片）且跨度受控 → 展宽 winner 覆盖全部符号
+      if (merged.length !== 1) continue;
+      const [ms, me] = merged[0];
+      if (me - ms + 1 > WINDOW_MERGE_MAX_SPAN) continue;
+      if (ms < winner.startLine || me > winner.endLine) {
+        const widened = this.resliceChunk(path, ms, me, winner);
+        if (widened) byPath.set(path, widened);
+      }
+    }
+
     // V5.13 cwd 邻近加权：用户正在看的区域优先（仅影响排序，不改召回集合）
     const cwd = opts.cwd ? normalizeRelPath(opts.cwd) : '';
     if (cwd) {
@@ -1620,6 +1686,17 @@ export class ContextEngine {
       if (totalTokens + tokens > maxTokens) break;
       totalTokens += tokens;
       result.push(chunk);
+    }
+
+    // V5.29 写入组装缓存（拷贝入缓存，外部引用与缓存隔离）；FIFO 淘汰最旧
+    this.assembleCache.set(cacheKey, {
+      chunks: result.map((c) => ({ ...c })),
+      generation: this.indexGeneration,
+      savedAt: Date.now(),
+    });
+    if (this.assembleCache.size > ASSEMBLE_CACHE_MAX) {
+      const oldest = this.assembleCache.keys().next().value;
+      if (oldest !== undefined) this.assembleCache.delete(oldest);
     }
 
     return result;
@@ -1687,6 +1764,22 @@ export class ContextEngine {
       path: normalizeRelPath(relPath),
       content: lines.slice(start, end).join('\n'),
       relevance: 0,
+      startLine: start + 1,
+      endLine: end,
+    };
+  }
+
+  /** V5.30 按行区间重切 chunk（保留 relevance 等字段；越界钳制，失败返回 null） */
+  private resliceChunk(path: string, startLine: number, endLine: number, base: ContextChunk): ContextChunk | null {
+    const content = this.getFileContent(path);
+    if (!content) return null;
+    const lines = content.split('\n');
+    const start = Math.max(0, startLine - 1);
+    const end = Math.min(lines.length, endLine);
+    if (end <= start) return null;
+    return {
+      ...base,
+      content: lines.slice(start, end).join('\n'),
       startLine: start + 1,
       endLine: end,
     };
@@ -2134,6 +2227,11 @@ export class ContextEngine {
     this.sessionActivityKeys = [];
   }
 
+  /** V5.29 组装缓存条目数（诊断/测试用；代际失效的陈旧条目惰性淘汰不计成本） */
+  assembleCacheSize(): number {
+    return this.assembleCache.size;
+  }
+
   /**
    * V5.23 单文件召回诊断（`codex context why` 数据源）：
    * 对指定文件逐路检查四路召回的贡献——命中哪几路、每路的得分细节、
@@ -2364,6 +2462,18 @@ export class ContextEngine {
 
 function normalizeRelPath(p: string): string {
   return p.replace(/\\/g, '/');
+}
+
+/** V5.30 区间合并：重叠或间隔 ≤ gap 的行区间并成一个（输入无序，输出按起点有序） */
+function mergeLineRanges(ranges: Array<[number, number]>, gap: number): Array<[number, number]> {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  const out: Array<[number, number]> = [];
+  for (const [s, e] of sorted) {
+    const last = out[out.length - 1];
+    if (last && s <= last[1] + gap) last[1] = Math.max(last[1], e);
+    else out.push([s, e]);
+  }
+  return out;
 }
 
 function extOf(path: string): string {

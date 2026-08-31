@@ -1005,6 +1005,146 @@ function isAbsoluteWinOrPosix(p: string): boolean {
   return /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('/');
 }
 
+// ---- V5.29 组装缓存 ----
+
+describe('V5.29 组装缓存（同查询短窗复用 + 代际失效）', () => {
+  it('命中：同查询同选项两次组装，缓存条目只增 1；结果等价且返回拷贝', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v529-'));
+    writeFileSync(join(r, 'svc.ts'), 'export class CacheSvc {\n  run(): void {}\n}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const a = e.assembleContext('CacheSvc', { maxTokens: 20_000 });
+    expect(e.assembleCacheSize()).toBe(1);
+    const b = e.assembleContext('CacheSvc', { maxTokens: 20_000 });
+    expect(e.assembleCacheSize()).toBe(1); // 命中不新增
+
+    expect(b.map((c) => `${c.path}:${c.startLine}`)).toEqual(a.map((c) => `${c.path}:${c.startLine}`));
+
+    // 返回拷贝：调用方篡改不污染缓存
+    b[0].relevance = 9999;
+    const c = e.assembleContext('CacheSvc', { maxTokens: 20_000 });
+    expect(c[0].relevance).not.toBe(9999);
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('键含会话活动：记录活动后同查询重新组装，加权生效（防陈旧缓存返回旧排序）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v529act-'));
+    writeFileSync(join(r, 'a-cache.ts'), 'export const cacheAlpha = 1;\n');
+    writeFileSync(join(r, 'b-cache.ts'), 'export const cacheBeta = 2;\n');
+    const t = new Date();
+    utimesSync(join(r, 'a-cache.ts'), t, t);
+    utimesSync(join(r, 'b-cache.ts'), t, t);
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const base = e.assembleContext('cache', { maxTokens: 20_000 });
+    expect(base[0].path).toBe('a-cache.ts'); // 基线：a 在前
+
+    e.recordSessionActivity(join(r, 'b-cache.ts'));
+    const boosted = e.assembleContext('cache', { maxTokens: 20_000 });
+    expect(boosted[0].path).toBe('b-cache.ts'); // 活动在键内 → 重新组装而非陈旧缓存
+    expect(e.assembleCacheSize()).toBe(2); // 两个不同键
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('代际失效：文件修改 + refresh 后同查询返回新内容（绝不吃陈旧缓存）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v529inv-'));
+    writeFileSync(join(r, 'gen.ts'), 'export class GenSvc {\n  old(): void {}\n}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const before = e.assembleContext('GenSvc', { maxTokens: 20_000 });
+    expect(before.some((c) => c.content.includes('old()'))).toBe(true);
+
+    writeFileSync(join(r, 'gen.ts'), 'export class GenSvc {\n  fresh(): void {}\n}\n');
+    e.refresh(); // mtime 变化 → invalidateFile → 代际失效
+    const after = e.assembleContext('GenSvc', { maxTokens: 20_000 });
+    expect(after.some((c) => c.content.includes('fresh()'))).toBe(true);
+    expect(after.every((c) => !c.content.includes('old()'))).toBe(true);
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('无变化 refresh 不失效：代际稳定（agent-loop 每轮 refresh 场景下缓存仍可命中）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v529keep-'));
+    writeFileSync(join(r, 'stable.ts'), 'export const stableVal = 1;\n');
+    const e = new ContextEngine();
+    await e.index(r);
+    e.assembleContext('stable', { maxTokens: 20_000 });
+    const sizeAfterFirst = e.assembleCacheSize();
+
+    e.refresh(); // 无任何文件变化
+    e.assembleContext('stable', { maxTokens: 20_000 });
+    expect(e.assembleCacheSize()).toBe(sizeAfterFirst); // 命中同一条目
+
+    rmSync(r, { recursive: true, force: true });
+  });
+});
+
+// ---- V5.30 组装去重（同文件窗口合并） ----
+
+describe('V5.30 同文件多符号窗口合并', () => {
+  /** 生成 N 行填充文件，在指定行放两个导出类 */
+  function makeFile(lines: number, alphaLine: number, betaLine: number): string {
+    const arr: string[] = [];
+    for (let i = 1; i <= lines; i++) {
+      if (i === alphaLine) arr.push('export class AlphaService {\n  alpha(): void {}\n}');
+      else if (i === betaLine) arr.push('export class BetaService {\n  beta(): void {}\n}');
+      else arr.push(`// filler line ${i}`);
+    }
+    return arr.join('\n') + '\n';
+  }
+
+  it('邻近符号（窗口间隔 ≤ 5 行）：合并为单一 chunk 覆盖两个定义', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v530near-'));
+    // Alpha L50 → 窗口 [30,70]；Beta L92 → 窗口 [72,112]；间隔 2 ≤ 5 → 合并
+    writeFileSync(join(r, 'near.ts'), makeFile(130, 50, 92));
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const chunks = e.assembleContext('AlphaService BetaService', { maxTokens: 20_000 });
+    expect(chunks).toHaveLength(1); // 同文件只出一个 chunk
+    const chunk = chunks[0];
+    expect(chunk.startLine).toBeLessThanOrEqual(30);
+    expect(chunk.endLine).toBeGreaterThanOrEqual(112);
+    expect(chunk.content).toContain('AlphaService');
+    expect(chunk.content).toContain('BetaService'); // 此前第二符号窗口整体丢失
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('远端符号（合并后两段区间）：不合并，chunk 保持单窗口跨度（防巨型 chunk）', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v530far-'));
+    // Alpha L50 → [30,70]；Beta L300 → [280,320]；间隔 210 → 两段，不合并
+    writeFileSync(join(r, 'far.ts'), makeFile(340, 50, 300));
+    const e = new ContextEngine();
+    await e.index(r);
+
+    const chunks = e.assembleContext('AlphaService BetaService', { maxTokens: 20_000 });
+    expect(chunks).toHaveLength(1);
+    const chunk = chunks[0];
+    expect(chunk.endLine - chunk.startLine + 1).toBeLessThanOrEqual(45); // ±20 窗口未被展宽
+    expect(chunk.content).toContain('AlphaService');
+    expect(chunk.content).not.toContain('BetaService'); // 远端符号维持旧行为（不并入）
+
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('单符号文件：无合并路径，行为与旧版一致', async () => {
+    const r = mkdtempSync(join(tmpdir(), 'codex-v530single-'));
+    writeFileSync(join(r, 'solo.ts'), 'export class SoloService {\n  solo(): void {}\n}\n');
+    const e = new ContextEngine();
+    await e.index(r);
+    const chunks = e.assembleContext('SoloService', { maxTokens: 20_000 });
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].content).toContain('SoloService');
+    rmSync(r, { recursive: true, force: true });
+  });
+});
+
 // ---- V5.25 会话活动加权 ----
 
 describe('V5.25 会话活动加权（recordSessionActivity）', () => {
