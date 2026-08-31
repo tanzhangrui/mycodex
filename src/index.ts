@@ -24,7 +24,8 @@
  */
 
 import { config as loadDotenv } from 'dotenv';
-loadDotenv(); // 必须在所有其他 import 之前加载 .env
+// quiet：dotenv 17 的启动横幅会污染 stdout——`--json` 机器可读输出必须是干净的
+loadDotenv({ quiet: true }); // 必须在所有其他 import 之前加载 .env
 
 import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, mkdirSync } from 'node:fs';
 import { join, resolve, isAbsolute, basename } from 'node:path';
@@ -820,19 +821,23 @@ async function handleDoctor(): Promise<void> {
 // ---- V5.20 召回分解调试 ----
 
 /**
- * `codex context query <查询> [目录...] [--cwd <路径>]`
+ * `codex context query <查询> [目录...] [--cwd <路径>] [--json]`
  * 与 assembleContext 相同的召回链路，逐路展示命中明细 + 最终组装结果。
+ * V5.21 --json：机器可读输出（脚本/CI 消费）；修复 --cwd 的值泄漏进目录参数
+ * （旧解析会把 cwd 路径当目录，产生重复根——键空间出现 src-2/ 前缀）。
  */
 async function handleContextQuery(args: string[]): Promise<void> {
-  // 参数解析：首参数为查询；其余非 flag 参数为目录；--cwd <路径> 可选
-  const positional = args.filter((a) => !a.startsWith('-'));
-  const q = positional[0];
-  const targets = positional.slice(1);
+  // 参数解析：首参数为查询；其余非 flag 参数为目录。
+  // 带值 flag（--cwd <路径>）的值不算位置参数——否则 cwd 路径会被误当目录。
   const cwdIdx = args.indexOf('--cwd');
+  const jsonOut = args.includes('--json');
+  const positional = args.filter((a, i) => !a.startsWith('-') && !(cwdIdx !== -1 && i === cwdIdx + 1));
+  const q = positional[0];
+  const targets = [...new Set(positional.slice(1))];
   const cwdArg = cwdIdx !== -1 ? args[cwdIdx + 1] : undefined;
 
   if (!q) {
-    console.log('用法: codex context query <查询> [目录...]（--cwd <路径> 模拟邻近加权）');
+    console.log('用法: codex context query <查询> [目录...]（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
     return;
   }
 
@@ -855,6 +860,29 @@ async function handleContextQuery(args: string[]): Promise<void> {
   }
 
   const bd = engine.debugRecall(q, { maxTokens: 8_000, cwd: cwdKey });
+
+  // V5.21 --json：机器可读输出（stdout 单 JSON 文档，脚本/CI 可直接解析）
+  if (jsonOut) {
+    console.log(
+      JSON.stringify(
+        {
+          version: VERSION,
+          query: q,
+          cwd: cwdKey ?? null,
+          keywords: bd.keywords,
+          symbols: bd.symbols,
+          semantic: bd.semantic,
+          keywordHits: bd.keywordsHits,
+          related: bd.related,
+          usageSites: bd.usageSites,
+          assembled: bd.assembled,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
 
   console.log(`Codex v${VERSION} 召回分解`);
   console.log(`  查询: ${q}`);
@@ -921,7 +949,7 @@ async function handleContext(args: string[]): Promise<void> {
   if (sub !== 'stats') {
     console.log('用法:');
     console.log('  codex context stats [目录...]        索引/缓存体检（缺省当前目录；多目录 = 多根）');
-    console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权）');
+    console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
     return;
   }
 

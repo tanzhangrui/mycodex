@@ -685,9 +685,9 @@ describe('V5.19 反向依赖索引 + re-export 链追踪', () => {
     const chunks = e.assembleContext('WidgetService', { maxTokens: 20_000 });
     const paths = chunks.map((c) => c.path);
     expect(paths).toContain('src/widget.ts'); // 定义（100）
-    expect(paths).toContain('src/consumer.ts'); // 真实使用点（≥20，可能叠加关键词/语义命中）
+    expect(paths).toContain('src/consumer.ts'); // 真实使用点（≥15，可能叠加语义命中）
     expect(paths).toContain('src/index.ts'); // barrel 使用点
-    expect(chunks.find((c) => c.path === 'src/consumer.ts')!.relevance).toBeGreaterThanOrEqual(20);
+    expect(chunks.find((c) => c.path === 'src/consumer.ts')!.relevance).toBeGreaterThanOrEqual(15);
   });
 
   it('getRelatedFiles direction=both：源文件两跳穿到消费者', () => {
@@ -763,5 +763,111 @@ describe('V5.20 debugRecall（四路召回分解）', () => {
     expect(bd.semantic).toEqual([]);
     expect(bd.usageSites).toEqual([]);
     expect(bd.assembled).toEqual([]);
+  });
+});
+
+// ---- V5.21 使用点分层 ----
+
+describe('V5.21 getImportedByLayered（使用点跳数分层）', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v521-'));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    // widget.ts ← index.ts（re-export）← consumer.ts；helper.ts 双链（index 转发 + a.ts 直接 import）
+    writeFileSync(join(r, 'src', 'widget.ts'), 'export class WidgetService {}\n');
+    writeFileSync(join(r, 'src', 'helper.ts'), 'export function helperFn(): void {}\n');
+    writeFileSync(join(r, 'src', 'index.ts'), "export * from './widget';\nexport * from './helper';\n");
+    writeFileSync(join(r, 'src', 'consumer.ts'), "import { WidgetService } from './index';\nexport const c = 1;\n");
+    writeFileSync(join(r, 'src', 'a.ts'), "import { helperFn } from './helper';\nexport const a = 1;\n");
+
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('hop 值：直接 importer 1，barrel 间接消费者 2', () => {
+    const layered = e.getImportedByLayered('src/widget.ts');
+    const byFile = new Map(layered.map((x) => [x.file, x.hop]));
+    expect(byFile.get('src/index.ts')).toBe(1); // barrel（直接 re-exporter）
+    expect(byFile.get('src/consumer.ts')).toBe(2); // 经 barrel 的间接消费者
+  });
+
+  it('多链可达取最短跳：helper 经 index（hop 2 到 consumer）与 a.ts（hop 1）', () => {
+    const byFile = new Map(e.getImportedByLayered('src/helper.ts').map((x) => [x.file, x.hop]));
+    expect(byFile.get('src/index.ts')).toBe(1);
+    expect(byFile.get('src/a.ts')).toBe(1);
+    expect(byFile.get('src/consumer.ts')).toBe(2); // consumer 不 import helper，仅经 barrel 链可达
+  });
+
+  it('与 getImportedByExpanded 文件集合一致（分层是同一 BFS 的视图）', () => {
+    const layered = e.getImportedByLayered('src/widget.ts').map((x) => x.file).sort();
+    const expanded = [...e.getImportedByExpanded('src/widget.ts')].sort();
+    expect(layered).toEqual(expanded);
+  });
+
+  it('maxHops 截断分层同样生效', () => {
+    const byFile = new Map(e.getImportedByLayered('src/widget.ts', 1).map((x) => [x.file, x.hop]));
+    expect(byFile.has('src/index.ts')).toBe(true);
+    expect(byFile.has('src/consumer.ts')).toBe(false);
+  });
+});
+
+// ---- V5.22 Python __init__.py re-export 链 ----
+
+describe('V5.22 Python __init__.py re-export 穿透', () => {
+  let r: string;
+  let e: ContextEngine;
+
+  beforeAll(async () => {
+    r = mkdtempSync(join(tmpdir(), 'codex-v522-'));
+    mkdirSync(join(r, 'pkg'), { recursive: true });
+    // pkg/helper.py ← pkg/__init__.py（`from .helper import Helper` 转发）← consumer.py
+    writeFileSync(join(r, 'pkg', '__init__.py'), 'from .helper import Helper\nfrom .extra import Extra\n');
+    writeFileSync(join(r, 'pkg', 'helper.py'), 'class Helper:\n    def run(self):\n        pass\n');
+    writeFileSync(join(r, 'pkg', 'extra.py'), 'class Extra:\n    pass\n');
+    // `from . import helper` 形态的转发（dotImport 展开）
+    mkdirSync(join(r, 'pkg2'), { recursive: true });
+    writeFileSync(join(r, 'pkg2', '__init__.py'), 'from . import tool\n');
+    writeFileSync(join(r, 'pkg2', 'tool.py'), 'def tool_fn():\n    pass\n');
+    writeFileSync(join(r, 'consumer.py'), 'from .pkg import Helper\nfrom .pkg2 import tool\n\ndef use(h: Helper):\n    return h.run()\n');
+    // 负例：普通模块间 import 不构成转发边
+    writeFileSync(join(r, 'mod_a.py'), 'def a_fn():\n    pass\n');
+    writeFileSync(join(r, 'mod_b.py'), 'from .mod_a import a_fn\n\ndef b_fn():\n    return a_fn()\n');
+    writeFileSync(join(r, 'mod_c.py'), 'from .mod_b import b_fn\n\ndef c_fn():\n    return b_fn()\n');
+
+    e = new ContextEngine();
+    await e.index(r);
+  });
+
+  afterAll(() => {
+    rmSync(r, { recursive: true, force: true });
+  });
+
+  it('__init__.py 转发：穿透包入口找到真实消费者（from .mod import X 形态）', () => {
+    const expanded = e.getImportedByExpanded('pkg/helper.py');
+    expect(expanded).toContain('pkg/__init__.py'); // 包入口（转发者）
+    expect(expanded).toContain('consumer.py'); // 经包入口的间接消费者
+  });
+
+  it('`from . import mod` 形态同样构成转发边', () => {
+    const expanded = e.getImportedByExpanded('pkg2/tool.py');
+    expect(expanded).toContain('pkg2/__init__.py');
+    expect(expanded).toContain('consumer.py');
+  });
+
+  it('普通模块 import 不穿透（mod_a ← mod_b 是普通边，mod_c 不算使用点）', () => {
+    const expanded = e.getImportedByExpanded('mod_a.py');
+    expect(expanded).toEqual(['mod_b.py']);
+  });
+
+  it('分层跳数：__init__ hop 1，消费者 hop 2', () => {
+    const byFile = new Map(e.getImportedByLayered('pkg/helper.py').map((x) => [x.file, x.hop]));
+    expect(byFile.get('pkg/__init__.py')).toBe(1);
+    expect(byFile.get('consumer.py')).toBe(2);
   });
 });

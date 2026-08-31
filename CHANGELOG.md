@@ -5,6 +5,68 @@
 
 ***
 
+## V5.22 — 2026-08-31 — Python `__init__.py` re-export 穿透 + 相对导入解析修复
+
+> V5.19 的 re-export 链只认 TS barrel——Python 侧同构场景（包入口转发）完全缺失；
+> 且实现时暴露两个真实解析缺陷：根级相对导入与目录导入全部解析失败。
+
+### A. `__init__.py` 视为 barrel（context-engine.ts）
+
+* `buildReExportIndex` 扩展：Python 仅包入口 `__init__.py` 的 import 视为转发边（`from .helper import Helper` / `from . import tool` 两种形态）——普通模块的 import 不是转发
+
+* 链路：`pkg/helper.py ← pkg/__init__.py（转发）← consumer.py（from .pkg import Helper）`——`getImportedByExpanded('pkg/helper.py')` 穿透包入口连带真实消费者
+
+### B. 两个真实解析缺陷修复（resolveImport）
+
+* **dots 前缀归一**：`from .mod import x` 捕获的说明符 `.mod` 此前被当字面路径段（`.mod.py` 探测必然落空）——根级文件的相对导入**全部**解析失败。现归一为 `./mod` / `../mod` 路径形态
+
+* **目录导入探测包入口**：`from .pkg import X` 实指 `pkg/__init__.py`，此前相对分支不探测——补 `base/__init__.py` 候选（Python 分支）
+
+* `IMPORT_RESOLVER_VERSION` 2→3：解析逻辑变化，旧持久化 import 种子整体失效重建
+
+### 验收
+
+* 新增 4 项测试：`__init__.py` 转发穿透找消费者 / `from . import mod` 形态 / 普通模块 import 不穿透（负例，同时覆盖根级 dots 归一修复）/ 分层跳数（init hop 1、消费者 hop 2）
+
+* typecheck 零错误 / **341 测试全绿**（333 + 8，含 V5.21 的 4 项）
+
+***
+
+## V5.21 — 2026-08-31 — 使用点分层 + `codex context query --json`
+
+> 使用点不分级：直接调用方与隔了三层 barrel 的消费者同为 relevance 20——
+> 越近的使用点越可能是"真正要改的地方"。调试输出也要能被脚本消费。
+
+### A. 使用点 relevance 分层（context-engine.ts）
+
+* `importedByWithDepth`（BFS 带跳数）+ `getImportedByLayered`：文件 → 距定义处的跳数；同一文件多链可达取最短跳
+
+* `assembleContext` 使用点分层：直接 importer（hop 1）relevance 20，barrel 间接消费者（hop 2+）15；多符号命中取最短跳
+
+* `getImportedByExpanded` 改为分层的视图（文件集合不变，向后兼容）
+
+### B. CLI `codex context query --json`
+
+* stdout 输出单 JSON 文档（version/query/cwd/keywords/symbols/semantic/keywordHits/related/usageSites/assembled），脚本/CI 可直接管道解析
+
+* dotenv 17 启动横幅污染 stdout——`loadDotenv({ quiet: true })` 静默（机器可读输出必须干净）
+
+### C. 两个 CLI 参数解析缺陷修复
+
+* **--cwd 值泄漏**：cwd 路径被误当目录参数 → 同一路径成两个根（键空间出现 `src-2/` 前缀）——带值 flag 的值不再计入位置参数，目录参数去重
+
+* **查询词丢失**：`--cwd` 缺省时 `cwdIdx + 1 === 0`，过滤条件误排除第 0 位参数（查询本身）——条件改为显式 `cwdIdx !== -1`
+
+### 验收
+
+* 新增 4 项测试：hop 分层值（直接 1 / barrel 间接 2）/ 多链最短跳 / 分层与 expanded 集合一致 / maxHops 截断分层生效
+
+* CLI 冒烟：`--json` 可被 `ConvertFrom-Json` 解析（symbols=1 / usageSites=2 / assembled=8）；`--cwd src` 不再产生 `src-2/` 重复根
+
+* typecheck 零错误 / 341 测试全绿 / 构建产物 128.1KB
+
+***
+
 ## V5.20 — 2026-08-31 — 召回分解调试（codex context query）
 
 > "为什么没召回这个文件"——四路召回是黑盒，排障只能靠猜。

@@ -171,7 +171,7 @@ const MAX_PERSIST_IMPORTS_PER_FILE = 100;
  * 避免"旧解析器写入的空/错 imports 种子被新解析器永久继承"。
  * 改动 resolveImport / resolvePackageImport / resolvePathAliasImport 行为时必须 +1。
  */
-const IMPORT_RESOLVER_VERSION = 2;
+const IMPORT_RESOLVER_VERSION = 3;
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py']);
 
@@ -1006,6 +1006,8 @@ export class ContextEngine {
    * 将相对 import 说明符解析为索引内的 relPath（扩展名/索引文件探测）
    * V5.18：TS ESM 约定——`./x.js` 常实际指 `./x.ts`（tsc emit 后扩展名不变），
    * 探测失败时剥离 `.js/.mjs/.cjs` 后缀再探测一轮。
+   * V5.22：Python dots 前缀归一——`.mod` → `./mod`、`..mod` → `../mod`
+   * （此前 `.mod` 被当字面路径段，根级文件相对导入全部解析失败）。
    */
   private resolveImport(fromFile: string, spec: string, lang: 'ts' | 'py'): string | null {
     // V5.7 tsconfig paths 优先：`@shared/utils` → 键空间前缀替换后探测
@@ -1016,6 +1018,14 @@ export class ContextEngine {
       const viaPaths = this.resolvePathAliasImport(spec);
       if (viaPaths) return viaPaths;
       return this.resolvePackageImport(spec);
+    }
+
+    // V5.22 Python 相对说明符形态归一（`from .mod import x` 捕获 `.mod`）
+    if (lang === 'py') {
+      const dots = spec.match(/^(\.+)(.*)$/);
+      if (dots && dots[2]) {
+        spec = (dots[1].length === 1 ? './' : '../'.repeat(dots[1].length - 1)) + dots[2];
+      }
     }
 
     const base = normalize(join(dirname(fromFile), spec)).replace(/\\/g, '/');
@@ -1039,6 +1049,12 @@ export class ContextEngine {
           const candidate = `${b}/${idx}`;
           if (this.filePathSet.has(candidate)) return candidate;
         }
+      }
+    } else {
+      // V5.22 Python 目录导入：`from .pkg import X` 实指包入口 pkg/__init__.py
+      for (const b of bases) {
+        const candidate = `${b}/__init__.py`;
+        if (this.filePathSet.has(candidate)) return candidate;
       }
     }
     return null;
@@ -1213,6 +1229,8 @@ export class ContextEngine {
   /**
    * V5.19 re-export 链索引：被 re-export 的文件 → 转发它的 barrel 文件集合。
    * `index.ts` 里 `export * from './widget'` → widget.ts → { index.ts }。
+   * V5.22 Python：`pkg/__init__.py` 里 `from .helper import Helper` 视为转发
+   * （helper 的名字经包入口对外可见）——pkg/helper.py → { pkg/__init__.py }。
    * 惰性构建，refresh 时随 reverseIndex 一同置空重建。
    */
   private reExportIndex: Map<string, Set<string>> | null = null;
@@ -1221,6 +1239,14 @@ export class ContextEngine {
     if (this.reExportIndex) return this.reExportIndex;
 
     const index = new Map<string, Set<string>>();
+    const addEdge = (target: string | null, barrel: string) => {
+      if (target && target !== barrel) {
+        const set = index.get(target);
+        if (set) set.add(barrel);
+        else index.set(target, new Set([barrel]));
+      }
+    };
+
     let scanned = 0;
     for (const entry of this.fileIndex) {
       if (scanned >= SYMBOL_INDEX_MAX_FILES) break;
@@ -1229,23 +1255,27 @@ export class ContextEngine {
       scanned++;
 
       const lang = this.langOf(entry.path);
-      if (lang !== 'ts') continue; // re-export 是 TS/JS barrel 语义（Python __init__ 转发由 import 边覆盖）
+      // V5.22：Python 仅包入口 __init__.py 视为 barrel（普通模块的 import 不是转发）
+      const isPyInit = lang === 'py' && entry.name === '__init__.py';
+      if (lang !== 'ts' && !isPyInit) continue;
 
       const content = this.getFileContent(entry.path);
       if (!content) continue;
 
-      for (const re of TS_REEXPORT_RES) {
-        re.lastIndex = 0;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(content)) !== null) {
-          const spec = m[1];
-          // 相对说明符恒解析；裸说明符走别名表（跨根 barrel）
-          const target = this.resolveImport(entry.path, spec, 'ts');
-          if (target && target !== entry.path) {
-            const set = index.get(target);
-            if (set) set.add(entry.path);
-            else index.set(target, new Set([entry.path]));
+      if (lang === 'ts') {
+        for (const re of TS_REEXPORT_RES) {
+          re.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(content)) !== null) {
+            // 相对说明符恒解析；裸说明符走别名表（跨根 barrel）
+            addEdge(this.resolveImport(entry.path, m[1], 'ts'), entry.path);
           }
+        }
+      } else {
+        // __init__.py：全部（相对）import 说明符都是转发候选
+        // （`from .mod import X` / `from . import mod` 两种形态均覆盖）
+        for (const spec of extractImportSpecifiers(content, 'py', false)) {
+          addEdge(this.resolveImport(entry.path, spec, 'py'), entry.path);
         }
       }
     }
@@ -1266,17 +1296,31 @@ export class ContextEngine {
    * （普通 import 不穿透，避免"传递依赖全算使用点"的过度扩散），默认 3 跳防环。
    */
   getImportedByExpanded(relPath: string, maxHops = 3): string[] {
-    if (!this.indexed) return [];
+    return [...this.importedByWithDepth(relPath, maxHops).keys()];
+  }
+
+  /**
+   * V5.21 分层使用点：文件 → 距定义处的跳数（hop 1 = 直接 importer，
+   * hop 2+ = 经 re-export 链的 barrel 间接消费者）。同一文件经多条链可达时取最短跳。
+   */
+  getImportedByLayered(relPath: string, maxHops = 3): Array<{ file: string; hop: number }> {
+    return [...this.importedByWithDepth(relPath, maxHops)].map(([file, hop]) => ({ file, hop }));
+  }
+
+  /** V5.21 带跳数的 BFS 穿透（getImportedByExpanded / getImportedByLayered 共用） */
+  private importedByWithDepth(relPath: string, maxHops: number): Map<string, number> {
+    if (!this.indexed) return new Map();
     const start = normalizeRelPath(relPath);
-    const results = new Set<string>();
+    const depth = new Map<string, number>();
     const visited = new Set<string>([start]);
     let frontier = [start];
 
-    for (let hop = 0; hop < maxHops && frontier.length > 0; hop++) {
+    for (let hop = 1; hop <= maxHops && frontier.length > 0; hop++) {
       const next: string[] = [];
       for (const file of frontier) {
         for (const importer of this.getImportedBy(file)) {
-          results.add(importer);
+          const prev = depth.get(importer);
+          if (prev === undefined || hop < prev) depth.set(importer, hop);
           if (!visited.has(importer) && this.isReExportOf(importer, file)) {
             visited.add(importer);
             next.push(importer); // barrel 转发：barrel 的消费者也是源文件的间接使用点
@@ -1285,7 +1329,7 @@ export class ContextEngine {
       }
       frontier = next;
     }
-    return [...results];
+    return depth;
   }
 
   // ---- 四路召回融合 ----
@@ -1452,16 +1496,20 @@ export class ContextEngine {
     // 4b) V5.19 使用点召回：符号定义文件的 importers（调用方/消费方），
     // 经 re-export 链穿透 barrel（消费者 import 的常是 index.ts 而非源文件）。
     // "改这个函数会影响谁"是高频上下文需求——定义处 + 使用处一并注入。
-    const usageSeeds = new Set<string>();
+    // V5.21 分层：直接 importer（hop 1）relevance 20，barrel 间接消费者（hop 2+）15——
+    // 越近的使用点越可能是"真正要改的地方"。多符号命中取最短跳。
+    const usageDepth = new Map<string, number>();
     for (const sym of symbolHits) {
-      for (const importer of this.getImportedByExpanded(sym.file)) {
-        if (!byPath.has(importer)) usageSeeds.add(importer);
+      for (const [file, hop] of this.importedByWithDepth(sym.file, 3)) {
+        if (byPath.has(file)) continue;
+        const prev = usageDepth.get(file);
+        if (prev === undefined || hop < prev) usageDepth.set(file, hop);
       }
     }
-    for (const file of usageSeeds) {
+    for (const [file, hop] of usageDepth) {
       const chunk = this.chunkAroundLine(file, 1, 40);
       if (chunk) {
-        chunk.relevance = 20; // 使用点：低于定义（100）高于普通依赖扩展（5）
+        chunk.relevance = hop === 1 ? 20 : 15; // 使用点分层：均低于定义（100）高于普通依赖扩展（5）
         byPath.set(file, chunk);
       }
     }
