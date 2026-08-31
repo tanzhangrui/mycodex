@@ -5,6 +5,32 @@
 
 ***
 
+## V5.32 — 2026-08-31 — bench 基线落盘对比 + CI 硬门禁
+
+> V5.31 只输出当次指标——召回水位随版本演进是升是降无据可查；
+> CI 想拦召回回退也缺一个机器可判定的红灯条件。
+
+### A. bench 核心模块化（src/context/bench.ts，CLI 与逻辑解耦）
+
+* `runBench`：抽样 + 指标计算（原 V5.31 CLI 内联逻辑迁移，行为不变）
+* `saveBaseline` / `loadBaseline`：基线 JSON v1 落盘（点文件名，索引器天然跳过，不污染语料）
+* `compareWithBaseline`：Recall@3/@10/MRR 任一低于基线即回退（耗时噪声大不入门禁）
+* `evalGate`：负例误召回 + `--min-r3 <百分比>` 下限 + 基线回退三路聚合门禁，空索引 + min-r3 也算 FAIL
+
+### B. CLI `codex context bench … [--save [文件]] [--compare [文件]] [--min-r3 <百分比>]`
+
+* `--save` 落盘基线（缺省 `<主根>/.codex-bench.json`）；`--compare` 逐指标对比并打印增量（`Recall@3 +1` 式）
+* 任一门禁红灯 → exit 1（CI 可感知）；`--json` 输出含 baseline / compare / gate 三段
+* 自指污染修复：负例探针改 `repeat` 构造——语义路是字符 trigram 匹配，探针字面量（含注释里的字样）会命中 bench.ts 自身导致负例全误召回
+
+### 验收
+
+* 新增 12 项测试：指标正确性 / 抽样确定性 / 基线 roundtrip / 损坏降级 / 对比持平·回退·改善 / 门禁达标·下限·空索引·负例·基线聚合
+* CLI 冒烟：本仓库 `--save` → `--compare --min-r3 90` 全链路 PASS（exit 0）
+* typecheck 零错误 / **387 测试全绿**（375 + 12）
+
+***
+
 ## V5.31 — 2026-08-31 — 召回质量基准 CLI（codex context bench）
 
 > V5.28 的回归基准是固定语料测试——只能守护本仓库自己的召回质量；

@@ -40,6 +40,7 @@ import { createSandbox } from './sandbox/sandbox.js';
 import { createLogger } from './utils/logger.js';
 import { toolRegistry } from './tools/registry.js';
 import { ContextEngine, collectGitChangedFiles } from './context/context-engine.js';
+import { runBench, saveBaseline, loadBaseline, compareWithBaseline, evalGate, type BenchCompare } from './context/bench.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import {
   loadMarketplaceIndex,
@@ -1055,27 +1056,35 @@ async function handleContextQuery(args: string[]): Promise<void> {
 
 /**
  * `codex context bench [目录...] [--json] [--queries N] [--max-tokens T]`
+ *           [--save [基线文件]] [--compare [基线文件]] [--min-r3 <百分比>]`
  * 对任意目录跑召回质量基准（V5.28 固定语料基准的通用版）：
  * - 查询自动生成：从全局符号索引分层抽样 N 个符号，符号名即查询、
  *   所在文件即 ground truth——无需人工标注即可在任意代码库上复跑。
  * - 指标：Recall@1/3/10、MRR、平均组装耗时 / chunk 数 / token 估算。
- * - 负例防线：固定乱码查询误召回即红灯（exit 1，CI 可感知）；
- *   召回指标本身不设硬阈值（不同代码库基线不同，供观察与回归对比）。
+ * - 负例防线：固定乱码查询误召回即红灯（exit 1，CI 可感知）。
+ * - V5.32 基线落盘对比：--save 存基线（缺省 `<主根>/.codex-bench.json`），
+ *   --compare 与基线逐指标对比，Recall@3/@10/MRR 任一回退即 FAIL；
+ *   --min-r3 <百分比>：Recall@3 硬下限（CI 门禁，空索引也算 FAIL）。
  * - --json：机器可读输出（与 context query/why --json 同约定）。
  */
 async function handleContextBench(args: string[]): Promise<void> {
   const jsonOut = args.includes('--json');
   const queriesIdx = args.indexOf('--queries');
   const tokensIdx = args.indexOf('--max-tokens');
-  const positional = args.filter(
-    (a, i) =>
-      !a.startsWith('-') &&
-      !(queriesIdx !== -1 && i === queriesIdx + 1) &&
-      !(tokensIdx !== -1 && i === tokensIdx + 1),
-  );
+  const minR3Idx = args.indexOf('--min-r3');
+  const saveIdx = args.indexOf('--save');
+  const cmpIdx = args.indexOf('--compare');
+  // 带值 flag 的值不算位置参数（--save/--compare 的值可选：后随非 flag 才是路径）
+  const valueIdxSet = new Set([queriesIdx, tokensIdx, minR3Idx, saveIdx, cmpIdx].filter((i) => i !== -1));
+  const valueOf = (i: number): string | undefined =>
+    i !== -1 && i + 1 < args.length && !args[i + 1].startsWith('-') ? args[i + 1] : undefined;
+  const positional = args.filter((a, i) => !a.startsWith('-') && !valueIdxSet.has(i - 1));
+
   const targets = [...new Set(positional)];
-  const queryCount = Math.max(1, Number(queriesIdx !== -1 ? args[queriesIdx + 1] : 20) || 20);
-  const maxTokens = Math.max(500, Number(tokensIdx !== -1 ? args[tokensIdx + 1] : 12_000) || 12_000);
+  const queryCount = Math.max(1, Number(valueOf(queriesIdx) ?? 20) || 20);
+  const maxTokens = Math.max(500, Number(valueOf(tokensIdx) ?? 12_000) || 12_000);
+  const minR3Raw = valueOf(minR3Idx);
+  const minR3 = minR3Raw !== undefined ? Math.max(0, Math.min(100, Number(minR3Raw))) : undefined;
 
   const workingDir: string | string[] =
     targets.length > 1 ? targets.map((t) => resolve(t)) : resolve(targets[0] ?? '.');
@@ -1089,51 +1098,28 @@ async function handleContextBench(args: string[]): Promise<void> {
   }
 
   const report = engine.getContextReport();
+  const metrics = runBench(engine, { queries: queryCount, maxTokens });
 
-  // 抽样池：全量符号 → 名称≥3字符 → 按 name@file 去重（同名同文件只测一次）
-  const pool: Array<{ name: string; kind: string; file: string }> = [];
-  const seen = new Set<string>();
-  for (const s of engine.listSymbols()) {
-    if (s.name.length < 3) continue;
-    const k = `${s.name}@${s.file}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    pool.push({ name: s.name, kind: s.kind, file: s.file });
+  // V5.32 基线：--save 落盘 / --compare 逐指标对比（缺省 <主根>/.codex-bench.json）
+  const baselineFile = valueOf(saveIdx) ?? valueOf(cmpIdx) ?? join(primaryRootOf(workingDir), '.codex-bench.json');
+  let savedBaseline: { savedAt: string } | null = null;
+  if (saveIdx !== -1) {
+    const b = saveBaseline(metrics, { queries: queryCount, maxTokens }, baselineFile);
+    savedBaseline = { savedAt: b.savedAt };
+  }
+  let compare: BenchCompare | null = null;
+  let baselineInfo: { file: string; savedAt: string | null } | null = null;
+  if (cmpIdx !== -1) {
+    const b = loadBaseline(baselineFile);
+    if (!b) {
+      console.error(`错误: 基线不可用 — ${baselineFile}（不存在 / 损坏 / 格式不符；先跑 --save 生成）`);
+      process.exit(1);
+    }
+    baselineInfo = { file: baselineFile, savedAt: b.savedAt };
+    compare = compareWithBaseline(metrics, b.metrics);
   }
 
-  // 分层抽样：排序后的池均匀取 N 个（确定性——同代码库同参数必得同样本集）
-  const samples =
-    pool.length <= queryCount
-      ? pool
-      : Array.from({ length: queryCount }, (_, i) => pool[Math.floor((i * pool.length) / queryCount)]);
-
-  // 逐查询测召回排名 + 耗时
-  const results: Array<{ name: string; kind: string; file: string; rank: number; ms: number; chunks: number; tokens: number }> = [];
-  for (const s of samples) {
-    const t0 = Date.now();
-    const chunks = engine.assembleContext(s.name, { maxTokens });
-    const ms = Date.now() - t0;
-    const idx = chunks.findIndex((c) => c.path === s.file);
-    results.push({
-      ...s,
-      rank: idx === -1 ? Number.POSITIVE_INFINITY : idx + 1,
-      ms,
-      chunks: chunks.length,
-      tokens: Math.round(chunks.reduce((n, c) => n + c.content.length, 0) / 4),
-    });
-  }
-
-  // 负例防线：固定乱码查询（跨库稳定）——任何非空组装都是误召回
-  const NEG_PROBES = ['zzzqqq wvvv', 'qqqzzz yyxx', 'aaabbb cccddd'];
-  const falsePositives = NEG_PROBES.filter((q) => engine.assembleContext(q, { maxTokens }).length > 0);
-
-  const total = results.length;
-  const hitAt = (k: number) => results.filter((r) => r.rank <= k).length;
-  const mrr = total === 0 ? 0 : results.reduce((n, r) => n + (Number.isFinite(r.rank) ? 1 / r.rank : 0), 0) / total;
-  const avg = (f: (r: (typeof results)[number]) => number) => (total === 0 ? 0 : results.reduce((n, r) => n + f(r), 0) / total);
-  const missed = results.filter((r) => !Number.isFinite(r.rank));
-
-  const pass = falsePositives.length === 0;
+  const gate = evalGate(metrics, { minR3, compare: compare ?? undefined });
 
   if (jsonOut) {
     console.log(
@@ -1143,32 +1129,29 @@ async function handleContextBench(args: string[]): Promise<void> {
           root: Array.isArray(workingDir) ? workingDir : [workingDir],
           fileCount: report.fileCount,
           symbolCount: report.symbolCount,
-          queries: total,
+          queries: metrics.queries,
           maxTokens,
-          recall: {
-            at1: hitAt(1),
-            at3: hitAt(3),
-            at10: hitAt(10),
-            mrr: Number(mrr.toFixed(4)),
-          },
-          perf: {
-            avgMs: Number(avg((r) => r.ms).toFixed(1)),
-            avgChunks: Number(avg((r) => r.chunks).toFixed(1)),
-            avgTokens: Math.round(avg((r) => r.tokens)),
-          },
-          negatives: { probes: NEG_PROBES.length, falsePositives },
-          samples: results.map((r) => ({
-            symbol: r.name,
+          recall: metrics.recall,
+          perf: metrics.perf,
+          negatives: metrics.negatives,
+          samples: metrics.samples.map((r) => ({
+            symbol: r.symbol,
             kind: r.kind,
             file: r.file,
-            rank: Number.isFinite(r.rank) ? r.rank : null,
+            rank: r.rank,
           })),
+          baseline: savedBaseline
+            ? { file: baselineFile, saved: true, savedAt: savedBaseline.savedAt }
+            : baselineInfo,
+          compare,
+          gate: { pass: gate.pass, reasons: gate.reasons, minR3: minR3 ?? null },
         },
         null,
         2,
       ),
     );
   } else {
+    const total = metrics.queries;
     console.log(`Codex v${VERSION} 召回质量基准`);
     console.log(
       `  目录: ${report.roots.map((r) => r.abs).join(' + ')}（${report.fileCount} 文件 / ${report.symbolCount} 符号）`,
@@ -1179,30 +1162,54 @@ async function handleContextBench(args: string[]): Promise<void> {
     if (total === 0) {
       console.log('  （无可测符号——索引为空或全部短于 3 字符）');
     } else {
-      console.log(`  Recall@1:  ${((hitAt(1) / total) * 100).toFixed(1)}%（${hitAt(1)}/${total}）`);
-      console.log(`  Recall@3:  ${((hitAt(3) / total) * 100).toFixed(1)}%（${hitAt(3)}/${total}）`);
-      console.log(`  Recall@10: ${((hitAt(10) / total) * 100).toFixed(1)}%（${hitAt(10)}/${total}）`);
-      console.log(`  MRR: ${mrr.toFixed(3)}`);
-      for (const m of missed.slice(0, 5)) console.log(`  ! 未召回: ${m.name}（${m.kind}）— ${m.file}`);
+      console.log(`  Recall@1:  ${((metrics.recall.at1 / total) * 100).toFixed(1)}%（${metrics.recall.at1}/${total}）`);
+      console.log(`  Recall@3:  ${((metrics.recall.at3 / total) * 100).toFixed(1)}%（${metrics.recall.at3}/${total}）`);
+      console.log(`  Recall@10: ${((metrics.recall.at10 / total) * 100).toFixed(1)}%（${metrics.recall.at10}/${total}）`);
+      console.log(`  MRR: ${metrics.recall.mrr.toFixed(3)}`);
+      const missed = metrics.samples.filter((r) => r.rank === null);
+      for (const m of missed.slice(0, 5)) console.log(`  ! 未召回: ${m.symbol}（${m.kind}）— ${m.file}`);
       if (missed.length > 5) console.log(`  ! …另有 ${missed.length - 5} 个未召回`);
     }
     console.log('');
     console.log('[性能]');
-    console.log(`  平均组装耗时: ${avg((r) => r.ms).toFixed(1)}ms`);
-    console.log(`  平均 chunk 数: ${avg((r) => r.chunks).toFixed(1)}`);
-    console.log(`  平均 token 估算: ${Math.round(avg((r) => r.tokens))}`);
+    console.log(`  平均组装耗时: ${metrics.perf.avgMs}ms`);
+    console.log(`  平均 chunk 数: ${metrics.perf.avgChunks}`);
+    console.log(`  平均 token 估算: ${metrics.perf.avgTokens}`);
     console.log('');
     console.log('[负例防线]');
     console.log(
-      pass
-        ? `  乱码查询误召回: 0/${NEG_PROBES.length} ✔`
-        : `  乱码查询误召回: ${falsePositives.length}/${NEG_PROBES.length} ✘ — ${falsePositives.join(' | ')}`,
+      metrics.negatives.falsePositives.length === 0
+        ? `  乱码查询误召回: 0/${metrics.negatives.probes} ✔`
+        : `  乱码查询误召回: ${metrics.negatives.falsePositives.length}/${metrics.negatives.probes} ✘ — ${metrics.negatives.falsePositives.join(' | ')}`,
     );
+    if (savedBaseline) {
+      console.log('');
+      console.log('[基线]');
+      console.log(`  已保存: ${baselineFile}（${savedBaseline.savedAt}）`);
+    }
+    if (compare && baselineInfo) {
+      console.log('');
+      console.log('[基线对比]');
+      console.log(`  基线: ${baselineInfo.file}${baselineInfo.savedAt ? `（${baselineInfo.savedAt}）` : ''}`);
+      const d = compare.deltas;
+      const fmt = (label: string, v: number): string => `${label}: ${v >= 0 ? '+' : ''}${v}`;
+      console.log(`  ${fmt('Recall@3', d.at3)}  ${fmt('Recall@10', d.at10)}  ${fmt('MRR', d.mrr)}`);
+      for (const r of compare.regressions) console.log(`  ! ${r}`);
+    }
+    if (minR3 !== undefined) {
+      console.log('');
+      console.log('[门禁]');
+      console.log(`  Recall@3 下限: ${minR3}%`);
+    }
     console.log('');
-    console.log(pass ? '结果: PASS' : '结果: FAIL（负例误召回——召回阈值/IDF 防线被突破）');
+    console.log(
+      gate.pass
+        ? '结果: PASS'
+        : `结果: FAIL\n${gate.reasons.map((r) => `  - ${r}`).join('\n')}`,
+    );
   }
 
-  if (!pass) process.exit(1);
+  if (!gate.pass) process.exit(1);
 }
 
 // ---- V5.18 上下文引擎体检 ----
@@ -1236,7 +1243,7 @@ async function handleContext(args: string[]): Promise<void> {
     console.log('  codex context stats [目录...]        索引/缓存体检（缺省当前目录；多目录 = 多根）');
     console.log('  codex context query <查询> [目录...]  四路召回分解调试（--cwd <路径> 模拟邻近加权，--json 机器可读输出）');
     console.log('  codex context why <文件> <查询> [目录...]  单文件召回诊断（--recent 接入 git 变更加权，--json 机器可读输出）');
-    console.log('  codex context bench [目录...]         召回质量基准（符号抽样自动生成查询，--json / --queries N / --max-tokens T）');
+    console.log('  codex context bench [目录...]         召回质量基准（--save/--compare 基线对比，--min-r3 <百分比> CI 门禁，--json）');
     return;
   }
 
