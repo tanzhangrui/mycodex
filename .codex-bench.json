@@ -1,0 +1,459 @@
+{
+  "format": 1,
+  "savedAt": "2026-09-01T00:17:13.246Z",
+  "params": {
+    "queries": 30,
+    "maxTokens": 12000,
+    "seed": 42
+  },
+  "metrics": {
+    "queries": 34,
+    "recall": {
+      "at1": 24,
+      "at3": 30,
+      "at10": 30,
+      "mrr": 0.7807
+    },
+    "crossLingual": {
+      "queries": 7,
+      "at3": 4,
+      "at10": 5,
+      "mrr": 0.419
+    },
+    "layers": {
+      "exported": {
+        "queries": 6,
+        "at1": 5,
+        "at3": 6,
+        "at10": 6,
+        "mrr": 0.8889
+      },
+      "local": {
+        "queries": 28,
+        "at1": 19,
+        "at3": 24,
+        "at10": 24,
+        "mrr": 0.7576
+      }
+    },
+    "perf": {
+      "avgMs": 4.1,
+      "avgChunks": 16.2,
+      "avgTokens": 5996
+    },
+    "negatives": {
+      "probes": 3,
+      "falsePositives": []
+    },
+    "samples": [
+      {
+        "symbol": "absoluteDir",
+        "kind": "const",
+        "file": "src/core/in-memory-fs.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 80,
+        "chunks": 21,
+        "tokens": 8645
+      },
+      {
+        "symbol": "ANSI_GREEN",
+        "kind": "const",
+        "file": "src/core/in-memory-fs.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 19,
+        "tokens": 7347
+      },
+      {
+        "symbol": "cjk",
+        "kind": "const",
+        "file": "src/context/context-engine.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 19,
+        "tokens": 7388
+      },
+      {
+        "symbol": "cleanup",
+        "kind": "const",
+        "file": "src/index.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 14,
+        "tokens": 4849
+      },
+      {
+        "symbol": "controller",
+        "kind": "const",
+        "file": "tests/e2e.test.ts",
+        "exported": false,
+        "rank": 2,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 10,
+        "tokens": 3311
+      },
+      {
+        "symbol": "currentInput",
+        "kind": "const",
+        "file": "src/cli/app.tsx",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 29,
+        "tokens": 11047
+      },
+      {
+        "symbol": "diag",
+        "kind": "const",
+        "file": "codex-ide/src/editor/code-actions.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 7,
+        "tokens": 3327
+      },
+      {
+        "symbol": "DiffManager",
+        "kind": "class",
+        "file": "codex-ide/src/editor/diff-manager.ts",
+        "exported": true,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 20,
+        "tokens": 7450
+      },
+      {
+        "symbol": "DirtyFile",
+        "kind": "interface",
+        "file": "codex-ide/src/agent/agent-service.ts",
+        "exported": true,
+        "rank": 1,
+        "crossQuery": "文件",
+        "crossRank": 1,
+        "ms": 3,
+        "chunks": 23,
+        "tokens": 8694
+      },
+      {
+        "symbol": "evalGate",
+        "kind": "function",
+        "file": "src/context/bench.ts",
+        "exported": true,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 9,
+        "tokens": 3227
+      },
+      {
+        "symbol": "filename",
+        "kind": "const",
+        "file": "src/utils/ai-client.ts",
+        "exported": false,
+        "rank": 2,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 28,
+        "tokens": 9580
+      },
+      {
+        "symbol": "fuzzyCollect",
+        "kind": "method",
+        "file": "src/context/context-engine.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 17,
+        "tokens": 6478
+      },
+      {
+        "symbol": "indexFile",
+        "kind": "const",
+        "file": "tests/marketplace.test.ts",
+        "exported": false,
+        "rank": 2,
+        "crossQuery": "索引 文件",
+        "crossRank": null,
+        "ms": 5,
+        "chunks": 20,
+        "tokens": 7717
+      },
+      {
+        "symbol": "instruction",
+        "kind": "const",
+        "file": "codex-ide/src/editor/inline-chat.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 9,
+        "tokens": 3965
+      },
+      {
+        "symbol": "isWatch",
+        "kind": "const",
+        "file": "build.mjs",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 5,
+        "tokens": 1434
+      },
+      {
+        "symbol": "kept",
+        "kind": "const",
+        "file": "codex-ide/src/completion/fim-core.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 0,
+        "chunks": 7,
+        "tokens": 2782
+      },
+      {
+        "symbol": "key",
+        "kind": "const",
+        "file": "src/tools/registry.ts",
+        "exported": false,
+        "rank": null,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 24,
+        "tokens": 8217
+      },
+      {
+        "symbol": "lines",
+        "kind": "const",
+        "file": "src/utils/highlight.ts",
+        "exported": false,
+        "rank": null,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 0,
+        "chunks": 9,
+        "tokens": 3100
+      },
+      {
+        "symbol": "mark",
+        "kind": "const",
+        "file": "src/index.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 11,
+        "tokens": 3277
+      },
+      {
+        "symbol": "MAX_PERSIST_MINED_PER_FILE",
+        "kind": "const",
+        "file": "src/context/context-engine.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": "保存 文件",
+        "crossRank": 10,
+        "ms": 5,
+        "chunks": 19,
+        "tokens": 7543
+      },
+      {
+        "symbol": "moduleUrl",
+        "kind": "const",
+        "file": "src/tools/registry.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 13,
+        "tokens": 4541
+      },
+      {
+        "symbol": "parts",
+        "kind": "const",
+        "file": "src/utils/ai-client.ts",
+        "exported": false,
+        "rank": null,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 23,
+        "tokens": 8207
+      },
+      {
+        "symbol": "PlanCommandOptions",
+        "kind": "interface",
+        "file": "src/cli/text-repl.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 10,
+        "tokens": 3994
+      },
+      {
+        "symbol": "PresetItem",
+        "kind": "interface",
+        "file": "codex-ide/src/status/status-bar.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 2,
+        "chunks": 17,
+        "tokens": 6974
+      },
+      {
+        "symbol": "provideInlineCompletionItems",
+        "kind": "method",
+        "file": "codex-ide/src/completion/fim-provider.ts",
+        "exported": true,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 8,
+        "tokens": 3824
+      },
+      {
+        "symbol": "range",
+        "kind": "const",
+        "file": "codex-ide/src/editor/code-actions.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 0,
+        "chunks": 9,
+        "tokens": 3630
+      },
+      {
+        "symbol": "raw",
+        "kind": "const",
+        "file": "tests/context-expand.test.ts",
+        "exported": false,
+        "rank": 22,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 25,
+        "tokens": 8401
+      },
+      {
+        "symbol": "Sandbox",
+        "kind": "class",
+        "file": "src/sandbox/sandbox.ts",
+        "exported": true,
+        "rank": 3,
+        "crossQuery": "沙箱",
+        "crossRank": 3,
+        "ms": 2,
+        "chunks": 21,
+        "tokens": 7059
+      },
+      {
+        "symbol": "SESSION_KEY",
+        "kind": "const",
+        "file": "codex-ide/src/agent/agent-service.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": "会话",
+        "crossRank": 1,
+        "ms": 3,
+        "chunks": 14,
+        "tokens": 5887
+      },
+      {
+        "symbol": "sleep",
+        "kind": "function",
+        "file": "src/utils/ai-client.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 20,
+        "tokens": 7347
+      },
+      {
+        "symbol": "snapshot",
+        "kind": "method",
+        "file": "src/core/in-memory-fs.ts",
+        "exported": true,
+        "rank": 1,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 22,
+        "tokens": 7935
+      },
+      {
+        "symbol": "store",
+        "kind": "const",
+        "file": "tests/message-manager.test.ts",
+        "exported": false,
+        "rank": 3,
+        "crossQuery": "保存 仓库 存储",
+        "crossRank": null,
+        "ms": 4,
+        "chunks": 11,
+        "tokens": 3714
+      },
+      {
+        "symbol": "TOOL_CACHE_MAX",
+        "kind": "const",
+        "file": "src/tools/registry.ts",
+        "exported": false,
+        "rank": 1,
+        "crossQuery": "工具 缓存",
+        "crossRank": 2,
+        "ms": 3,
+        "chunks": 12,
+        "tokens": 4603
+      },
+      {
+        "symbol": "tools",
+        "kind": "const",
+        "file": "tests/benchmark.test.ts",
+        "exported": false,
+        "rank": 3,
+        "crossQuery": null,
+        "crossRank": null,
+        "ms": 1,
+        "chunks": 27,
+        "tokens": 8386
+      }
+    ]
+  }
+}

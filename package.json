@@ -16,6 +16,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bench": "node dist/index.js context bench --queries 30 --seed 42 --compare --min-r3 80",
+    "bench:save": "node dist/index.js context bench --queries 30 --seed 42 --save",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

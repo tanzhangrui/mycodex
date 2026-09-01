@@ -5,6 +5,31 @@
 
 ***
 
+## V5.43 — 2026-09-01 — 质量门禁产品化（基线入库 + npm scripts）
+
+> 召回质量基建（V5.32–V5.42）已完备，但门禁要手敲长命令——最后一公里：
+> 基线入库 + 一条 `npm run bench`，任何贡献者 clone 即得回退检测。
+
+### A. 基线入库（`.codex-bench.json`）
+
+* `--seed 42` 稳定采样基线提交进仓库——样本集是符号条目的函数，代码变更后仍可比（V5.39 语义）
+
+* 基线快照：R\@3 30/30、MRR 0.781、导出层 6/6、跨语言 4/7、负例 0/3 误召回
+
+### B. npm scripts
+
+* `npm run bench`：`--compare --min-r3 80` 门禁（基线对比 + Recall\@3 下限，任一回退非零退出）
+
+* `npm run bench:save`：改进召回后刷新基线（显式操作，防基线静默漂移）
+
+### 验收
+
+* `npm run bench` 端到端 PASS（基线对比全 +0、门禁下限通过、退出码 0）
+
+* typecheck 零错误 / 456 测试全绿
+
+***
+
 ## V5.42 — 2026-08-31 — 词典自学习（注释-标识符共现挖掘）
 
 > 静态同义词典（V5.34）只覆盖通用后端词汇——每个代码库自己的领域术语
@@ -14,28 +39,39 @@
 ### A. `mineCommentSynonyms`（query-expand.ts）
 
 * 纯函数挖掘：声明行（TS 的 class/function/const/let/var/interface/type/enum · PY 的 def/class）上方**紧邻**注释块（连续注释行，回看 ≤5 行，空行隔断）
+
 * 注释里的 CJK 连续段（2-8 字）× 标识符全名（小写）+ 驼峰/下划线子词（≥3 字符）→ 同义对
+
 * `/** 支付网关 */ export class PayGateway` → 支付网关 ↔ paygateway/pay/gateway（作者亲写的中英对照，代码库专属证据）
 
-### B. 挖掘词典参与查询扩展（EXPANSION_DISCOUNT_MINED = 0.5）
+### B. 挖掘词典参与查询扩展（EXPANSION\_DISCOUNT\_MINED = 0.5）
 
 * `expandQuery(query, mined?)`：可选挖掘词典参数——挖掘短语作为子串出现在查询 CJK 段中即命中，目标 token 以 0.5 折扣进语义路
+
 * 置信度设计：精确映射 0.6 > **挖掘 0.5** > 多对多 0.3——对本代码库是确定的（作者亲写），但注释可能过时，保守一档
+
 * **静态词典优先**：同一 token 静态已扩展则挖掘不覆盖；查询已有词不扩展；负例（乱码）查询零扩展——三重防线不变
+
 * 引擎四个调用点全部接入：符号路提前返回守卫 / 第三轮兜底 / 语义路权重 / `context why` 分解
 
 ### C. 生命周期与持久化（context-engine.ts）
 
 * 挖掘与符号提取同一趟内容（零额外读盘）；`minedSynCache`（本会话 LRU）∪ `persistedMined`（持久化种子）聚合视图惰性构建
+
 * 失效语义与 symbolIndex 一致：文件增删改（invalidateFile / refresh）→ 聚合重建；持久化 v3 缓存新增 `files[].mined` 字段（单文件上限 40 对），种子路径（免读盘）同样保有挖掘词典
+
 * `context stats` 信号段新增 **挖掘词典规模**（去重对数）——跨语言召回的代码库自适应可观测面
 
 ### 验收
 
 * 自测仓库（注释全中文）自动挖掘 **1333 对**专属同义对，零手工维护
+
 * 端到端：「负例探针」（静态词典无此词）80% 覆盖率直击 `src/context/bench.ts` 定义文件（挖掘词典是唯一召回路径）
-* 持久化 roundtrip：缓存种子路径（免读盘）指标与全量重建完全一致（`--seed 42` 跨进程两轮：R@3 30/30、MRR 0.781、导出层 6/6、负例 0 误召回）
+
+* 持久化 roundtrip：缓存种子路径（免读盘）指标与全量重建完全一致（`--seed 42` 跨进程两轮：R\@3 30/30、MRR 0.781、导出层 6/6、负例 0 误召回）
+
 * 新增 10 项测试：挖掘函数（TS 块注释 / Python # / 空行隔断 / 纯英文注释零挖掘）/ expandQuery 挖掘语义（领域词扩展 / 静态优先 / 全名可达性 / 负例防线）/ 引擎级召回 / 持久化 roundtrip
+
 * typecheck 零错误 / **456 测试全绿**（446 + 10）
 
 ***
@@ -51,19 +87,25 @@
 ### A. 符号 `exported` 标记 + 分层指标（context-engine.ts / bench.ts）
 
 * `SymbolEntry.exported?: boolean`：TS/JS 按 `export` 前缀声明判定，Python 按顶层（无缩进）def/class 判定；导出类的方法继承类导出性（公开 API），顶层函数体内误报的"方法"无类上下文 → false
+
 * `BenchMetrics.layers: { exported: RecallLayer; local: RecallLayer }`——分层统计 queries/at1/at3/at10/mrr；一致性：exported + local = 总体
-* 基线对比新增门禁：**导出层 Recall@3 回退即 fail**（总体持平也拦——局部符号改善掩盖导出层回退的情形）
+
+* 基线对比新增门禁：**导出层 Recall\@3 回退即 fail**（总体持平也拦——局部符号改善掩盖导出层回退的情形）
 
 ### B. 逐对精确映射（query-expand.ts）
 
 * `EXACT_PAIRS`：显式声明高置信 1:1 配对（登录→login、支付→pay、缓存→cache 等主翻译）
+
 * `pairDiscountOf(from, to)`：精确配对 → 0.6 满折扣；否则回落组规模分级；**任一词不在词典 → 0**（修复 `Math.max` 误抬词典内单侧词折扣的假阳性）
+
 * 组规模分级（V5.38）对多词组内所有配对一视同仁——逐对声明打破组粒度：多词组内的主翻译拿满折扣，近义成员保持保守
 
 ### C. 持久化格式 v3（修复 exported 标记丢失）
 
 * **缺陷**：`serializeIndex` 序列化符号只保留 name/kind/file/line，`exported` 落盘即丢；旧 v2 缓存加载时缺省 false → 整个仓库的导出 API 全被判成局部符号，分层指标失真（实测自测仓库 30 样本全 local、导出层 0/0）
+
 * **修复**：格式升版 v3（符号携带 exported）；v1/v2 一律拒载重建（宁重建勿陈旧）；`serializeIndex` 补写 `exported` 字段
+
 * 回归测试：跨实例加载后导出符号仍为导出层（`resolveQuerySymbols('beta')` → `exported === true`）
 
 ### D. `context bench --json` 补全字段
@@ -72,9 +114,12 @@
 
 ### 验收
 
-* 自测仓库 `--seed 42`：R@3 30/30、MRR 0.781、**导出层 6/6 满分**、局部层 24/28（天然难例）、负例 0/3 误召回；跨进程两轮运行指标完全一致（稳定采样）
+* 自测仓库 `--seed 42`：R\@3 30/30、MRR 0.781、**导出层 6/6 满分**、局部层 24/28（天然难例）、负例 0/3 误召回；跨进程两轮运行指标完全一致（稳定采样）
+
 * 持久化 roundtrip：v3 缓存落盘 → 新进程加载 → 分层指标不退化
+
 * 新增测试：样本 exported 标记 / 分层一致性 / 导出层回退检测（总体持平也拦）/ pairDiscountOf 逐对语义（精确配对满折扣 / 近义回落 / 词典外归零）/ 持久化 v3 roundtrip
+
 * typecheck 零错误 / **446 测试全绿**（436 + 10）
 
 ***
@@ -87,18 +132,23 @@
 ### A. 根因一：trigram 碰撞（探针设计缺陷）
 
 * 旧探针（6 连 z + 4 连 w 式 repeat 构造）≥ 4 字符 → 生成字符 trigram；trigram `zzz` 与测试文件里的乱码夹具字面量（`zzzqqq` 等）共享子串
+
 * V5.33 把 df=0 token 从覆盖率分母排除后，仅存的 `zzz` 单 token 覆盖率被抬满 → 语义路 80% 相关性直接命中 4 个测试文件
+
 * **探针重设计三原则**：① 词长 < 4（不触发 trigram 提取）；② 混合字母三字词（无词面碰撞）；③ 单字符数组拼词（源码无探针整词，注释也不写探针词样——自指防线）
 
 ### B. 根因二：lock 文件污染索引（scanDirectory 忽略清单）
 
 * `package-lock.json` 的依赖哈希是随机串——随机串的字符 trigram 会与任意 3 字符查询词碰撞（实测 43% 覆盖率命中），且本身零召回价值
+
 * 忽略清单补入 package-lock.json / yarn.lock / pnpm-lock.yaml / bun.lockb / composer.lock / poetry.lock / Cargo.lock / go.sum
 
 ### 验收
 
-* `context bench --seed 42` 整体 **PASS**（负例 0/3 误召回；Recall@3 87.9%）
+* `context bench --seed 42` 整体 **PASS**（负例 0/3 误召回；Recall\@3 87.9%）
+
 * 新增 5 项测试：探针词长不变量 / 探针多样性 / bench.ts 源码分词不含探针词（自指防线）/ trigram 碰撞回归（新探针零组装 + 旧探针确实误召回，证明修复针对真实缺陷）/ lock 文件排除（fileCount 不含 + 哈希子串查询零召回）
+
 * typecheck 零错误 / **436 测试全绿**（431 + 5）
 
 ***
@@ -110,17 +160,21 @@
 ### A. `stableSample`（bench.ts）
 
 * 哈希过滤采样：命中条件 `hash(name@file, seed)/MAX < rate`——样本集是**条目自身**的函数，池增删成员不改既有成员的选中状态
+
 * `rate = queries/pool.length`（样本数期望 ≈ queries）；FNV-1a 与引擎一致
+
 * `BenchParams.seed` 缺省 = 原均匀索引采样（确定性不变）
 
 ### B. CLI `codex context bench --seed <n>`
 
 * `--save` 基线 params 携带 seed（roundtrip 保真）；`--compare` 校验种子一致性——不一致 → 拒绝对比 exit 1（防假回退/假改善）
+
 * 输出标注采样方式（`--seed N 稳定采样` / `均匀抽样`）
 
 ### 验收
 
 * 新增 6 项测试：种子确定性 / 样本量近似目标 / 池增删不改既有成员选中状态 / 不同种子不同样本集 / runBench 接入 seed / 基线 params roundtrip 携带 seed
+
 * typecheck 零错误 / **431 测试全绿**（425 + 6）
 
 ***
@@ -132,7 +186,9 @@
 ### A. 分级折扣（query-expand.ts）
 
 * `WORD_GROUP_SIZE`：词 → 合并连通集规模（`auth` 连通"验证"+"权限"两组 → 按 5 算，不按单组虚高）
+
 * `EXPANSION_DISCOUNT_EXACT = 0.6`（一一对应，规模 2）/ `EXPANSION_DISCOUNT_AMBIGUOUS = 0.3`（多对多）
+
 * 扩展词折扣取 `max(触发词, 目标词)`——触发词连通集大但目标词一一对应时，目标词置信度仍高
 
 ### B. 可观测性
@@ -142,6 +198,7 @@
 ### 验收
 
 * 新增 6 项测试：一一对应高折扣 / 多对多低折扣 / 跨组连通词按合并集 / 不在词典 → 0 / expandQuery 分级生效 / sources 携带置信度
+
 * typecheck 零错误 / **425 测试全绿**（419 + 6）
 
 ***
